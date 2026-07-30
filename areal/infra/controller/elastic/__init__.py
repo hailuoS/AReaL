@@ -10,9 +10,11 @@ from .errors import (
     InstanceNotRemovableError,
     InvalidDesiredCountError,
     InvalidStateTransitionError,
+    SingleNodeInstanceError,
     TaskBindingError,
 )
 from .instance_pool import RolloutInstancePool
+from .launcher import RolloutInstanceLauncher, RolloutLaunchResult
 from .models import (
     InstanceDesiredState,
     RolloutInstance,
@@ -30,8 +32,11 @@ __all__ = [
     "InvalidDesiredCountError",
     "InvalidStateTransitionError",
     "RolloutInstance",
+    "RolloutInstanceLauncher",
+    "RolloutLaunchResult",
     "RolloutInstancePool",
     "RolloutInstanceState",
     "RolloutRPCTarget",
+    "SingleNodeInstanceError",
     "TaskBindingError",
 ]

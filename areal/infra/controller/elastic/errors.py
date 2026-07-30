@@ -31,5 +31,9 @@ class InvalidStateTransitionError(ElasticRolloutError):
     """Raised when an instance lifecycle transition is not allowed."""
 
 
+class SingleNodeInstanceError(ElasticRolloutError):
+    """Raised when a complete rollout instance cannot fit on one node."""
+
+
 class TaskBindingError(ElasticRolloutError):
     """Raised when a workflow task is bound inconsistently."""
