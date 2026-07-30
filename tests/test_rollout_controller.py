@@ -1337,6 +1337,64 @@ class TestRolloutControllerQueueSize:
 class TestRolloutControllerCollectiveRPC:
     """Tests for collective RPC methods."""
 
+    def test_build_rollout_job_preserves_static_worker_resources(self):
+        """The extracted job builder keeps the original DP worker layout."""
+        config = create_test_config(backend="sglang:d2", consumer_batch_size=16)
+        scheduler = MockScheduler()
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=config,
+            scheduler=scheduler,
+        )
+
+        job = controller._build_rollout_job("rollout")
+
+        assert job.role == "rollout"
+        assert job.replicas == 2
+        assert len(job.tasks) == 2
+        assert job.tasks[0].gpu == 1
+
+    def test_rollout_target_snapshot_preserves_static_engine_names(self):
+        """Static targets retain existing role/rank names for every worker."""
+        config = create_test_config(backend="sglang:d2", consumer_batch_size=16)
+        scheduler = MockScheduler()
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=config,
+            scheduler=scheduler,
+        )
+        controller.initialize(role="rollout", server_args={})
+
+        targets = controller._rollout_rpc_targets()
+
+        assert [target.worker_id for target in targets] == ["rollout/0", "rollout/1"]
+        assert [target.engine_name for target in targets] == ["rollout/0", "rollout/1"]
+        controller.destroy()
+
+    def test_collective_rpc_uses_snapshot_after_worker_list_changes(self):
+        """A collective RPC dispatches to targets captured at invocation time."""
+        config = create_test_config(backend="sglang:d2", consumer_batch_size=16)
+        scheduler = MockScheduler()
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=config,
+            scheduler=scheduler,
+        )
+        controller.initialize(role="rollout", server_args={})
+        targets = controller._rollout_rpc_targets()
+        workers = controller.workers
+        scheduler.engine_calls = []
+        controller.workers = []
+
+        asyncio.run(controller._collective_rpc_on_targets_async("snapshot", targets))
+
+        snapshot_calls = [
+            call for call in scheduler.engine_calls if call[1] == "snapshot"
+        ]
+        assert [call[0] for call in snapshot_calls] == ["rollout/0", "rollout/1"]
+        controller.workers = workers
+        controller.destroy()
+
     def test_collective_rpc_calls_all_workers(self):
         """Test _collective_rpc calls all workers."""
         config = create_test_config(backend="sglang:d3", consumer_batch_size=16)

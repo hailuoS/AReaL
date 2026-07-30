@@ -35,6 +35,7 @@ from areal.api.cli_args import (
     PerfTracerConfig,
     SchedulingSpec,
 )
+from areal.infra.controller.elastic import RolloutRPCTarget
 from areal.infra.rpc.serialization import deserialize_value
 from areal.infra.utils.concurrent import run_async_task
 from areal.utils import logging, perf_tracer
@@ -168,28 +169,7 @@ class RolloutController:
         # usually TP x PP.
         self._worker_role = role
 
-        instance_size = (
-            self.rollout_alloc.parallel.tp_size * self.rollout_alloc.parallel.pp_size
-        )
-        dp_size = self.rollout_alloc.parallel.dp_size
-
-        # The first element of `self.config.scheduling_spec` is the resource spec
-        # of workers, aka the RPC server process. Since a worker exactly matches
-        # to a single engine instance in the local environment, we can dirrectly
-        # use the spec of engines  as the spec of workers here. Engine scheduling
-        # specs are ignored.
-        sch_spec = SchedulingSpec(**asdict(self.config.scheduling_spec[0]))
-        sch_spec.cpu *= instance_size
-        sch_spec.mem *= instance_size
-        if sch_spec.gpu > 0:
-            sch_spec.gpu = instance_size
-
-        job = Job(
-            replicas=dp_size,
-            tasks=[sch_spec for _ in range(dp_size)],
-            scheduling_strategy=self.config.scheduling_strategy,
-            role=self._worker_role,
-        )
+        job = self._build_rollout_job(role)
 
         # Call async scheduler methods synchronously
         run_async_task(
@@ -224,6 +204,31 @@ class RolloutController:
         # Start callback server for weight sync coordination
         self._start_callback_server()
 
+    def _build_rollout_job(self, role: str) -> Job:
+        """Build the unchanged static V1 Scheduler job for rollout workers."""
+        instance_size = (
+            self.rollout_alloc.parallel.tp_size * self.rollout_alloc.parallel.pp_size
+        )
+        dp_size = self.rollout_alloc.parallel.dp_size
+
+        # The first element of `self.config.scheduling_spec` is the resource spec
+        # of workers, aka the RPC server process. Since a worker exactly matches
+        # to a single engine instance in the local environment, we can directly
+        # use the spec of engines as the spec of workers here. Engine scheduling
+        # specs are ignored.
+        sch_spec = SchedulingSpec(**asdict(self.config.scheduling_spec[0]))
+        sch_spec.cpu *= instance_size
+        sch_spec.mem *= instance_size
+        if sch_spec.gpu > 0:
+            sch_spec.gpu = instance_size
+
+        return Job(
+            replicas=dp_size,
+            tasks=[sch_spec for _ in range(dp_size)],
+            scheduling_strategy=self.config.scheduling_strategy,
+            role=role,
+        )
+
     async def _async_initialize(
         self,
         job: Job,
@@ -247,14 +252,15 @@ class RolloutController:
 
         # Create and initialize engines on workers
         logger.info("Creating engines...")
+        targets = self._rollout_rpc_targets()
         tasks = [
             self.scheduler.create_engine(
-                worker_id=worker.id,
+                worker_id=target.worker_id,
                 engine=f"{engine_class.__module__}.{engine_class.__name__}",
-                engine_name=self._engine_name(rank),
+                engine_name=target.engine_name,
                 config=self.config,
             )
-            for rank, worker in enumerate(self.workers)
+            for target in targets
         ]
         await asyncio.gather(*tasks)
         logger.info("Engine created on all workers!")
@@ -276,9 +282,9 @@ class RolloutController:
             )
             tasks = [
                 self.scheduler.async_call_engine(
-                    worker_id=worker.id,
+                    worker_id=target.worker_id,
                     method="initialize",
-                    engine_name=self._engine_name(rank),
+                    engine_name=target.engine_name,
                     # args in `engine_api`
                     engine_id=str(rank),
                     addr=f"{info.host}:{info.port}",
@@ -287,8 +293,8 @@ class RolloutController:
                     *args,
                     **kwargs,
                 )
-                for rank, (worker, info) in enumerate(
-                    zip(self.workers, self.server_infos)
+                for rank, (target, info) in enumerate(
+                    zip(targets, self.server_infos)
                 )
             ]
             await asyncio.gather(*tasks)
@@ -298,9 +304,9 @@ class RolloutController:
             )
             tasks = [
                 self.scheduler.async_call_engine(
-                    worker_id=worker.id,
+                    worker_id=target.worker_id,
                     method="initialize",
-                    engine_name=self._engine_name(rank),
+                    engine_name=target.engine_name,
                     # args in `engine_api`
                     engine_id=str(rank),
                     engine_rank=rank,
@@ -308,7 +314,7 @@ class RolloutController:
                     *args,
                     **kwargs,
                 )
-                for rank, worker in enumerate(self.workers)
+                for rank, target in enumerate(targets)
             ]
             await asyncio.gather(*tasks)
 
@@ -682,12 +688,34 @@ class RolloutController:
         if future:
             future.get_loop().call_soon_threadsafe(future.set_result, None)
 
+    def _rollout_rpc_targets(self) -> tuple[RolloutRPCTarget, ...]:
+        """Snapshot static rollout RPC targets without changing rank naming."""
+        return tuple(
+            RolloutRPCTarget(
+                instance_id=f"static-{rank}",
+                worker_id=worker.id,
+                engine_name=self._engine_name(rank),
+            )
+            for rank, worker in enumerate(self.workers)
+        )
+
+    def _proxy_rpc_targets(self) -> tuple[RolloutRPCTarget, ...]:
+        """Snapshot static proxy RPC targets without changing rank naming."""
+        return tuple(
+            RolloutRPCTarget(
+                instance_id=f"proxy-static-{rank}",
+                worker_id=worker.id,
+                engine_name=self._proxy_engine_name(rank),
+            )
+            for rank, worker in enumerate(self.proxy_workers)
+        )
+
     def _collective_rpc(self, method: str, *args, **kwargs) -> list[Any]:
         return run_async_task(self._collective_rpc_async, method, *args, **kwargs)
 
     async def _collective_rpc_async(self, method: str, *args, **kwargs) -> list[Any]:
-        return await self._generic_collective_rpc_async(
-            method, self.workers, self._engine_name, *args, **kwargs
+        return await self._collective_rpc_on_targets_async(
+            method, self._rollout_rpc_targets(), *args, **kwargs
         )
 
     def _proxy_collective_rpc(self, method: str, *args, **kwargs) -> list[Any]:
@@ -696,27 +724,27 @@ class RolloutController:
     async def _proxy_collective_rpc_async(
         self, method: str, *args, **kwargs
     ) -> list[Any]:
-        return await self._generic_collective_rpc_async(
-            method, self.proxy_workers, self._proxy_engine_name, *args, **kwargs
+        return await self._collective_rpc_on_targets_async(
+            method, self._proxy_rpc_targets(), *args, **kwargs
         )
 
-    async def _generic_collective_rpc_async(
+    async def _collective_rpc_on_targets_async(
         self,
         method: str,
-        workers: list[Worker],
-        engine_name_fn: Callable[[int], str],
+        targets: tuple[RolloutRPCTarget, ...],
         *args,
         **kwargs,
     ) -> list[Any]:
+        """Call an engine method on an immutable target snapshot."""
         tasks = [
             self.scheduler.async_call_engine(
-                worker_id=worker.id,
+                worker_id=target.worker_id,
                 method=method,
-                engine_name=engine_name_fn(rank),
+                engine_name=target.engine_name,
                 *args,
                 **kwargs,
             )
-            for rank, worker in enumerate(workers)
+            for target in targets
         ]
         return await asyncio.gather(*tasks)
 
@@ -1006,11 +1034,12 @@ class RolloutController:
         async def _compute():
             indexed_chunks: list[list[int]] = []
             tasks = []
-            n_workers = len(self.workers)
-            if n_workers == 0:
+            targets = self._rollout_rpc_targets()
+            n_workers = len(targets)
+            if not targets:
                 raise RuntimeError("No workers available for compute_logp.")
 
-            for rank, worker in enumerate(self.workers):
+            for rank, target in enumerate(targets):
                 idxs = list(range(rank, len(data), n_workers))
                 if not idxs:
                     continue
@@ -1018,9 +1047,9 @@ class RolloutController:
                 indexed_chunks.append(idxs)
                 tasks.append(
                     self.scheduler.async_call_engine(
-                        worker_id=worker.id,
+                        worker_id=target.worker_id,
                         method="compute_logp",
-                        engine_name=self._engine_name(rank),
+                        engine_name=target.engine_name,
                         data=chunk,
                         http_timeout=self.config.request_timeout,
                     )
@@ -1066,15 +1095,16 @@ class RolloutController:
         )
 
     async def init_weights_update_group(self, meta: WeightUpdateMeta) -> None:
+        targets = self._rollout_rpc_targets()
         tasks = [
             self.scheduler.async_call_engine(
-                worker_id=worker.id,
+                worker_id=target.worker_id,
                 method="init_weights_update_group",
-                engine_name=self._engine_name(rank),
+                engine_name=target.engine_name,
                 meta=meta,
                 xccl_group_ranks=[rank],
             )
-            for rank, worker in enumerate(self.workers)
+            for rank, target in enumerate(targets)
         ]
         await asyncio.gather(*tasks)
 
@@ -1157,16 +1187,17 @@ class RolloutController:
 
     def config_perf_tracer(self, config: PerfTracerConfig, role: str) -> None:
         async def _call():
+            targets = self._rollout_rpc_targets()
             tasks = [
                 self.scheduler.async_call_engine(
-                    worker_id=worker.id,
+                    worker_id=target.worker_id,
                     method="config_perf_tracer",
-                    engine_name=self._engine_name(rank),
+                    engine_name=target.engine_name,
                     rank=rank,
                     role=role,
                     config=config,
                 )
-                for rank, worker in enumerate(self.workers)
+                for rank, target in enumerate(targets)
             ]
             return await asyncio.gather(*tasks)
 
