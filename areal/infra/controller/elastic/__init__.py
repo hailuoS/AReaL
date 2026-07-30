@@ -2,7 +2,9 @@
 
 """In-memory lifecycle primitives for RolloutController V1 elasticity."""
 
+from .disk_catalog import DiskCheckpointCatalog, DiskCheckpointManifest
 from .errors import (
+    DiskCheckpointCatalogError,
     DuplicateInstanceError,
     ElasticRolloutError,
     InstanceNotFoundError,
@@ -24,6 +26,9 @@ from .models import (
 
 __all__ = [
     "DuplicateInstanceError",
+    "DiskCheckpointCatalog",
+    "DiskCheckpointCatalogError",
+    "DiskCheckpointManifest",
     "ElasticRolloutError",
     "InstanceDesiredState",
     "InstanceNotFoundError",
