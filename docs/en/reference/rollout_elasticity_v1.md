@@ -1,39 +1,107 @@
 # Rollout elasticity for Controller V1
 
-Rollout elasticity is an opt-in extension of `RolloutController` V1. It does
-not use `RolloutControllerV2`, a V2 router, or a V2 data proxy.
+Rollout elasticity is an opt-in, single-node extension of `RolloutController` V1. It
+does not use `RolloutControllerV2`, a V2 router, or a V2 data proxy.
 
-## Configuration contract
+## Scope
 
-`rollout.elastic.enabled` defaults to `false`. With that value, AReaL follows
-the existing static rollout lifecycle without starting an instance pool,
-reconciler, control API, or checkpoint catalog.
+Each elastic instance is one complete `TP × PP` rollout server owned by an independent
+Scheduler role and a stable, non-positional instance ID. A single instance must fit on
+one node. Cross-node instances and dynamic Proxy online sessions are not supported.
 
-When elasticity is enabled, each instance is a complete `TP × PP` rollout
-server. `min_instances`, `initial_instances`, and `max_instances` therefore
-refer to complete instances, not ranks or devices. They must satisfy:
+Elastic mode supports disk weight synchronization only. AWEX and XCCL retain their
+existing static behavior.
+
+## Configuration
+
+`rollout.elastic.enabled` defaults to `false`. When disabled, the original static
+`Job(replicas=dp_size)` lifecycle, worker naming, routing, weight updates, and
+checkpoint cleanup remain unchanged.
+
+The instance bounds must satisfy:
 
 ```text
 1 <= min_instances <= initial_instances <= max_instances
 ```
 
-`role_prefix` names the Scheduler resource scope. It is not a stable instance
-identity; later controller state assigns immutable instance IDs separately.
+`max_concurrent_rollouts` is the capacity of one complete instance in elastic mode.
+Controller capacity is recalculated as:
 
-## Disk-only weight synchronization
+```text
+READY instances × max_concurrent_rollouts
+```
 
-Elastic mode is disk-only. A later controller integration validates that the
-training engine uses `actor.weight_update_mode=disk`; AWEX and XCCL remain
-available only on the unchanged static path.
+## HTTP control and status
 
-Disk checkpoints must retain at least two committed versions
-(`checkpoint_retention >= 2`) so a newly launched instance can catch up before
-it is eligible for requests. Checkpoint manifests, leases, and garbage
-collection are introduced in later commits.
+The V1 callback server exposes:
 
-## Drain and recovery contracts
+```text
+GET /elastic/desired-instances
+PUT /elastic/desired-instances
+GET /elastic/instances
+GET /elastic/scaling-recommendation
+POST /elastic/scaling-recommendation
+```
 
-`drain_timeout_seconds` bounds graceful scale-in. A drain must eventually wait
-for task, direct-request, online-session, and weight-update leases to empty.
-`recovery_schema_version` reserves the on-disk controller state format; this
-commit does not persist or recover state.
+Set desired capacity with:
+
+```json
+{"desired_instances": 2}
+```
+
+The HTTP request changes desired state only. The background reconciler creates or drains
+independent Scheduler roles. A new instance becomes `READY` only after server
+initialization and loading the exact committed disk version.
+
+Scale-in first changes an instance to `DRAINING`. It receives no new work and is deleted
+only after workflow tasks, direct requests, and weight-update leases are empty. The
+instance model reserves active-session accounting, but dynamic Proxy session routing and
+drain are deferred.
+
+## Scaling recommendation
+
+Training records the time blocked in `prepare_batch`, step duration, accepted rollouts,
+and consumed samples. The report reuses AstraFlow's three-zone rule:
+
+```text
+wait_fraction > 0.10:
+    scale up to ceil(instances / (1 - wait_fraction))
+
+wait_fraction < 0.05 and production and consumption are nonzero:
+    scale down to ceil(instances × consumed / entered × 1.10)
+
+otherwise:
+    hold
+```
+
+The result is clamped to configured min/max instances. It is report-only and never
+changes desired state automatically.
+
+## Disk checkpoint retention and recovery
+
+Committed checkpoints are cataloged atomically. The newest `checkpoint_retention`
+versions are retained, along with any version protected by catch-up or weight-update
+leases.
+
+When `rollout.fileroot` is configured, the Controller atomically persists desired
+capacity, serving version, committed checkpoint, and owned Scheduler roles. After
+restart it validates the exact checkpoint, removes recorded stale roles, and lets the
+reconciler recreate the requested capacity. A nonzero serving version without its
+committed disk checkpoint fails recovery.
+
+## Single-node validation
+
+Run the Controller HTTP spike:
+
+```bash
+AREAL_SPMD_MODE=false python examples/math/rollout_elastic_controller_spike.py \
+  --verify-recommendation --verify-recovery -- \
+  --config examples/math/gsm8k_grpo_npu.yaml scheduler.type=ray
+```
+
+Then run normal end-to-end training with disk updates. After at least one weight update,
+increase desired capacity and verify from `GET /elastic/instances` that the new instance
+has the current `loaded_version` before it reaches `ready`.
+
+Finally run the same training configuration with `rollout.elastic.enabled=false` to
+verify the unchanged static path.
