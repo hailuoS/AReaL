@@ -23,6 +23,7 @@ from .models import (
     RolloutInstanceState,
     RolloutRPCTarget,
 )
+from .reconciler import ReconcileResult, RolloutInstanceReconciler
 
 __all__ = [
     "DuplicateInstanceError",
@@ -40,8 +41,10 @@ __all__ = [
     "RolloutInstanceLauncher",
     "RolloutLaunchResult",
     "RolloutInstancePool",
+    "RolloutInstanceReconciler",
     "RolloutInstanceState",
     "RolloutRPCTarget",
+    "ReconcileResult",
     "SingleNodeInstanceError",
     "TaskBindingError",
 ]
