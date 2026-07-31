@@ -105,6 +105,7 @@ class RolloutController:
         # State
         self._version_lock = Lock()
         self._version = 0
+        self._elastic_capacity_per_instance: int | None = None
         self._disk_checkpoint_catalog: DiskCheckpointCatalog | None = None
         self._instance_pool: RolloutInstancePool | None = None
         self._elastic_reconciler: RolloutInstanceReconciler | None = None
@@ -213,6 +214,9 @@ class RolloutController:
             consumer_batch_size=consumer_batch_size,
             max_staleness=self.config.max_head_offpolicyness,
         )
+        if self._instance_pool is not None:
+            self._elastic_capacity_per_instance = max_concurrent_rollouts
+            self._refresh_elastic_capacity()
 
         # Create and initialize the dispatcher
         qsize = self.config.queue_size or max_concurrent_rollouts * 16
@@ -269,6 +273,16 @@ class RolloutController:
     async def _reconcile_elastic_once(self) -> None:
         assert self._elastic_reconciler is not None
         await self._elastic_reconciler.reconcile_once()
+        self._refresh_elastic_capacity()
+
+    def _refresh_elastic_capacity(self) -> None:
+        if self._instance_pool is None or self._staleness_manager is None:
+            return
+        assert self._elastic_capacity_per_instance is not None
+        ready_instances = len(self._instance_pool.ready_snapshot())
+        self._staleness_manager.set_max_concurrent_rollouts(
+            max(1, ready_instances * self._elastic_capacity_per_instance)
+        )
 
     def _elastic_reconcile_loop(self) -> None:
         while not self._elastic_reconcile_stop.wait(
