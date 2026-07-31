@@ -40,6 +40,8 @@ from areal.infra.controller.elastic import (
     DiskCheckpointCatalog,
     DiskCheckpointCatalogError,
     DiskCheckpointManifest,
+    ElasticRecoveryState,
+    ElasticRecoveryStore,
     ElasticScalingWindow,
     InvalidDesiredCountError,
     RolloutInstanceLauncher,
@@ -115,6 +117,7 @@ class RolloutController:
         self._elastic_reconcile_thread: threading.Thread | None = None
         self._elastic_last_reconcile_error: str | None = None
         self._elastic_scaling_report: dict[str, Any] | None = None
+        self._elastic_recovery_store: ElasticRecoveryStore | None = None
         if config.elastic.enabled:
             self._instance_pool = RolloutInstancePool(
                 min_instances=config.elastic.min_instances,
@@ -245,6 +248,48 @@ class RolloutController:
         initialize_kwargs: dict[str, Any],
     ) -> None:
         assert self._instance_pool is not None
+        if self.config.fileroot:
+            recovery_role = role.replace("/", "_")
+            self._elastic_recovery_store = ElasticRecoveryStore(
+                Path(self.config.fileroot)
+                / f"elastic_rollout_recovery_{recovery_role}.json"
+            )
+            recovered = self._elastic_recovery_store.load()
+            if recovered is not None:
+                self._instance_pool.set_desired_count(recovered.desired_instances)
+                self._version = recovered.serving_version
+                if recovered.checkpoint_path is not None:
+                    checkpoint_path = Path(recovered.checkpoint_path)
+                    if not checkpoint_path.is_dir():
+                        raise RuntimeError(
+                            "recovery checkpoint directory does not exist: "
+                            f"{checkpoint_path}"
+                        )
+                    self._disk_checkpoint_catalog = DiskCheckpointCatalog(
+                        checkpoint_path.parent
+                    )
+                    manifest = self._disk_checkpoint_catalog.get(
+                        recovered.checkpoint_version
+                    )
+                    if Path(manifest.path) != checkpoint_path:
+                        raise RuntimeError(
+                            "recovery checkpoint does not match disk catalog"
+                        )
+                elif recovered.serving_version > 0:
+                    raise RuntimeError(
+                        "elastic recovery at a nonzero serving version requires "
+                        "a committed disk checkpoint"
+                    )
+                for stale_role in recovered.worker_roles:
+                    try:
+                        self.scheduler.delete_workers(role=stale_role)
+                        logger.info("Deleted stale recovered role %s", stale_role)
+                    except Exception:
+                        logger.warning(
+                            "Could not delete stale recovered role %s",
+                            stale_role,
+                            exc_info=True,
+                        )
         launcher = RolloutInstanceLauncher(
             scheduler=self.scheduler,
             inf_engine=self.inf_engine,
@@ -271,13 +316,21 @@ class RolloutController:
     def _latest_elastic_checkpoint(self) -> DiskCheckpointManifest | None:
         if self._disk_checkpoint_catalog is None:
             return None
-        checkpoints = self._disk_checkpoint_catalog.list()
-        return checkpoints[-1] if checkpoints else None
+        version = self.get_version()
+        try:
+            return self._disk_checkpoint_catalog.get(version)
+        except DiskCheckpointCatalogError:
+            if version == 0:
+                return None
+            raise RuntimeError(
+                f"serving version {version} has no committed disk checkpoint"
+            ) from None
 
     async def _reconcile_elastic_once(self) -> None:
         assert self._elastic_reconciler is not None
         await self._elastic_reconciler.reconcile_once()
         self._refresh_elastic_capacity()
+        self._save_elastic_recovery_state()
 
     def _refresh_elastic_capacity(self) -> None:
         if self._instance_pool is None or self._staleness_manager is None:
@@ -287,6 +340,38 @@ class RolloutController:
         self._staleness_manager.set_max_concurrent_rollouts(
             max(1, ready_instances * self._elastic_capacity_per_instance)
         )
+
+    def _save_elastic_recovery_state(self) -> None:
+        if self._elastic_recovery_store is not None and self._instance_pool is not None:
+            version = self.get_version()
+            checkpoint = None
+            if self._disk_checkpoint_catalog is not None:
+                try:
+                    checkpoint = self._disk_checkpoint_catalog.get(version)
+                except DiskCheckpointCatalogError:
+                    checkpoint = None
+            if version > 0 and checkpoint is None:
+                raise RuntimeError(
+                    f"cannot persist elastic serving version {version} without "
+                    "a committed disk checkpoint"
+                )
+            self._elastic_recovery_store.save(
+                ElasticRecoveryState(
+                    schema_version=self.config.elastic.recovery_schema_version,
+                    desired_instances=self._instance_pool.desired_count,
+                    serving_version=version,
+                    checkpoint_version=(
+                        checkpoint.version if checkpoint is not None else None
+                    ),
+                    checkpoint_path=(
+                        checkpoint.path if checkpoint is not None else None
+                    ),
+                    worker_roles=tuple(
+                        self._instance_pool.get(instance_id).worker_role
+                        for instance_id in self._instance_pool.instance_ids()
+                    ),
+                )
+            )
 
     def record_elastic_scaling_window(
         self, *, entered: int, consumed: int, wait_seconds: float, step_seconds: float
@@ -762,6 +847,7 @@ class RolloutController:
                 self._instance_pool.set_desired_count(desired_count)
             except InvalidDesiredCountError as exc:
                 return jsonify({"error": str(exc)}), 400
+            self._save_elastic_recovery_state()
             return jsonify(
                 {
                     "desired_instances": self._instance_pool.desired_count,
@@ -1490,6 +1576,7 @@ class RolloutController:
                 self._proxy_collective_rpc(
                     "set_version", version=version, http_timeout=60.0
                 )
+        self._save_elastic_recovery_state()
 
     def get_version(self) -> int:
         with self._version_lock:

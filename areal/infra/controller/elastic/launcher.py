@@ -165,6 +165,9 @@ class RolloutInstanceLauncher:
             version=checkpoint.version,
             clear_checkpoint_after_load=False,
         )
+        # Expose the version being loaded while CATCHING_UP so checkpoint GC
+        # protects the directory until this RPC finishes.
+        instance.loaded_version = checkpoint.version
         try:
             await self._scheduler.async_call_engine(
                 worker_id=instance.worker_id,
