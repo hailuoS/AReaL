@@ -111,6 +111,7 @@ class RolloutController:
         self._elastic_reconciler: RolloutInstanceReconciler | None = None
         self._elastic_reconcile_stop = threading.Event()
         self._elastic_reconcile_thread: threading.Thread | None = None
+        self._elastic_last_reconcile_error: str | None = None
         if config.elastic.enabled:
             self._instance_pool = RolloutInstancePool(
                 min_instances=config.elastic.min_instances,
@@ -290,7 +291,9 @@ class RolloutController:
         ):
             try:
                 run_async_task(self._reconcile_elastic_once)
+                self._elastic_last_reconcile_error = None
             except Exception:
+                self._elastic_last_reconcile_error = traceback.format_exc()
                 logger.error("Elastic reconciliation failed", exc_info=True)
 
     def _build_rollout_job(self, role: str) -> Job:
@@ -733,6 +736,43 @@ class RolloutController:
                 {
                     "desired_instances": self._instance_pool.desired_count,
                     "instance_ids": self._instance_pool.instance_ids(),
+                }
+            )
+
+        @app.route("/elastic/instances", methods=["GET"])
+        def elastic_instances():
+            """Return a stable JSON snapshot for external control loops."""
+            if self._instance_pool is None:
+                return jsonify({"error": "elastic rollout is disabled"}), 409
+            instances = []
+            for instance_id in self._instance_pool.instance_ids():
+                instance = self._instance_pool.get(instance_id)
+                instances.append(
+                    {
+                        "instance_id": instance.instance_id,
+                        "worker_role": instance.worker_role,
+                        "worker_id": instance.worker_id,
+                        "engine_name": instance.engine_name,
+                        "state": instance.state.value,
+                        "desired_state": instance.desired_state.value,
+                        "loaded_version": instance.loaded_version,
+                        "active_tasks": len(instance.workflow_task_ids),
+                        "direct_inflight": instance.direct_inflight,
+                        "active_sessions": instance.active_sessions,
+                        "update_leases": instance.update_leases,
+                    }
+                )
+            return jsonify(
+                {
+                    "desired_instances": self._instance_pool.desired_count,
+                    "ready_instances": len(self._instance_pool.ready_snapshot()),
+                    "max_concurrent_rollouts": (
+                        self._staleness_manager.max_concurrent_rollouts
+                        if self._staleness_manager is not None
+                        else None
+                    ),
+                    "last_reconcile_error": self._elastic_last_reconcile_error,
+                    "instances": instances,
                 }
             )
 
