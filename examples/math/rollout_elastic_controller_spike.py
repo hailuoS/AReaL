@@ -70,6 +70,19 @@ def _wait_for_instances(base_url: str, count: int, timeout: float = 600.0) -> No
             instances = payload["instances"]
             if any(instance["state"] != "ready" for instance in instances):
                 raise RuntimeError(f"Non-READY instance in ready snapshot: {instances}")
+            if any(
+                instance["loaded_version"] != payload["serving_version"]
+                for instance in instances
+            ):
+                raise RuntimeError(
+                    "READY instance does not match serving version: "
+                    f"serving={payload['serving_version']} instances={instances}"
+                )
+            if payload["pending_update_version"] is not None:
+                raise RuntimeError(
+                    "Elastic weight transition is still pending: "
+                    f"{payload['pending_update_version']}"
+                )
             if len({instance["instance_id"] for instance in instances}) != count:
                 raise RuntimeError("Elastic instances do not have unique stable IDs")
             if len({instance["worker_role"] for instance in instances}) != count:
