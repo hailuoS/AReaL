@@ -2,7 +2,13 @@
 
 import pytest
 
-from areal.api.cli_args import ElasticRolloutConfig, InferenceEngineConfig
+from areal.api.alloc_mode import ModelAllocation
+from areal.api.cli_args import (
+    ElasticRolloutConfig,
+    InferenceEngineConfig,
+    PPOConfig,
+)
+from areal.trainer.rl_trainer import PPOTrainer
 
 
 def test_elastic_rollout_config_is_disabled_by_default():
@@ -42,3 +48,41 @@ def test_elastic_rollout_config_accepts_scale_out_contract():
 
     assert config.enabled
     assert config.max_instances == 4
+
+
+def _trainer_for_elastic_validation(weight_update_mode: str) -> PPOTrainer:
+    config = PPOConfig()
+    config.actor.backend = "fsdp:d1"
+    config.actor.weight_update_mode = weight_update_mode
+    config.rollout.backend = "vllm:d1"
+    config.rollout.elastic = ElasticRolloutConfig(enabled=True, max_instances=2)
+    trainer = PPOTrainer.__new__(PPOTrainer)
+    trainer.config = config
+    trainer.actor_alloc = ModelAllocation.from_str(config.actor.backend, name="actor")
+    trainer.rollout_alloc = ModelAllocation.from_str(
+        config.rollout.backend, name="rollout"
+    )
+    trainer._should_offload_rollout = False
+    trainer._should_offload_actor = False
+    trainer._should_offload_critic = False
+    trainer._should_offload_ref = False
+    trainer._should_offload_teacher = False
+    return trainer
+
+
+def test_elastic_rollout_rejects_non_disk_weight_updates(monkeypatch):
+    monkeypatch.setattr("areal.trainer.rl_trainer.is_single_controller", lambda: True)
+    trainer = _trainer_for_elastic_validation("awex")
+
+    with pytest.raises(ValueError, match="weight_update_mode=disk"):
+        trainer._validate_cfg()
+
+
+def test_elastic_rollout_rejects_v2_controller(monkeypatch):
+    monkeypatch.setattr("areal.trainer.rl_trainer.is_single_controller", lambda: True)
+    trainer = _trainer_for_elastic_validation("disk")
+    trainer.config.actor._version = "v2"
+    trainer.config.rollout._version = "v2"
+
+    with pytest.raises(ValueError, match="RolloutController V1"):
+        trainer._validate_cfg()
