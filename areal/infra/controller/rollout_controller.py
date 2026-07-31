@@ -118,6 +118,10 @@ class RolloutController:
         self._elastic_last_reconcile_error: str | None = None
         self._elastic_scaling_report: dict[str, Any] | None = None
         self._elastic_recovery_store: ElasticRecoveryStore | None = None
+        self._elastic_update_condition = threading.Condition()
+        self._elastic_pending_update_version: int | None = None
+        self._elastic_catchups_inflight = 0
+        self._elastic_pending_worker_roles: set[str] = set()
         if config.elastic.enabled:
             self._instance_pool = RolloutInstancePool(
                 min_instances=config.elastic.min_instances,
@@ -304,6 +308,11 @@ class RolloutController:
             initialize_kwargs=initialize_kwargs,
             latest_checkpoint=self._latest_elastic_checkpoint,
             current_version=self.get_version,
+            drain_timeout_seconds=self.config.elastic.drain_timeout_seconds,
+            begin_catch_up=self._begin_elastic_catch_up,
+            end_catch_up=self._end_elastic_catch_up,
+            record_launch_intent=self._record_elastic_launch_intent,
+            clear_launch_intent=self._clear_elastic_launch_intent,
         )
         run_async_task(self._reconcile_elastic_once)
         self._elastic_reconcile_thread = threading.Thread(
@@ -313,10 +322,32 @@ class RolloutController:
         )
         self._elastic_reconcile_thread.start()
 
+    def _elastic_recovery_path(self, role: str) -> Path:
+        if not self.config.fileroot:
+            raise ValueError("elastic recovery requires rollout.fileroot")
+        recovery_root = Path(self.config.fileroot)
+        if self.config.experiment_name and self.config.trial_name:
+            recovery_root = (
+                recovery_root / self.config.experiment_name / self.config.trial_name
+            )
+        recovery_role = role.replace("/", "_")
+        return recovery_root / f"elastic_rollout_recovery_{recovery_role}.json"
+
     def _latest_elastic_checkpoint(self) -> DiskCheckpointManifest | None:
         if self._disk_checkpoint_catalog is None:
             return None
         version = self.get_version()
+        return self._latest_elastic_checkpoint_for_version(version)
+
+    def _latest_elastic_checkpoint_for_version(
+        self, version: int
+    ) -> DiskCheckpointManifest | None:
+        if self._disk_checkpoint_catalog is None:
+            if version == 0:
+                return None
+            raise RuntimeError(
+                f"serving version {version} has no committed disk checkpoint"
+            )
         try:
             return self._disk_checkpoint_catalog.get(version)
         except DiskCheckpointCatalogError:
@@ -330,6 +361,77 @@ class RolloutController:
         assert self._elastic_reconciler is not None
         await self._elastic_reconciler.reconcile_once()
         self._refresh_elastic_capacity()
+        self._save_elastic_recovery_state()
+
+    def _begin_elastic_catch_up(self) -> None:
+        with self._elastic_update_condition:
+            self._elastic_update_condition.wait_for(
+                lambda: (
+                    self._elastic_pending_update_version is None
+                    or self._elastic_reconcile_stop.is_set()
+                )
+            )
+            if self._elastic_reconcile_stop.is_set():
+                raise RuntimeError("elastic controller is stopping")
+            self._elastic_catchups_inflight += 1
+
+    def _end_elastic_catch_up(self) -> None:
+        with self._elastic_update_condition:
+            if self._elastic_catchups_inflight <= 0:
+                raise RuntimeError("elastic catch-up guard is not held")
+            self._elastic_catchups_inflight -= 1
+            self._elastic_update_condition.notify_all()
+
+    def _begin_elastic_weight_update(self, version: int) -> None:
+        with self._elastic_update_condition:
+            self._elastic_update_condition.wait_for(
+                lambda: (
+                    (
+                        self._elastic_pending_update_version is None
+                        and self._elastic_catchups_inflight == 0
+                    )
+                    or self._elastic_reconcile_stop.is_set()
+                )
+            )
+            if self._elastic_reconcile_stop.is_set():
+                raise RuntimeError("elastic controller is stopping")
+            self._elastic_pending_update_version = version
+
+    def _abort_elastic_weight_update(self, version: int) -> None:
+        with self._elastic_update_condition:
+            if self._elastic_pending_update_version == version:
+                self._elastic_pending_update_version = None
+                self._elastic_update_condition.notify_all()
+
+    def _finish_elastic_weight_update(self, version: int) -> None:
+        with self._elastic_update_condition:
+            pending = self._elastic_pending_update_version
+            if pending is not None and pending != version:
+                raise RuntimeError(
+                    f"serving version {version} does not match pending disk "
+                    f"version {pending}"
+                )
+            if pending == version:
+                self._elastic_pending_update_version = None
+                self._elastic_update_condition.notify_all()
+
+    def _validate_elastic_serving_version(self, version: int) -> None:
+        with self._elastic_update_condition:
+            pending = self._elastic_pending_update_version
+            if pending is not None and pending != version:
+                raise RuntimeError(
+                    f"serving version {version} does not match pending disk "
+                    f"version {pending}"
+                )
+
+    def _record_elastic_launch_intent(self, worker_role: str) -> None:
+        with self._elastic_update_condition:
+            self._elastic_pending_worker_roles.add(worker_role)
+        self._save_elastic_recovery_state()
+
+    def _clear_elastic_launch_intent(self, worker_role: str) -> None:
+        with self._elastic_update_condition:
+            self._elastic_pending_worker_roles.discard(worker_role)
         self._save_elastic_recovery_state()
 
     def _refresh_elastic_capacity(self) -> None:
@@ -355,6 +457,9 @@ class RolloutController:
                     f"cannot persist elastic serving version {version} without "
                     "a committed disk checkpoint"
                 )
+            with self._elastic_update_condition:
+                pending_worker_roles = frozenset(self._elastic_pending_worker_roles)
+            instances = self._instance_pool.instances_snapshot()
             self._elastic_recovery_store.save(
                 ElasticRecoveryState(
                     schema_version=self.config.elastic.recovery_schema_version,
@@ -367,8 +472,10 @@ class RolloutController:
                         checkpoint.path if checkpoint is not None else None
                     ),
                     worker_roles=tuple(
-                        self._instance_pool.get(instance_id).worker_role
-                        for instance_id in self._instance_pool.instance_ids()
+                        sorted(
+                            {instance.worker_role for instance in instances}
+                            | pending_worker_roles
+                        )
                     ),
                 )
             )
@@ -500,9 +607,7 @@ class RolloutController:
                     *args,
                     **kwargs,
                 )
-                for rank, (target, info) in enumerate(
-                    zip(targets, self.server_infos)
-                )
+                for rank, (target, info) in enumerate(zip(targets, self.server_infos))
             ]
             await asyncio.gather(*tasks)
         else:
@@ -534,7 +639,11 @@ class RolloutController:
 
         if self._elastic_reconcile_thread is not None:
             self._elastic_reconcile_stop.set()
+            with self._elastic_update_condition:
+                self._elastic_update_condition.notify_all()
             self._elastic_reconcile_thread.join(timeout=5.0)
+            if self._elastic_reconcile_thread.is_alive():
+                logger.warning("Elastic reconcile thread did not stop within 5s")
             self._elastic_reconcile_thread = None
 
         self._stop_callback_server()
@@ -860,9 +969,10 @@ class RolloutController:
             """Return a stable JSON snapshot for external control loops."""
             if self._instance_pool is None:
                 return jsonify({"error": "elastic rollout is disabled"}), 409
+            with self._elastic_update_condition:
+                pending_update_version = self._elastic_pending_update_version
             instances = []
-            for instance_id in self._instance_pool.instance_ids():
-                instance = self._instance_pool.get(instance_id)
+            for instance in self._instance_pool.instances_snapshot():
                 instances.append(
                     {
                         "instance_id": instance.instance_id,
@@ -882,6 +992,8 @@ class RolloutController:
                 {
                     "desired_instances": self._instance_pool.desired_count,
                     "ready_instances": len(self._instance_pool.ready_snapshot()),
+                    "serving_version": self.get_version(),
+                    "pending_update_version": pending_update_version,
                     "max_concurrent_rollouts": (
                         self._staleness_manager.max_concurrent_rollouts
                         if self._staleness_manager is not None
@@ -1479,6 +1591,10 @@ class RolloutController:
                 self._instance_pool.release_direct_request(target.instance_id)
 
     async def init_weights_update_group(self, meta: WeightUpdateMeta) -> None:
+        if self._instance_pool is not None:
+            raise RuntimeError(
+                "elastic RolloutController V1 supports disk weight updates only"
+            )
         targets = self._rollout_rpc_targets()
         tasks = [
             self.scheduler.async_call_engine(
@@ -1495,30 +1611,48 @@ class RolloutController:
     async def update_weights_from_distributed(
         self, meta: WeightUpdateMeta, param_specs: list[ParamSpec]
     ):
+        if self._instance_pool is not None:
+            raise RuntimeError(
+                "elastic RolloutController V1 supports disk weight updates only"
+            )
         await self._collective_rpc_async(
             "update_weights_from_distributed", meta=meta, param_specs=param_specs
         )
 
     async def update_weights_from_disk(self, meta: WeightUpdateMeta):
         meta.clear_checkpoint_after_load = False
-        targets = self._rollout_rpc_targets()
-        leased_instance_ids: list[str] = []
+        targets: tuple[RolloutRPCTarget, ...] = ()
+        if self._instance_pool is not None:
+            if meta.version is None:
+                raise DiskCheckpointCatalogError(
+                    "elastic disk weight updates require a checkpoint version"
+                )
+            self._begin_elastic_weight_update(meta.version)
+        else:
+            targets = self._rollout_rpc_targets()
         try:
             if self._instance_pool is not None:
-                for target in targets:
-                    self._instance_pool.acquire_update_lease(target.instance_id)
-                    leased_instance_ids.append(target.instance_id)
+                targets = self._instance_pool.acquire_weight_update_snapshot()
+            if self._instance_pool is not None and not targets:
+                raise RuntimeError(
+                    "elastic disk update requires at least one READY rollout instance"
+                )
             await self._collective_rpc_on_targets_async(
                 "update_weights_from_disk", targets, meta=meta
             )
             if self.config.elastic.enabled:
                 self._record_elastic_disk_checkpoint(meta)
+                self._instance_pool.mark_loaded_version(targets, meta.version)
             else:
                 shutil.rmtree(meta.path, ignore_errors=True)
+        except BaseException:
+            if self._instance_pool is not None:
+                assert meta.version is not None
+                self._abort_elastic_weight_update(meta.version)
+            raise
         finally:
             if self._instance_pool is not None:
-                for instance_id in leased_instance_ids:
-                    self._instance_pool.release_update_lease(instance_id)
+                self._instance_pool.release_weight_update_snapshot(targets)
 
     def _record_elastic_disk_checkpoint(self, meta: WeightUpdateMeta) -> None:
         """Persist a successfully loaded checkpoint for a future elastic instance.
@@ -1555,12 +1689,9 @@ class RolloutController:
         )
         protected_versions = {
             instance.loaded_version
-            for instance_id in self._instance_pool.instance_ids()
-            for instance in [self._instance_pool.get(instance_id)]
+            for instance in self._instance_pool.instances_snapshot()
             if instance.loaded_version is not None
-            and (
-                instance.state.value == "catching_up" or instance.update_leases > 0
-            )
+            and (instance.state.value == "catching_up" or instance.update_leases > 0)
         }
         self._disk_checkpoint_catalog.collect_garbage(
             retention=self.config.elastic.checkpoint_retention,
@@ -1573,6 +1704,10 @@ class RolloutController:
         step_id: int | None = None,
         kwargs: dict[str, Any] | None = None,
     ):
+        if self._instance_pool is not None:
+            raise RuntimeError(
+                "elastic RolloutController V1 supports disk weight updates only"
+            )
         await self._collective_rpc_async(
             "update_weights_from_awex", meta=meta, step_id=step_id, kwargs=kwargs
         )
@@ -1592,14 +1727,33 @@ class RolloutController:
         self._collective_rpc("onload", tags=tags)
 
     def set_version(self, version: int) -> None:
-        with self._version_lock:
-            self._version = version
-            self._collective_rpc("set_version", version=version, http_timeout=60.0)
-            if self._proxy_started:
-                self._proxy_collective_rpc(
-                    "set_version", version=version, http_timeout=60.0
-                )
-        self._save_elastic_recovery_state()
+        if self._instance_pool is None:
+            with self._version_lock:
+                self._version = version
+                self._collective_rpc("set_version", version=version, http_timeout=60.0)
+                if self._proxy_started:
+                    self._proxy_collective_rpc(
+                        "set_version", version=version, http_timeout=60.0
+                    )
+            return
+
+        with self._elastic_update_condition:
+            self._validate_elastic_serving_version(version)
+            if version > 0:
+                checkpoint = self._latest_elastic_checkpoint_for_version(version)
+                if checkpoint is None or checkpoint.version != version:
+                    raise RuntimeError(
+                        f"serving version {version} has no matching disk checkpoint"
+                    )
+            with self._version_lock:
+                self._collective_rpc("set_version", version=version, http_timeout=60.0)
+                if self._proxy_started:
+                    self._proxy_collective_rpc(
+                        "set_version", version=version, http_timeout=60.0
+                    )
+                self._version = version
+            self._save_elastic_recovery_state()
+            self._finish_elastic_weight_update(version)
 
     def get_version(self) -> int:
         with self._version_lock:
