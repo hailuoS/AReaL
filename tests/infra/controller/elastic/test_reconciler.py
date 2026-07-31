@@ -19,6 +19,7 @@ class _FakeLaunchResult:
 class _FakeLauncher:
     def __init__(self):
         self.launched = []
+        self.proxied = []
         self.caught_up = []
         self.destroyed = []
 
@@ -28,11 +29,27 @@ class _FakeLauncher:
             worker_role=worker_role,
             worker_id=f"{worker_role}/0",
             engine_name=f"rollout/{instance_id}",
+            server_host="127.0.0.1",
+            server_port=30000,
         )
         instance.transition_to(RolloutInstanceState.STARTING)
         instance.transition_to(RolloutInstanceState.CATCHING_UP)
         self.launched.append(instance)
         return _FakeLaunchResult(instance)
+
+    @staticmethod
+    def proxy_role(instance):
+        return f"proxy-{instance.worker_role}"
+
+    async def launch_proxy(self, instance):
+        role = self.proxy_role(instance)
+        instance.attach_proxy(
+            role=role,
+            worker_id=f"{role}/0",
+            engine_name=f"proxy/{instance.instance_id}",
+            addr="http://127.0.0.1:31000",
+        )
+        self.proxied.append(instance.instance_id)
 
     async def catch_up_from_disk(self, instance, checkpoint):
         self.caught_up.append((instance.instance_id, checkpoint.version))
@@ -47,6 +64,11 @@ class _FakeLauncher:
 class _FailingCatchUpLauncher(_FakeLauncher):
     async def catch_up_from_disk(self, instance, checkpoint):
         raise RuntimeError("catch-up failed")
+
+
+class _FailingProxyLauncher(_FakeLauncher):
+    async def launch_proxy(self, instance):
+        raise RuntimeError("proxy launch failed")
 
 
 @pytest.mark.asyncio
@@ -80,6 +102,36 @@ async def test_reconciler_launches_each_instance_in_its_own_role(tmp_path):
     ]
     assert recorded_roles == [instance.worker_role for instance in launcher.launched]
     assert cleared_roles == recorded_roles
+
+
+@pytest.mark.asyncio
+async def test_reconciler_attaches_proxy_before_new_instance_is_ready():
+    pool = RolloutInstancePool(min_instances=1, initial_instances=1, max_instances=2)
+    launcher = _FakeLauncher()
+    proxy_enabled = False
+    reconciler = RolloutInstanceReconciler(
+        pool=pool,
+        launcher=launcher,
+        role_prefix="rollout-elastic",
+        server_args={},
+        latest_checkpoint=lambda: None,
+        current_version=lambda: 0,
+        proxy_enabled=lambda: proxy_enabled,
+    )
+    await reconciler.reconcile_once()
+    initial = pool.get(pool.instance_ids()[0])
+    assert not initial.proxy_ready
+
+    proxy_enabled = True
+    await reconciler.reconcile_once()
+    assert initial.proxy_ready
+
+    pool.set_desired_count(2)
+    await reconciler.reconcile_once()
+    instances = [pool.get(instance_id) for instance_id in pool.instance_ids()]
+    assert len(instances) == 2
+    assert all(instance.proxy_ready for instance in instances)
+    assert all(instance.state is RolloutInstanceState.READY for instance in instances)
 
 
 @pytest.mark.asyncio
@@ -159,6 +211,33 @@ async def test_reconciler_removes_instance_after_catch_up_failure(tmp_path):
 
     assert pool.instance_ids() == ()
     assert len(launcher.destroyed) == 1
+
+
+@pytest.mark.asyncio
+async def test_reconciler_removes_new_instance_after_proxy_failure():
+    pool = RolloutInstancePool(min_instances=1, initial_instances=1, max_instances=1)
+    launcher = _FailingProxyLauncher()
+    recorded_roles = []
+    cleared_roles = []
+    reconciler = RolloutInstanceReconciler(
+        pool=pool,
+        launcher=launcher,
+        role_prefix="rollout-elastic",
+        server_args={},
+        latest_checkpoint=lambda: None,
+        current_version=lambda: 0,
+        proxy_enabled=lambda: True,
+        record_launch_intent=recorded_roles.append,
+        clear_launch_intent=cleared_roles.append,
+    )
+
+    with pytest.raises(RuntimeError, match="proxy launch failed"):
+        await reconciler.reconcile_once()
+
+    assert pool.instance_ids() == ()
+    assert len(launcher.destroyed) == 1
+    assert recorded_roles[1].startswith("proxy-rollout-elastic-")
+    assert cleared_roles == recorded_roles
 
 
 @pytest.mark.asyncio
