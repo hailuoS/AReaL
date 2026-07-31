@@ -4,13 +4,14 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 
 from .errors import InvalidStateTransitionError
 
 
-class RolloutInstanceState(str, Enum):
+class RolloutInstanceState(str, Enum):  # noqa: UP042
     """Observed lifecycle state of one complete TP × PP rollout instance."""
 
     PENDING = "pending"
@@ -23,7 +24,7 @@ class RolloutInstanceState(str, Enum):
     FAILED = "failed"
 
 
-class InstanceDesiredState(str, Enum):
+class InstanceDesiredState(str, Enum):  # noqa: UP042
     """Desired lifecycle state assigned by the reconciler."""
 
     RUNNING = "running"
@@ -107,6 +108,7 @@ class RolloutInstance:
     direct_inflight: int = 0
     active_sessions: int = 0
     update_leases: int = 0
+    drain_started_at: float | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("instance_id", "worker_role", "worker_id", "engine_name"):
@@ -178,6 +180,7 @@ class RolloutInstance:
         """Stop accepting new work and declare the desired stopped state."""
         self.desired_state = InstanceDesiredState.STOPPED
         if self.state is RolloutInstanceState.READY:
+            self.drain_started_at = time.monotonic()
             self.transition_to(RolloutInstanceState.DRAINING)
 
     def cancel_drain(self) -> None:
@@ -187,4 +190,5 @@ class RolloutInstance:
                 f"instance {self.instance_id} is not draining"
             )
         self.desired_state = InstanceDesiredState.RUNNING
+        self.drain_started_at = None
         self.transition_to(RolloutInstanceState.READY)
