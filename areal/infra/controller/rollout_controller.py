@@ -253,10 +253,8 @@ class RolloutController:
     ) -> None:
         assert self._instance_pool is not None
         if self.config.fileroot:
-            recovery_role = role.replace("/", "_")
             self._elastic_recovery_store = ElasticRecoveryStore(
-                Path(self.config.fileroot)
-                / f"elastic_rollout_recovery_{recovery_role}.json"
+                self._elastic_recovery_path(role)
             )
             recovered = self._elastic_recovery_store.load()
             if recovered is not None:
