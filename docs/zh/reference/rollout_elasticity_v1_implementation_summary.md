@@ -5,12 +5,13 @@
 本次开发基于 AReaL `ascend-v1.0.4` NPU 分支，在
 `RolloutController` V1 上完成了单节点 Rollout 弹性扩缩容的主体功能。
 
-实现结果维护在以下个人仓分支；精确提交列表以
-`git log upstream/ascend-v1.0.4..HEAD` 为准：
+当前分支（含本总结更新）相对 `upstream/ascend-v1.0.4` 共包含 34 个提交，维护在
+以下个人仓分支：
 
 ```text
 仓库：https://github.com/hailuoS/AReaL
 分支：ascend-v1.0.4
+最新功能提交：c7f90d34
 ```
 
 当前实现支持：
@@ -64,6 +65,10 @@ instance_id
 worker_role
 worker_id
 engine_name
+proxy_role
+proxy_worker_id
+proxy_engine_name
+proxy_addr
 ```
 
 这些字段不依赖数组下标。缩容后创建的新实例不会复用当前数组位置作为身份。
@@ -325,10 +330,12 @@ wait_fraction < 0.05 且 entered > 0 且 consumed > 0:
 | 恢复状态 | `areal/infra/controller/elastic/recovery_state.py` |
 | 扩缩容建议 | `areal/infra/controller/elastic/scaling_report.py` |
 | V1 Controller 集成 | `areal/infra/controller/rollout_controller.py` |
+| V1 Proxy Server | `areal/experimental/openai/proxy/proxy_rollout_server.py`（复用） |
 | 动态并发容量 | `areal/infra/staleness_manager.py` |
 | 训练入口约束和指标接线 | `areal/trainer/rl_trainer.py` |
 | 单 role 隔离穿刺 | `examples/math/rollout_role_spike.py` |
 | HTTP 扩缩容穿刺 | `examples/math/rollout_elastic_controller_spike.py` |
+| 外部 autoscaler 闭环穿刺 | `examples/math/rollout_elastic_autoscaler_spike.py` |
 
 ## 7. 实施提交
 
@@ -388,11 +395,15 @@ bbc408d9 docs: document elastic V1 runtime boundaries
 
 ### 阶段六：外部闭环和 AgentWorkflow V1 Proxy
 
-- 增加读取扩缩容报告并设置 desired state 的外部 autoscaler 穿刺；
-- 为每个弹性实例增加稳定的 Proxy 身份和地址；
-- 从实例 rollout role fork 独立 V1 ProxyRolloutServer；
-- AgentWorkflow task 与 rollout、proxy 使用同一个 instance 绑定；
-- 将 Proxy 纳入扩容 READY、失败回滚、缩容删除和 Controller 恢复。
+```text
+2feae8cc feat(examples): add elastic autoscaler closed-loop spike
+c4d80a1e feat(infra): attach V1 proxies to elastic instances
+59ea006a feat(infra): route AgentWorkflow through elastic V1 proxies
+c7f90d34 test(examples): verify elastic V1 proxy lifecycle
+```
+
+这一阶段增加报告到 desired state 的外部闭环，并将实例专属 V1 Proxy 纳入
+AgentWorkflow task 绑定、扩容 READY、失败回滚、缩容删除和 Controller 恢复。
 
 ## 8. 已完成验证
 
@@ -410,6 +421,9 @@ Isolation verified: deleted ... without disrupting [...]
 - 扩容时启动两个独立 vLLM 实例；
 - 缩容后保留实例继续正常运行；
 - 当前穿刺运行未报错。
+
+新增的 AgentWorkflow V1 Proxy 生命周期已完成本地静态检查，但尚待公司 NPU
+环境执行 `--verify-proxy` 穿刺和真实 `MathAgent` 端到端训练验证。
 
 本地完成的静态检查包括：
 
@@ -429,10 +443,10 @@ git switch ascend-v1.0.4
 git pull --ff-only origin ascend-v1.0.4
 ```
 
-预期 HEAD：
+同步后确认最近提交中包含：
 
 ```text
-bbc408d9
+c7f90d34
 ```
 
 ### 9.2 单 role 隔离穿刺
@@ -515,7 +529,8 @@ Closed-loop report -> desired state 1 -> 2 -> 1 spike passed
 ```bash
 python examples/math/rollout_elastic_autoscaler_spike.py \
   --base-url http://127.0.0.1:PORT \
-  --dry-run
+  --dry-run \
+  --require-proxy
 ```
 
 持续读取训练真实报告并执行建议：
@@ -524,7 +539,8 @@ python examples/math/rollout_elastic_autoscaler_spike.py \
 python examples/math/rollout_elastic_autoscaler_spike.py \
   --base-url http://127.0.0.1:PORT \
   --poll-interval 5 \
-  --cooldown 30
+  --cooldown 30 \
+  --require-proxy
 ```
 
 真实报告模式持续运行，使用 `Ctrl-C` 停止。脚本只在建议目标与当前 desired state
@@ -532,16 +548,26 @@ python examples/math/rollout_elastic_autoscaler_spike.py \
 
 ### 9.5 端到端训练
 
-在原 NPU 训练命令中至少增加：
+`gsm8k_grpo_npu.yaml` 尚未显式声明 `rollout.elastic`，因此命令行新增字段需要使用
+Hydra 的 `+` 语法。使用新的 experiment/trial 名称启动：
 
-```text
-actor.weight_update_mode=disk
-rollout.elastic.enabled=true
-rollout.elastic.min_instances=1
-rollout.elastic.initial_instances=1
-rollout.elastic.max_instances=2
-scheduler.type=ray
+```bash
+AREAL_SPMD_MODE=false python examples/math/gsm8k_rl.py \
+  --config examples/math/gsm8k_grpo_npu.yaml \
+  scheduler.type=ray \
+  actor.weight_update_mode=disk \
+  +rollout.elastic.enabled=true \
+  +rollout.elastic.min_instances=1 \
+  +rollout.elastic.initial_instances=1 \
+  +rollout.elastic.max_instances=2 \
+  +rollout.elastic.reconcile_interval_seconds=2 \
+  +rollout.elastic.role_prefix=rollout-elastic-e2e \
+  experiment_name=gsm8k-elastic-e2e \
+  trial_name=trial-e2e-01
 ```
+
+该示例继续使用 `areal.workflow.openai.math_agent.MathAgent`。Trainer 会在训练开始前
+调用 `start_proxy()`，为当前和后续扩容实例创建独立 V1 Proxy。
 
 验证步骤：
 
@@ -549,7 +575,7 @@ scheduler.type=ray
 2. 等待至少完成一个训练 step 和一次 disk 权重更新；
 3. 查询 Controller 日志中的 callback 地址；
 4. 调用 HTTP 将 desired 从 1 调整为 2；
-5. 等待新实例进入 `READY`；
+5. 等待新实例完成 V1 Proxy 初始化和 disk 追平后进入 `READY`；
 6. 确认训练继续推进；
 7. 将 desired 从 2 调整回 1；
 8. 确认被删除实例先进入 `DRAINING`；
@@ -575,6 +601,8 @@ curl -X PUT "${BASE_URL}/elastic/desired-instances" \
 ```text
 pending_update_version == null
 每个 READY 实例的 loaded_version == serving_version
+proxy_enabled == true
+每个 READY 实例的 proxy_ready == true
 last_reconcile_error == null
 ```
 
@@ -603,6 +631,8 @@ rollout.elastic.enabled=false
 - active task、direct request 或 update lease 非零时不能删除实例；
 - 所有 `READY` 实例最终使用同一个 serving version；
 - 单个 role 删除不能影响其他实例；
+- AgentWorkflow task 使用的 proxy_addr 必须属于同一个已绑定 instance；
+- 缩容必须先排空 task，再删除 proxy role，最后删除 rollout role；
 - Controller 重启不能读取其他 experiment/trial 的恢复状态；
 - checkpoint GC 不能删除正在使用的版本；
 - `elastic.enabled=false` 不发生功能回归。
