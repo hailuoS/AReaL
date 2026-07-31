@@ -5,12 +5,12 @@
 本次开发基于 AReaL `ascend-v1.0.4` NPU 分支，在
 `RolloutController` V1 上完成了单节点 Rollout 弹性扩缩容的主体功能。
 
-实现结果相对 `upstream/ascend-v1.0.4` 共包含 29 个提交，当前个人仓分支为：
+实现结果维护在以下个人仓分支；精确提交列表以
+`git log upstream/ascend-v1.0.4..HEAD` 为准：
 
 ```text
 仓库：https://github.com/hailuoS/AReaL
 分支：ascend-v1.0.4
-HEAD：bbc408d9
 ```
 
 当前实现支持：
@@ -19,6 +19,7 @@ HEAD：bbc408d9
 - Controller 根据 desired state 执行 `1 -> N -> 1` 扩缩容；
 - 每个弹性实例都是完整的单节点 `TP × PP` Rollout 实例；
 - 每个实例使用独立 Scheduler role、稳定 instance ID 和稳定 engine name；
+- offline AgentWorkflow 为每个实例创建独立的 V1 ProxyRolloutServer；
 - 新实例完成启动、健康检查及 disk 权重追平后才进入 `READY`；
 - 推理任务只路由到 `READY` 实例；
 - 训练 step 使用 disk 模式更新全部 `READY` 实例；
@@ -112,6 +113,11 @@ Launcher 复用当前 NPU 分支已有的 worker 启动、server 初始化、设
 
 启动前会检查单个完整实例能够放入一个节点。当前不会将一个实例拆到多个节点。
 
+当训练使用 AgentWorkflow 时，Controller 会为每个实例从其独立 rollout role
+fork 一个稳定的 proxy role。Proxy 初始化到该实例的 server 地址后，实例才能进入
+`READY`。缩容时先删除 proxy role，再删除 rollout role。RolloutWorkflow 不会创建
+这些 Proxy 资源。
+
 ### 3.4 Desired-state Reconciler
 
 Reconciler 周期性比较：
@@ -128,6 +134,7 @@ desired_instances
   -> 创建独立 Scheduler role
   -> 启动完整 TP × PP server
   -> 健康检查
+  -> AgentWorkflow 模式下创建并初始化实例专属 V1 Proxy
   -> 加载当前 serving version 对应的 disk checkpoint
   -> 设置 loaded_version
   -> READY
@@ -144,7 +151,8 @@ READY
   -> 停止分配新请求
   -> active task/direct request/update lease 全部归零
   -> STOPPING
-  -> 删除独立 Scheduler role
+  -> 删除实例专属 proxy role
+  -> 删除独立 rollout role
   -> 从 InstancePool 移除
 ```
 
@@ -185,6 +193,7 @@ workflow task 的路径为：
   -> BatchTaskDispatcher
   -> InstancePool.reserve_task
   -> 原子选择 READY 实例并绑定 task_id
+  -> AgentWorkflow 使用同一实例的 proxy_addr
   -> scheduler.async_call_engine
   -> callback server 收到结果
   -> 完成 future
@@ -321,7 +330,7 @@ wait_fraction < 0.05 且 entered > 0 且 consumed > 0:
 | 单 role 隔离穿刺 | `examples/math/rollout_role_spike.py` |
 | HTTP 扩缩容穿刺 | `examples/math/rollout_elastic_controller_spike.py` |
 
-## 7. 29 个提交
+## 7. 实施提交
 
 ### 阶段一：实例隔离和静态结构
 
@@ -376,6 +385,14 @@ af373d11 fix(infra): make elastic instance leases atomic
 602c1fb6 test(examples): verify elastic serving version convergence
 bbc408d9 docs: document elastic V1 runtime boundaries
 ```
+
+### 阶段六：外部闭环和 AgentWorkflow V1 Proxy
+
+- 增加读取扩缩容报告并设置 desired state 的外部 autoscaler 穿刺；
+- 为每个弹性实例增加稳定的 Proxy 身份和地址；
+- 从实例 rollout role fork 独立 V1 ProxyRolloutServer；
+- AgentWorkflow task 与 rollout、proxy 使用同一个 instance 绑定；
+- 将 Proxy 纳入扩容 READY、失败回滚、缩容删除和 Controller 恢复。
 
 ## 8. 已完成验证
 
@@ -443,7 +460,7 @@ AREAL_SPMD_MODE=false python examples/math/rollout_role_spike.py \
 ```bash
 AREAL_SPMD_MODE=false python \
   examples/math/rollout_elastic_controller_spike.py \
-  --verify-recommendation --verify-recovery -- \
+  --verify-recommendation --verify-recovery --verify-proxy -- \
   --config examples/math/gsm8k_grpo_npu.yaml \
   scheduler.type=ray
 ```
@@ -455,6 +472,7 @@ AREAL_SPMD_MODE=false python \
 - 初始 1 个 `READY` 实例；
 - HTTP 设置 desired 为 2 后出现 2 个 `READY` 实例；
 - 两个实例具有不同 instance ID、worker role 和 engine name；
+- 每个实例具有独立 proxy role，且 `proxy_ready=true`；
 - HTTP 设置 desired 为 1 后完成 drain 并删除一个 role；
 - 原实例保持健康；
 - scale-up、hold 和 scale-down 建议符合预期；
@@ -471,7 +489,8 @@ AREAL_SPMD_MODE=false python \
 ```bash
 python examples/math/rollout_elastic_autoscaler_spike.py \
   --base-url http://127.0.0.1:PORT \
-  --inject-spike
+  --inject-spike \
+  --require-proxy
 ```
 
 脚本要求初始状态为 1 个稳定的 `READY` 实例。它会：

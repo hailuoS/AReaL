@@ -9,6 +9,10 @@ Rollout 弹性扩缩容是 `RolloutController` V1 的可选单节点扩展，不
 role 和稳定、非数组下标的 instance ID。单个实例必须能够放入一个节点。
 暂不支持跨节点实例和动态 Proxy online session。
 
+offline AgentWorkflow 使用实例专属的 V1 ProxyRolloutServer。Proxy 使用独立、
+稳定的 Scheduler role，与所属 Rollout 实例一起创建、路由、排空和删除。该能力
+不启动 Proxy Gateway，也不接受外部 online session。
+
 弹性模式仅支持 disk 权重同步。启用时会提前拒绝 AWEX、XCCL、V2 和 Proxy
 online 配置。独立的共享 server eval rollout 暂不支持；训练可以继续，
 validation rollout 会跳过并输出 warning。
@@ -55,13 +59,15 @@ Scheduler role。新实例完成 server 初始化并加载准确的已提交 dis
 才能进入 `READY`。
 
 `GET /elastic/instances` 会返回 `serving_version`、
-`pending_update_version` 以及每个实例的 `loaded_version`。
+`pending_update_version` 以及每个实例的 `loaded_version`、`proxy_role`、
+`proxy_addr` 和 `proxy_ready`。顶层 `proxy_enabled` 用于区分需要 Proxy 的
+AgentWorkflow Controller 和不需要 Proxy 的 RolloutWorkflow Controller。
 
 缩容时实例先进入 `DRAINING`，不再接收新请求；只有 workflow task、direct
 request 和 weight-update lease 全部清零后才会删除。超过
 `drain_timeout_seconds` 时只记录 reconcile error，不会强制删除仍有在途操作的
-实例。实例模型预留了 active session 统计，但动态 Proxy session 路由和 drain
-尚未接入。
+实例。offline AgentWorkflow session 被所属 workflow task lease 覆盖；动态 Proxy
+Gateway online session 路由和 drain 尚未接入。
 
 ## 扩缩容建议
 
@@ -102,7 +108,7 @@ version、已提交 checkpoint 和所属 Scheduler roles。恢复文件按
 
 ```bash
 AREAL_SPMD_MODE=false python examples/math/rollout_elastic_controller_spike.py \
-  --verify-recommendation --verify-recovery -- \
+  --verify-recommendation --verify-recovery --verify-proxy -- \
   --config examples/math/gsm8k_grpo_npu.yaml scheduler.type=ray
 ```
 

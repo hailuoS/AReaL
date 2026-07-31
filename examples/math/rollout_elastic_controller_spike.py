@@ -40,6 +40,11 @@ def _parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         action="store_true",
         help="Restart the V1 Controller and verify desired-state recovery.",
     )
+    parser.add_argument(
+        "--verify-proxy",
+        action="store_true",
+        help="Attach one V1 ProxyRolloutServer to every elastic instance.",
+    )
     options, config_args = parser.parse_known_args(argv)
     if config_args and config_args[0] == "--":
         config_args = config_args[1:]
@@ -54,7 +59,13 @@ def _get_instances(base_url: str) -> dict:
     return response.json()
 
 
-def _wait_for_instances(base_url: str, count: int, timeout: float = 600.0) -> None:
+def _wait_for_instances(
+    base_url: str,
+    count: int,
+    timeout: float = 600.0,
+    *,
+    require_proxy: bool = False,
+) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         payload = _get_instances(base_url)
@@ -68,8 +79,16 @@ def _wait_for_instances(base_url: str, count: int, timeout: float = 600.0) -> No
         )
         if ready == count and total == count:
             instances = payload["instances"]
+            if require_proxy and not payload["proxy_enabled"]:
+                raise RuntimeError("Elastic V1 proxy workers are not enabled")
             if any(instance["state"] != "ready" for instance in instances):
                 raise RuntimeError(f"Non-READY instance in ready snapshot: {instances}")
+            if require_proxy and any(
+                not instance["proxy_ready"] for instance in instances
+            ):
+                raise RuntimeError(
+                    f"READY instance does not have a V1 proxy: {instances}"
+                )
             if any(
                 instance["loaded_version"] != payload["serving_version"]
                 for instance in instances
@@ -167,17 +186,20 @@ def main(argv: list[str] | None = None) -> None:
         controller.initialize(role=_CONTROLLER_ROLE, server_args=server_args)
         base_url = f"http://{controller.callback_addr}"
         _wait_for_instances(base_url, 1)
+        if options.verify_proxy:
+            controller.start_proxy()
+            _wait_for_instances(base_url, 1, require_proxy=True)
         initial_role = _get_instances(base_url)["instances"][0]["worker_role"]
         if options.verify_recommendation:
             _verify_recommendations(base_url, ready_instances=1)
 
         _set_desired(base_url, 2)
-        _wait_for_instances(base_url, 2)
+        _wait_for_instances(base_url, 2, require_proxy=options.verify_proxy)
         if options.verify_recommendation:
             _verify_recommendations(base_url, ready_instances=2)
 
         _set_desired(base_url, 1)
-        _wait_for_instances(base_url, 1)
+        _wait_for_instances(base_url, 1, require_proxy=options.verify_proxy)
         final_role = _get_instances(base_url)["instances"][0]["worker_role"]
         if final_role != initial_role:
             raise RuntimeError(
@@ -196,7 +218,9 @@ def main(argv: list[str] | None = None) -> None:
                 role=_CONTROLLER_ROLE, server_args=server_args
             )
             recovered_url = f"http://{recovered_controller.callback_addr}"
-            _wait_for_instances(recovered_url, 1)
+            if options.verify_proxy:
+                recovered_controller.start_proxy()
+            _wait_for_instances(recovered_url, 1, require_proxy=options.verify_proxy)
             status = _get_instances(recovered_url)
             if status["desired_instances"] != 1:
                 raise RuntimeError(f"Desired state was not recovered: {status}")
