@@ -8,10 +8,17 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from areal.api import InferenceEngine, Job, LocalInfServerInfo, Scheduler
+from areal.api import (
+    InferenceEngine,
+    Job,
+    LocalInfServerInfo,
+    Scheduler,
+    WeightUpdateMeta,
+)
 from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import InferenceEngineConfig, SchedulingSpec
 
+from .disk_catalog import DiskCheckpointManifest
 from .errors import SingleNodeInstanceError
 from .models import RolloutInstance, RolloutInstanceState
 
@@ -141,6 +148,40 @@ class RolloutInstanceLauncher:
                 instance.transition_to(RolloutInstanceState.FAILED)
             if workers_created:
                 self._scheduler.delete_workers(role=worker_role)
+            raise
+
+    async def catch_up_from_disk(
+        self,
+        instance: RolloutInstance,
+        checkpoint: DiskCheckpointManifest,
+    ) -> None:
+        """Load one committed disk version before making an instance routable."""
+        if instance.state is not RolloutInstanceState.CATCHING_UP:
+            raise ValueError("instance must be in CATCHING_UP before disk catch-up")
+
+        meta = WeightUpdateMeta(
+            type="disk",
+            path=checkpoint.path,
+            version=checkpoint.version,
+            clear_checkpoint_after_load=False,
+        )
+        try:
+            await self._scheduler.async_call_engine(
+                worker_id=instance.worker_id,
+                method="update_weights_from_disk",
+                engine_name=instance.engine_name,
+                meta=meta,
+            )
+            await self._scheduler.async_call_engine(
+                worker_id=instance.worker_id,
+                method="set_version",
+                engine_name=instance.engine_name,
+                version=checkpoint.version,
+            )
+            instance.loaded_version = checkpoint.version
+            instance.transition_to(RolloutInstanceState.READY)
+        except BaseException:
+            instance.transition_to(RolloutInstanceState.FAILED)
             raise
 
     def destroy(self, instance: RolloutInstance) -> None:

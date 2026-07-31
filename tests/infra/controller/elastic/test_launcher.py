@@ -8,6 +8,7 @@ import pytest
 from areal.api import LocalInfServerInfo, Worker
 from areal.api.cli_args import SchedulingSpec
 from areal.infra.controller.elastic import (
+    DiskCheckpointManifest,
     RolloutInstanceLauncher,
     RolloutInstanceState,
     SingleNodeInstanceError,
@@ -129,6 +130,61 @@ async def test_launch_rejects_cross_node_instance_before_creating_workers():
         )
 
     assert scheduler.created_job is None
+
+
+@pytest.mark.asyncio
+async def test_catch_up_loads_committed_checkpoint_before_ready(tmp_path):
+    """A launched instance cannot route before disk loading and versioning finish."""
+    launcher, scheduler = _launcher()
+    result = await launcher.launch(
+        instance_id="ri-a",
+        worker_role="rollout-elastic-ri-a",
+        server_args={},
+    )
+    checkpoint = tmp_path / "weight_update_v7"
+    checkpoint.mkdir()
+
+    await launcher.catch_up_from_disk(
+        result.instance,
+        DiskCheckpointManifest(version=7, path=str(checkpoint)),
+    )
+
+    assert result.instance.state is RolloutInstanceState.READY
+    assert result.instance.loaded_version == 7
+    update_call = next(
+        call for call in scheduler.engine_calls if call[0] == "update_weights_from_disk"
+    )
+    assert update_call[3]["meta"].path == str(checkpoint)
+    assert update_call[3]["meta"].version == 7
+    assert any(call[0] == "set_version" for call in scheduler.engine_calls)
+
+
+@pytest.mark.asyncio
+async def test_catch_up_failure_marks_instance_failed(tmp_path):
+    """A failed disk load never accidentally exposes a partially caught-up server."""
+    launcher, scheduler = _launcher()
+    result = await launcher.launch(
+        instance_id="ri-a",
+        worker_role="rollout-elastic-ri-a",
+        server_args={},
+    )
+    checkpoint = tmp_path / "weight_update_v7"
+    checkpoint.mkdir()
+
+    async def fail_weight_update(worker_id, method, engine_name, **kwargs):
+        if method == "update_weights_from_disk":
+            raise RuntimeError("disk load failed")
+        return None
+
+    scheduler.async_call_engine = fail_weight_update
+
+    with pytest.raises(RuntimeError, match="disk load failed"):
+        await launcher.catch_up_from_disk(
+            result.instance,
+            DiskCheckpointManifest(version=7, path=str(checkpoint)),
+        )
+
+    assert result.instance.state is RolloutInstanceState.FAILED
 
 
 def test_destroy_requires_drain_teardown_state():
