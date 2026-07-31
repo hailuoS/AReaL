@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -86,6 +87,24 @@ class DiskCheckpointCatalog:
         """Return a version-sorted immutable checkpoint snapshot."""
         manifests = self._read_manifests()
         return tuple(manifests[version] for version in sorted(manifests))
+
+    def collect_garbage(
+        self, *, retention: int, protected_versions: set[int] | frozenset[int] = frozenset()
+    ) -> tuple[DiskCheckpointManifest, ...]:
+        """Remove old committed directories except explicitly protected versions."""
+        if retention < 1:
+            raise DiskCheckpointCatalogError("checkpoint retention must be at least 1")
+        manifests = self._read_manifests()
+        retained = set(sorted(manifests, reverse=True)[:retention]) | set(protected_versions)
+        removed = []
+        for version in sorted(set(manifests) - retained):
+            manifest = manifests[version]
+            shutil.rmtree(manifest.path)
+            removed.append(manifest)
+            del manifests[version]
+        if removed:
+            self._write_manifests(manifests)
+        return tuple(removed)
 
     def _read_manifests(self) -> dict[int, DiskCheckpointManifest]:
         if not self._path.exists():

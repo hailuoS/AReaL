@@ -1444,6 +1444,19 @@ class RolloutController:
         self._disk_checkpoint_catalog.commit(
             DiskCheckpointManifest(version=meta.version, path=str(checkpoint_path))
         )
+        protected_versions = {
+            instance.loaded_version
+            for instance_id in self._instance_pool.instance_ids()
+            for instance in [self._instance_pool.get(instance_id)]
+            if instance.loaded_version is not None
+            and (
+                instance.state.value == "catching_up" or instance.update_leases > 0
+            )
+        }
+        self._disk_checkpoint_catalog.collect_garbage(
+            retention=self.config.elastic.checkpoint_retention,
+            protected_versions=protected_versions,
+        )
 
     async def update_weights_from_awex(
         self,

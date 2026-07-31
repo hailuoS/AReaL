@@ -72,3 +72,20 @@ def test_invalid_catalog_payload_is_rejected(tmp_path):
 
     with pytest.raises(DiskCheckpointCatalogError, match="catalog checkpoints"):
         catalog.list()
+
+
+def test_collect_garbage_keeps_recent_and_protected_versions(tmp_path):
+    catalog = DiskCheckpointCatalog(tmp_path / "catalog")
+    checkpoints = []
+    for version in range(3):
+        checkpoint = tmp_path / f"weight_update_v{version}"
+        checkpoint.mkdir()
+        catalog.commit(DiskCheckpointManifest(version, str(checkpoint)))
+        checkpoints.append(checkpoint)
+
+    removed = catalog.collect_garbage(retention=1, protected_versions={0})
+
+    assert [manifest.version for manifest in removed] == [1]
+    assert checkpoints[0].is_dir()
+    assert not checkpoints[1].exists()
+    assert checkpoints[2].is_dir()
