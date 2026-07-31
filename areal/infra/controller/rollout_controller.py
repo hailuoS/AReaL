@@ -1276,11 +1276,24 @@ class RolloutController:
 
     async def update_weights_from_disk(self, meta: WeightUpdateMeta):
         meta.clear_checkpoint_after_load = False
-        await self._collective_rpc_async("update_weights_from_disk", meta=meta)
-        if self.config.elastic.enabled:
-            self._record_elastic_disk_checkpoint(meta)
-        else:
-            shutil.rmtree(meta.path, ignore_errors=True)
+        targets = self._rollout_rpc_targets()
+        leased_instance_ids: list[str] = []
+        try:
+            if self._instance_pool is not None:
+                for target in targets:
+                    self._instance_pool.acquire_update_lease(target.instance_id)
+                    leased_instance_ids.append(target.instance_id)
+            await self._collective_rpc_on_targets_async(
+                "update_weights_from_disk", targets, meta=meta
+            )
+            if self.config.elastic.enabled:
+                self._record_elastic_disk_checkpoint(meta)
+            else:
+                shutil.rmtree(meta.path, ignore_errors=True)
+        finally:
+            if self._instance_pool is not None:
+                for instance_id in leased_instance_ids:
+                    self._instance_pool.release_update_lease(instance_id)
 
     def _record_elastic_disk_checkpoint(self, meta: WeightUpdateMeta) -> None:
         """Persist a successfully loaded checkpoint for a future elastic instance.
