@@ -9,6 +9,7 @@ import traceback
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from threading import Lock
 from typing import Any
 
@@ -35,7 +36,12 @@ from areal.api.cli_args import (
     PerfTracerConfig,
     SchedulingSpec,
 )
-from areal.infra.controller.elastic import RolloutRPCTarget
+from areal.infra.controller.elastic import (
+    DiskCheckpointCatalog,
+    DiskCheckpointCatalogError,
+    DiskCheckpointManifest,
+    RolloutRPCTarget,
+)
 from areal.infra.rpc.serialization import deserialize_value
 from areal.infra.utils.concurrent import run_async_task
 from areal.utils import logging, perf_tracer
@@ -95,6 +101,7 @@ class RolloutController:
         # State
         self._version_lock = Lock()
         self._version = 0
+        self._disk_checkpoint_catalog: DiskCheckpointCatalog | None = None
 
         self._task_id_generator = TaskIdGenerator()
 
@@ -1118,7 +1125,44 @@ class RolloutController:
     async def update_weights_from_disk(self, meta: WeightUpdateMeta):
         meta.clear_checkpoint_after_load = False
         await self._collective_rpc_async("update_weights_from_disk", meta=meta)
-        shutil.rmtree(meta.path, ignore_errors=True)
+        if self.config.elastic.enabled:
+            self._record_elastic_disk_checkpoint(meta)
+        else:
+            shutil.rmtree(meta.path, ignore_errors=True)
+
+    def _record_elastic_disk_checkpoint(self, meta: WeightUpdateMeta) -> None:
+        """Persist a successfully loaded checkpoint for a future elastic instance.
+
+        This runs only after every current V1 rollout worker has completed the
+        disk update.  The static lifecycle intentionally keeps its historical
+        immediate cleanup behavior.
+        """
+        if meta.type != "disk":
+            raise DiskCheckpointCatalogError(
+                "elastic rollout checkpoint catalog requires disk updates"
+            )
+        if meta.version is None:
+            raise DiskCheckpointCatalogError(
+                "elastic disk weight updates require a checkpoint version"
+            )
+        if meta.path is None:
+            raise DiskCheckpointCatalogError(
+                "elastic disk weight updates require a checkpoint path"
+            )
+
+        checkpoint_path = Path(meta.path).resolve()
+        if self._disk_checkpoint_catalog is None:
+            self._disk_checkpoint_catalog = DiskCheckpointCatalog(
+                checkpoint_path.parent
+            )
+        elif self._disk_checkpoint_catalog.path.parent != checkpoint_path.parent:
+            raise DiskCheckpointCatalogError(
+                "elastic disk checkpoint directory changed during one run"
+            )
+
+        self._disk_checkpoint_catalog.commit(
+            DiskCheckpointManifest(version=meta.version, path=str(checkpoint_path))
+        )
 
     async def update_weights_from_awex(
         self,
