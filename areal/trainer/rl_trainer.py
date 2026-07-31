@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import os
+import time
 from collections.abc import Callable
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, cast
@@ -645,6 +646,7 @@ class PPOTrainer:
 
             if self._should_offload_rollout:
                 self._onload_rollout()
+            rollout_started_at = time.monotonic()
             with (
                 stats_tracker.record_timing("rollout"),
                 perf_tracer.trace_scope(
@@ -664,6 +666,25 @@ class PPOTrainer:
                     group_size=config.gconfig.n_samples,
                     dynamic_bs=self.config.dynamic_bs,
                 )
+            if isinstance(self.rollout, RolloutController) and self.rollout.config.elastic.enabled:
+                accepted = self.rollout.staleness_manager.get_stats().accepted
+                previous_accepted = getattr(self, "_elastic_last_accepted", None)
+                previous_rollout_started = getattr(
+                    self, "_elastic_previous_rollout_started", None
+                )
+                entered = 0 if previous_accepted is None else max(0, accepted - previous_accepted)
+                self._elastic_last_accepted = accepted
+                self.rollout.record_elastic_scaling_window(
+                    entered=entered,
+                    consumed=len(rollout_batch),
+                    wait_seconds=time.monotonic() - rollout_started_at,
+                    step_seconds=(
+                        0.0
+                        if previous_rollout_started is None
+                        else rollout_started_at - previous_rollout_started
+                    ),
+                )
+                self._elastic_previous_rollout_started = rollout_started_at
             if self._should_offload_rollout:
                 self._offload_rollout()
 

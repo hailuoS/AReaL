@@ -24,6 +24,11 @@ from .models import (
     RolloutRPCTarget,
 )
 from .reconciler import ReconcileResult, RolloutInstanceReconciler
+from .scaling_report import (
+    ElasticScalingRecommendation,
+    ElasticScalingWindow,
+    recommend_instances,
+)
 
 __all__ = [
     "DuplicateInstanceError",
@@ -45,6 +50,9 @@ __all__ = [
     "RolloutInstanceState",
     "RolloutRPCTarget",
     "ReconcileResult",
+    "ElasticScalingRecommendation",
+    "ElasticScalingWindow",
+    "recommend_instances",
     "SingleNodeInstanceError",
     "TaskBindingError",
 ]

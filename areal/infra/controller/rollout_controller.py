@@ -40,11 +40,13 @@ from areal.infra.controller.elastic import (
     DiskCheckpointCatalog,
     DiskCheckpointCatalogError,
     DiskCheckpointManifest,
+    ElasticScalingWindow,
     InvalidDesiredCountError,
     RolloutInstanceLauncher,
     RolloutInstancePool,
     RolloutInstanceReconciler,
     RolloutRPCTarget,
+    recommend_instances,
 )
 from areal.infra.rpc.serialization import deserialize_value
 from areal.infra.utils.concurrent import run_async_task
@@ -112,6 +114,7 @@ class RolloutController:
         self._elastic_reconcile_stop = threading.Event()
         self._elastic_reconcile_thread: threading.Thread | None = None
         self._elastic_last_reconcile_error: str | None = None
+        self._elastic_scaling_report: dict[str, Any] | None = None
         if config.elastic.enabled:
             self._instance_pool = RolloutInstancePool(
                 min_instances=config.elastic.min_instances,
@@ -284,6 +287,33 @@ class RolloutController:
         self._staleness_manager.set_max_concurrent_rollouts(
             max(1, ready_instances * self._elastic_capacity_per_instance)
         )
+
+    def record_elastic_scaling_window(
+        self, *, entered: int, consumed: int, wait_seconds: float, step_seconds: float
+    ) -> dict[str, Any]:
+        """Store an AstraFlow-compatible report without changing desired state."""
+        assert self._instance_pool is not None
+        window = ElasticScalingWindow(
+            ready_instances=len(self._instance_pool.ready_snapshot()),
+            entered=entered,
+            consumed=consumed,
+            wait_seconds=wait_seconds,
+            step_seconds=step_seconds,
+        )
+        recommendation = recommend_instances(
+            window,
+            min_instances=self.config.elastic.min_instances,
+            max_instances=self.config.elastic.max_instances,
+        )
+        self._elastic_scaling_report = {
+            "branch": recommendation.branch,
+            "recommended_instances": recommendation.recommended_instances,
+            "rollout_wait_fraction": recommendation.rollout_wait_fraction,
+            "entered": entered,
+            "consumed": consumed,
+            "ready_instances": window.ready_instances,
+        }
+        return self._elastic_scaling_report
 
     def _elastic_reconcile_loop(self) -> None:
         while not self._elastic_reconcile_stop.wait(
@@ -775,6 +805,38 @@ class RolloutController:
                     "instances": instances,
                 }
             )
+
+        @app.route("/elastic/scaling-recommendation", methods=["GET", "POST"])
+        def elastic_scaling_recommendation():
+            if self._instance_pool is None:
+                return jsonify({"error": "elastic rollout is disabled"}), 409
+            if request.method == "GET":
+                return jsonify(self._elastic_scaling_report or {"status": "empty"})
+            payload = request.get_json(silent=True) or {}
+            try:
+                window = ElasticScalingWindow(
+                    ready_instances=len(self._instance_pool.ready_snapshot()),
+                    entered=int(payload["entered"]),
+                    consumed=int(payload["consumed"]),
+                    wait_seconds=float(payload["wait_seconds"]),
+                    step_seconds=float(payload["step_seconds"]),
+                )
+                recommendation = recommend_instances(
+                    window,
+                    min_instances=self.config.elastic.min_instances,
+                    max_instances=self.config.elastic.max_instances,
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                return jsonify({"error": str(exc)}), 400
+            self._elastic_scaling_report = {
+                "branch": recommendation.branch,
+                "recommended_instances": recommendation.recommended_instances,
+                "rollout_wait_fraction": recommendation.rollout_wait_fraction,
+                "entered": window.entered,
+                "consumed": window.consumed,
+                "ready_instances": window.ready_instances,
+            }
+            return jsonify(self._elastic_scaling_report)
 
         @app.route("/callback/pause_generation", methods=["POST"])
         def pause_generation():
