@@ -40,6 +40,8 @@ from areal.infra.controller.elastic import (
     DiskCheckpointCatalog,
     DiskCheckpointCatalogError,
     DiskCheckpointManifest,
+    InvalidDesiredCountError,
+    RolloutInstancePool,
     RolloutRPCTarget,
 )
 from areal.infra.rpc.serialization import deserialize_value
@@ -102,6 +104,13 @@ class RolloutController:
         self._version_lock = Lock()
         self._version = 0
         self._disk_checkpoint_catalog: DiskCheckpointCatalog | None = None
+        self._instance_pool: RolloutInstancePool | None = None
+        if config.elastic.enabled:
+            self._instance_pool = RolloutInstancePool(
+                min_instances=config.elastic.min_instances,
+                initial_instances=config.elastic.initial_instances,
+                max_instances=config.elastic.max_instances,
+            )
 
         self._task_id_generator = TaskIdGenerator()
 
@@ -603,6 +612,40 @@ class RolloutController:
                 self.update_weights_from_awex(meta, step_id=step_id, kwargs=kwargs)
             )
             return jsonify({"status": "ok"})
+
+        @app.route("/elastic/desired-instances", methods=["GET", "PUT"])
+        def elastic_desired_instances():
+            """Read or update desired complete TP x PP rollout instances.
+
+            This endpoint is intentionally a desired-state control plane.  A
+            later reconciler owns resource creation and graceful teardown, so
+            an HTTP request never creates or kills Scheduler workers inline.
+            """
+            if self._instance_pool is None:
+                return jsonify({"error": "elastic rollout is disabled"}), 409
+
+            if request.method == "GET":
+                return jsonify(
+                    {
+                        "desired_instances": self._instance_pool.desired_count,
+                        "instance_ids": self._instance_pool.instance_ids(),
+                    }
+                )
+
+            payload = request.get_json(silent=True) or {}
+            desired_count = payload.get("desired_instances")
+            if isinstance(desired_count, bool) or not isinstance(desired_count, int):
+                return jsonify({"error": "desired_instances must be an integer"}), 400
+            try:
+                self._instance_pool.set_desired_count(desired_count)
+            except InvalidDesiredCountError as exc:
+                return jsonify({"error": str(exc)}), 400
+            return jsonify(
+                {
+                    "desired_instances": self._instance_pool.desired_count,
+                    "instance_ids": self._instance_pool.instance_ids(),
+                }
+            )
 
         @app.route("/callback/pause_generation", methods=["POST"])
         def pause_generation():
