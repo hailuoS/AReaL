@@ -118,10 +118,12 @@ class RolloutController:
         self._elastic_last_reconcile_error: str | None = None
         self._elastic_scaling_report: dict[str, Any] | None = None
         self._elastic_recovery_store: ElasticRecoveryStore | None = None
+        self._elastic_reconcile_lock = threading.Lock()
         self._elastic_update_condition = threading.Condition()
         self._elastic_pending_update_version: int | None = None
         self._elastic_catchups_inflight = 0
         self._elastic_pending_worker_roles: set[str] = set()
+        self._elastic_proxy_enabled = False
         if config.elastic.enabled:
             self._instance_pool = RolloutInstancePool(
                 min_instances=config.elastic.min_instances,
@@ -311,6 +313,7 @@ class RolloutController:
             end_catch_up=self._end_elastic_catch_up,
             record_launch_intent=self._record_elastic_launch_intent,
             clear_launch_intent=self._clear_elastic_launch_intent,
+            proxy_enabled=lambda: self._elastic_proxy_enabled,
         )
         run_async_task(self._reconcile_elastic_once)
         self._elastic_reconcile_thread = threading.Thread(
@@ -357,9 +360,10 @@ class RolloutController:
 
     async def _reconcile_elastic_once(self) -> None:
         assert self._elastic_reconciler is not None
-        await self._elastic_reconciler.reconcile_once()
-        self._refresh_elastic_capacity()
-        self._save_elastic_recovery_state()
+        with self._elastic_reconcile_lock:
+            await self._elastic_reconciler.reconcile_once()
+            self._refresh_elastic_capacity()
+            self._save_elastic_recovery_state()
 
     def _begin_elastic_catch_up(self) -> None:
         with self._elastic_update_condition:
@@ -458,6 +462,12 @@ class RolloutController:
             with self._elastic_update_condition:
                 pending_worker_roles = frozenset(self._elastic_pending_worker_roles)
             instances = self._instance_pool.instances_snapshot()
+            instance_roles = {instance.worker_role for instance in instances}
+            instance_roles.update(
+                instance.proxy_role
+                for instance in instances
+                if instance.proxy_role is not None
+            )
             self._elastic_recovery_store.save(
                 ElasticRecoveryState(
                     schema_version=self.config.elastic.recovery_schema_version,
@@ -469,12 +479,7 @@ class RolloutController:
                     checkpoint_path=(
                         checkpoint.path if checkpoint is not None else None
                     ),
-                    worker_roles=tuple(
-                        sorted(
-                            {instance.worker_role for instance in instances}
-                            | pending_worker_roles
-                        )
-                    ),
+                    worker_roles=tuple(sorted(instance_roles | pending_worker_roles)),
                 )
             )
 
@@ -653,11 +658,13 @@ class RolloutController:
             for instance_id in self._instance_pool.instance_ids():
                 instance = self._instance_pool.get(instance_id)
                 try:
+                    if instance.proxy_role is not None:
+                        self.scheduler.delete_workers(role=instance.proxy_role)
                     self.scheduler.delete_workers(role=instance.worker_role)
                 except Exception:
                     logger.error(
-                        "Error deleting elastic worker role %s: %s",
-                        instance.worker_role,
+                        "Error deleting elastic instance %s roles: %s",
+                        instance.instance_id,
                         traceback.format_exc(),
                     )
         elif hasattr(self, "_worker_role"):
@@ -669,7 +676,7 @@ class RolloutController:
                 logger.error(f"Error deleting workers: {traceback.format_exc()}")
 
         # Delete proxy workers if initialized
-        if self._proxy_started:
+        if self._proxy_started and self._instance_pool is None:
             try:
                 self.scheduler.delete_workers(role=self._proxy_role)
                 self.proxy_workers.clear()
@@ -678,6 +685,8 @@ class RolloutController:
                 logger.info("Proxy workers deleted")
             except Exception:
                 logger.error(f"Error deleting proxy workers: {traceback.format_exc()}")
+        elif self._instance_pool is not None:
+            self._proxy_started = False
 
         # Shutdown proxy gateway if initialized
         self._stop_proxy_gateway()
@@ -693,6 +702,32 @@ class RolloutController:
         """
         if self._proxy_started:
             logger.warning("Proxy workers already initialized")
+            return
+
+        if self._instance_pool is not None:
+            if self._elastic_reconciler is None:
+                raise RuntimeError(
+                    "Cannot initialize elastic proxy workers before rollout initialize()"
+                )
+            self._elastic_proxy_enabled = True
+            try:
+                run_async_task(self._reconcile_elastic_once)
+            except BaseException:
+                self._elastic_proxy_enabled = False
+                raise
+            missing_proxy = [
+                instance.instance_id
+                for instance in self._instance_pool.instances_snapshot()
+                if instance.is_routable and not instance.proxy_ready
+            ]
+            if missing_proxy:
+                self._elastic_proxy_enabled = False
+                raise RuntimeError(
+                    "Elastic proxy initialization did not cover READY instances: "
+                    f"{missing_proxy}"
+                )
+            self._proxy_started = True
+            logger.info("Elastic instance-local proxy workers initialized")
             return
 
         if not self.server_infos:
@@ -780,6 +815,11 @@ class RolloutController:
         Creates a FastAPI server that routes requests to backend proxy
         workers. Requires ``start_proxy()`` to have been called first.
         """
+        if self._instance_pool is not None:
+            raise NotImplementedError(
+                "Elastic RolloutController V1 supports instance-local offline "
+                "AgentWorkflow proxies only; Proxy Gateway online routing is deferred"
+            )
         if not self._proxy_started:
             raise RuntimeError(
                 "Proxy workers not initialized. Call start_proxy() first."
@@ -977,6 +1017,11 @@ class RolloutController:
                         "worker_role": instance.worker_role,
                         "worker_id": instance.worker_id,
                         "engine_name": instance.engine_name,
+                        "proxy_role": instance.proxy_role,
+                        "proxy_worker_id": instance.proxy_worker_id,
+                        "proxy_engine_name": instance.proxy_engine_name,
+                        "proxy_addr": instance.proxy_addr,
+                        "proxy_ready": instance.proxy_ready,
                         "state": instance.state.value,
                         "desired_state": instance.desired_state.value,
                         "loaded_version": instance.loaded_version,
@@ -992,6 +1037,7 @@ class RolloutController:
                     "ready_instances": len(self._instance_pool.ready_snapshot()),
                     "serving_version": self.get_version(),
                     "pending_update_version": pending_update_version,
+                    "proxy_enabled": self._elastic_proxy_enabled,
                     "max_concurrent_rollouts": (
                         self._staleness_manager.max_concurrent_rollouts
                         if self._staleness_manager is not None
@@ -1171,9 +1217,32 @@ class RolloutController:
     async def _proxy_collective_rpc_async(
         self, method: str, *args, **kwargs
     ) -> list[Any]:
-        return await self._collective_rpc_on_targets_async(
-            method, self._proxy_rpc_targets(), *args, **kwargs
-        )
+        if self._instance_pool is None:
+            return await self._collective_rpc_on_targets_async(
+                method, self._proxy_rpc_targets(), *args, **kwargs
+            )
+
+        rollout_targets = self._instance_pool.acquire_direct_snapshot()
+        try:
+            proxy_targets = []
+            for target in rollout_targets:
+                if target.proxy_worker_id is None or target.proxy_engine_name is None:
+                    raise RuntimeError(
+                        f"READY instance {target.instance_id} has no initialized proxy"
+                    )
+                proxy_targets.append(
+                    RolloutRPCTarget(
+                        instance_id=target.instance_id,
+                        worker_id=target.proxy_worker_id,
+                        engine_name=target.proxy_engine_name,
+                        proxy_addr=target.proxy_addr,
+                    )
+                )
+            return await self._collective_rpc_on_targets_async(
+                method, tuple(proxy_targets), *args, **kwargs
+            )
+        finally:
+            self._instance_pool.release_direct_snapshot(rollout_targets)
 
     async def _collective_rpc_on_targets_async(
         self,
@@ -1273,6 +1342,20 @@ class RolloutController:
                 )
         return should_accept_fn
 
+    def _proxy_addr_for_target(
+        self, target: RolloutRPCTarget, explicit_addr: str | None
+    ) -> str | None:
+        """Resolve the proxy that belongs to the already-selected target."""
+        if explicit_addr is not None or not self._proxy_started:
+            return explicit_addr
+        if self._instance_pool is not None:
+            if target.proxy_addr is None:
+                raise RuntimeError(
+                    f"Elastic instance {target.instance_id} has no proxy"
+                )
+            return target.proxy_addr
+        return self.get_proxy_addr(int(target.engine_name.rsplit("/", maxsplit=1)[1]))
+
     def _rollout_stats(self) -> str:
         stats = self._staleness_manager.get_stats()
         return (
@@ -1307,15 +1390,9 @@ class RolloutController:
                 with self._futures_lock:
                     self._pending_futures[task_id] = future
 
-                proxy_addr = pending_task.proxy_addr
-                if self._proxy_started and proxy_addr is None:
-                    if self._instance_pool is not None:
-                        raise RuntimeError(
-                            "elastic rollout does not yet support proxy routing"
-                        )
-                    proxy_addr = self.get_proxy_addr(
-                        int(target.engine_name.rsplit("/", maxsplit=1)[1])
-                    )
+                proxy_addr = self._proxy_addr_for_target(
+                    target, pending_task.proxy_addr
+                )
                 engine_task_id = await self.scheduler.async_call_engine(
                     target.worker_id,
                     "submit",

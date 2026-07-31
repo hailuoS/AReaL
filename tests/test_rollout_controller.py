@@ -23,7 +23,9 @@ from areal.api.cli_args import (
 from areal.infra import RolloutController
 from areal.infra.controller.elastic import (
     DiskCheckpointCatalogError,
+    ElasticRecoveryStore,
     RolloutInstanceState,
+    RolloutRPCTarget,
 )
 from areal.infra.scheduler.local import LocalScheduler
 from areal.utils.hf_utils import load_hf_tokenizer
@@ -1467,6 +1469,26 @@ class TestElasticDiskCheckpointCatalog:
             / "elastic_rollout_recovery_rollout.json"
         )
 
+    def test_recovery_state_tracks_instance_proxy_role(self, tmp_path):
+        controller, instance = self._controller(tmp_path)
+        instance.attach_proxy(
+            role="proxy-rollout-elastic-ri-ready",
+            worker_id="proxy-rollout-elastic-ri-ready/0",
+            engine_name="proxy/ri-ready",
+            addr="http://127.0.0.1:31000",
+        )
+        recovery_path = tmp_path / "elastic-recovery.json"
+        controller._elastic_recovery_store = ElasticRecoveryStore(recovery_path)
+
+        controller._save_elastic_recovery_state()
+
+        recovered = controller._elastic_recovery_store.load()
+        assert recovered is not None
+        assert set(recovered.worker_roles) == {
+            "rollout-elastic-ri-ready",
+            "proxy-rollout-elastic-ri-ready",
+        }
+
     def test_elastic_disk_update_keeps_and_records_loaded_checkpoint(self, tmp_path):
         controller, instance = self._controller(tmp_path)
         checkpoint = tmp_path / "weight_update_v7"
@@ -1510,6 +1532,83 @@ class TestElasticDiskCheckpointCatalog:
             DiskCheckpointCatalogError, match="require a checkpoint version"
         ):
             asyncio.run(controller.update_weights_from_disk(meta))
+
+
+def test_elastic_proxy_routing_uses_selected_instance_proxy():
+    config = create_test_config(
+        elastic=ElasticRolloutConfig(enabled=True, max_instances=2)
+    )
+    controller = RolloutController(
+        inf_engine=MockInferenceEngine,
+        config=config,
+        scheduler=MockScheduler(),
+    )
+    instance = controller._instance_pool.create(
+        instance_id="ri-ready",
+        worker_role="rollout-elastic-ri-ready",
+        worker_id="rollout-elastic-ri-ready/0",
+        engine_name="rollout/ri-ready",
+    )
+    instance.attach_proxy(
+        role="proxy-rollout-elastic-ri-ready",
+        worker_id="proxy-rollout-elastic-ri-ready/0",
+        engine_name="proxy/ri-ready",
+        addr="http://127.0.0.1:31000",
+    )
+    controller._proxy_started = True
+
+    assert (
+        controller._proxy_addr_for_target(instance.rpc_target, None)
+        == "http://127.0.0.1:31000"
+    )
+    assert (
+        controller._proxy_addr_for_target(instance.rpc_target, "http://explicit:32000")
+        == "http://explicit:32000"
+    )
+    with pytest.raises(NotImplementedError, match="Proxy Gateway online"):
+        controller.start_proxy_gateway()
+
+
+def test_elastic_proxy_collective_rpc_uses_instance_proxy_target():
+    config = create_test_config(
+        elastic=ElasticRolloutConfig(enabled=True, max_instances=2)
+    )
+    controller = RolloutController(
+        inf_engine=MockInferenceEngine,
+        config=config,
+        scheduler=MockScheduler(),
+    )
+    instance = controller._instance_pool.create(
+        instance_id="ri-ready",
+        worker_role="rollout-elastic-ri-ready",
+        worker_id="rollout-elastic-ri-ready/0",
+        engine_name="rollout/ri-ready",
+    )
+    instance.attach_proxy(
+        role="proxy-rollout-elastic-ri-ready",
+        worker_id="proxy-rollout-elastic-ri-ready/0",
+        engine_name="proxy/ri-ready",
+        addr="http://127.0.0.1:31000",
+    )
+    instance.transition_to(RolloutInstanceState.STARTING)
+    instance.transition_to(RolloutInstanceState.READY)
+    controller._collective_rpc_on_targets_async = AsyncMock(return_value=[])
+
+    asyncio.run(controller._proxy_collective_rpc_async("set_version", version=4))
+
+    controller._collective_rpc_on_targets_async.assert_awaited_once_with(
+        "set_version",
+        (
+            RolloutRPCTarget(
+                instance_id="ri-ready",
+                worker_id="proxy-rollout-elastic-ri-ready/0",
+                engine_name="proxy/ri-ready",
+                proxy_addr="http://127.0.0.1:31000",
+            ),
+        ),
+        version=4,
+    )
+    assert instance.direct_inflight == 0
 
 
 if __name__ == "__main__":
