@@ -41,7 +41,9 @@ from areal.infra.controller.elastic import (
     DiskCheckpointCatalogError,
     DiskCheckpointManifest,
     InvalidDesiredCountError,
+    RolloutInstanceLauncher,
     RolloutInstancePool,
+    RolloutInstanceReconciler,
     RolloutRPCTarget,
 )
 from areal.infra.rpc.serialization import deserialize_value
@@ -105,6 +107,9 @@ class RolloutController:
         self._version = 0
         self._disk_checkpoint_catalog: DiskCheckpointCatalog | None = None
         self._instance_pool: RolloutInstancePool | None = None
+        self._elastic_reconciler: RolloutInstanceReconciler | None = None
+        self._elastic_reconcile_stop = threading.Event()
+        self._elastic_reconcile_thread: threading.Thread | None = None
         if config.elastic.enabled:
             self._instance_pool = RolloutInstancePool(
                 min_instances=config.elastic.min_instances,
@@ -185,12 +190,17 @@ class RolloutController:
         # usually TP x PP.
         self._worker_role = role
 
-        job = self._build_rollout_job(role)
-
-        # Call async scheduler methods synchronously
-        run_async_task(
-            self._async_initialize, job, server_args, server_infos, *args, **kwargs
-        )
+        if self.config.elastic.enabled:
+            if server_infos is not None:
+                raise NotImplementedError(
+                    "elastic rollout does not support externally supplied servers"
+                )
+            self._initialize_elastic(role, server_args or {}, kwargs)
+        else:
+            job = self._build_rollout_job(role)
+            run_async_task(
+                self._async_initialize, job, server_args, server_infos, *args, **kwargs
+            )
 
         # Initialize staleness manager for global capacity control
         max_concurrent_rollouts = (
@@ -219,6 +229,55 @@ class RolloutController:
 
         # Start callback server for weight sync coordination
         self._start_callback_server()
+
+    def _initialize_elastic(
+        self,
+        role: str,
+        server_args: dict[str, Any],
+        initialize_kwargs: dict[str, Any],
+    ) -> None:
+        assert self._instance_pool is not None
+        launcher = RolloutInstanceLauncher(
+            scheduler=self.scheduler,
+            inf_engine=self.inf_engine,
+            config=self.config,
+            rollout_alloc=self.rollout_alloc,
+        )
+        self._elastic_reconciler = RolloutInstanceReconciler(
+            pool=self._instance_pool,
+            launcher=launcher,
+            role_prefix=self.config.elastic.role_prefix,
+            server_args=server_args,
+            initialize_kwargs=initialize_kwargs,
+            latest_checkpoint=self._latest_elastic_checkpoint,
+            current_version=self.get_version,
+        )
+        run_async_task(self._reconcile_elastic_once)
+        self._elastic_reconcile_thread = threading.Thread(
+            target=self._elastic_reconcile_loop,
+            name="rollout-elastic-reconciler",
+            daemon=True,
+        )
+        self._elastic_reconcile_thread.start()
+
+    def _latest_elastic_checkpoint(self) -> DiskCheckpointManifest | None:
+        if self._disk_checkpoint_catalog is None:
+            return None
+        checkpoints = self._disk_checkpoint_catalog.list()
+        return checkpoints[-1] if checkpoints else None
+
+    async def _reconcile_elastic_once(self) -> None:
+        assert self._elastic_reconciler is not None
+        await self._elastic_reconciler.reconcile_once()
+
+    def _elastic_reconcile_loop(self) -> None:
+        while not self._elastic_reconcile_stop.wait(
+            self.config.elastic.reconcile_interval_seconds
+        ):
+            try:
+                run_async_task(self._reconcile_elastic_once)
+            except Exception:
+                logger.error("Elastic reconciliation failed", exc_info=True)
 
     def _build_rollout_job(self, role: str) -> Job:
         """Build the unchanged static V1 Scheduler job for rollout workers."""
@@ -341,12 +400,28 @@ class RolloutController:
         if self._dispatcher is not None:
             self._dispatcher.destroy()
 
+        if self._elastic_reconcile_thread is not None:
+            self._elastic_reconcile_stop.set()
+            self._elastic_reconcile_thread.join(timeout=5.0)
+            self._elastic_reconcile_thread = None
+
         self._stop_callback_server()
 
         self._collective_rpc("destroy", http_timeout=60.0)
 
         # Delete workers via scheduler
-        if hasattr(self, "_worker_role"):
+        if self._instance_pool is not None:
+            for instance_id in self._instance_pool.instance_ids():
+                instance = self._instance_pool.get(instance_id)
+                try:
+                    self.scheduler.delete_workers(role=instance.worker_role)
+                except Exception:
+                    logger.error(
+                        "Error deleting elastic worker role %s: %s",
+                        instance.worker_role,
+                        traceback.format_exc(),
+                    )
+        elif hasattr(self, "_worker_role"):
             try:
                 self.scheduler.delete_workers(role=self._worker_role)
                 self.workers.clear()
