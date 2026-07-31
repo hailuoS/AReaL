@@ -1043,9 +1043,17 @@ class RolloutController:
         return run_async_task(self._collective_rpc_async, method, *args, **kwargs)
 
     async def _collective_rpc_async(self, method: str, *args, **kwargs) -> list[Any]:
-        return await self._collective_rpc_on_targets_async(
-            method, self._rollout_rpc_targets(), *args, **kwargs
-        )
+        if self._instance_pool is None:
+            return await self._collective_rpc_on_targets_async(
+                method, self._rollout_rpc_targets(), *args, **kwargs
+            )
+        targets = self._instance_pool.acquire_direct_snapshot()
+        try:
+            return await self._collective_rpc_on_targets_async(
+                method, targets, *args, **kwargs
+            )
+        finally:
+            self._instance_pool.release_direct_snapshot(targets)
 
     def _proxy_collective_rpc(self, method: str, *args, **kwargs) -> list[Any]:
         return run_async_task(self._proxy_collective_rpc_async, method, *args, **kwargs)
@@ -1166,8 +1174,6 @@ class RolloutController:
 
     def _create_submit_callback(self, pending_task: _RemoteRolloutTaskInput):
         async def _submit_then_wait() -> _RemoteRolloutResult | None:
-            target = self._choose_rollout_target()
-
             # NOTE: No need to call `on_rollout_submitted` here.
             # This function will be passed to `BatchTaskDispather` where
             # `on_rollout_submitted` will be called upon dispatching
@@ -1177,14 +1183,19 @@ class RolloutController:
             manager = self.staleness_manager
 
             try:
+                if self._instance_pool is not None:
+                    target = self._instance_pool.reserve_task(
+                        str(task_id), self._current_worker_idx
+                    )
+                    self._current_worker_idx += 1
+                    bound_instance_id = target.instance_id
+                else:
+                    target = self._choose_rollout_target()
+
                 # Set future for this task
                 future = asyncio.get_event_loop().create_future()
                 with self._futures_lock:
                     self._pending_futures[task_id] = future
-
-                if self._instance_pool is not None:
-                    self._instance_pool.bind_task(str(task_id), target.instance_id)
-                    bound_instance_id = target.instance_id
 
                 proxy_addr = pending_task.proxy_addr
                 if self._proxy_started and proxy_addr is None:
@@ -1392,36 +1403,44 @@ class RolloutController:
         async def _compute():
             indexed_chunks: list[list[int]] = []
             tasks = []
-            targets = self._rollout_rpc_targets()
+            if self._instance_pool is None:
+                targets = self._rollout_rpc_targets()
+            else:
+                targets = self._instance_pool.acquire_direct_snapshot()
             n_workers = len(targets)
             if not targets:
                 raise RuntimeError("No workers available for compute_logp.")
 
-            for rank, target in enumerate(targets):
-                idxs = list(range(rank, len(data), n_workers))
-                if not idxs:
-                    continue
-                chunk = [data[i] for i in idxs]
-                indexed_chunks.append(idxs)
-                tasks.append(
-                    self.scheduler.async_call_engine(
-                        worker_id=target.worker_id,
-                        method="compute_logp",
-                        engine_name=target.engine_name,
-                        data=chunk,
-                        http_timeout=self.config.request_timeout,
+            try:
+                for rank, target in enumerate(targets):
+                    idxs = list(range(rank, len(data), n_workers))
+                    if not idxs:
+                        continue
+                    chunk = [data[i] for i in idxs]
+                    indexed_chunks.append(idxs)
+                    tasks.append(
+                        self.scheduler.async_call_engine(
+                            worker_id=target.worker_id,
+                            method="compute_logp",
+                            engine_name=target.engine_name,
+                            data=chunk,
+                            http_timeout=self.config.request_timeout,
+                        )
                     )
-                )
-            rpc_results = await asyncio.gather(*tasks)
-            merged: list[Any] = [None] * len(data)
-            for idxs, chunk_result in zip(indexed_chunks, rpc_results):
-                if len(chunk_result) != len(idxs):
-                    raise RuntimeError(
-                        f"compute_logp result length mismatch: got {len(chunk_result)}, expected {len(idxs)}"
-                    )
-                for out_idx, value in zip(idxs, chunk_result):
-                    merged[out_idx] = value
-            return merged
+                rpc_results = await asyncio.gather(*tasks)
+                merged: list[Any] = [None] * len(data)
+                for idxs, chunk_result in zip(indexed_chunks, rpc_results):
+                    if len(chunk_result) != len(idxs):
+                        raise RuntimeError(
+                            f"compute_logp result length mismatch: got "
+                            f"{len(chunk_result)}, expected {len(idxs)}"
+                        )
+                    for out_idx, value in zip(idxs, chunk_result):
+                        merged[out_idx] = value
+                return merged
+            finally:
+                if self._instance_pool is not None:
+                    self._instance_pool.release_direct_snapshot(targets)
 
         return run_async_task(_compute)
 
@@ -1441,9 +1460,13 @@ class RolloutController:
         ModelResponse
             The generated response from the model
         """
-        target = self._choose_rollout_target()
         if self._instance_pool is not None:
-            self._instance_pool.acquire_direct_request(target.instance_id)
+            target = self._instance_pool.reserve_direct_request(
+                self._current_worker_idx
+            )
+            self._current_worker_idx += 1
+        else:
+            target = self._choose_rollout_target()
         try:
             return await self.scheduler.async_call_engine(
                 worker_id=target.worker_id,
@@ -1612,19 +1635,26 @@ class RolloutController:
 
     def config_perf_tracer(self, config: PerfTracerConfig, role: str) -> None:
         async def _call():
-            targets = self._rollout_rpc_targets()
-            tasks = [
-                self.scheduler.async_call_engine(
-                    worker_id=target.worker_id,
-                    method="config_perf_tracer",
-                    engine_name=target.engine_name,
-                    rank=rank,
-                    role=role,
-                    config=config,
-                )
-                for rank, target in enumerate(targets)
-            ]
-            return await asyncio.gather(*tasks)
+            if self._instance_pool is None:
+                targets = self._rollout_rpc_targets()
+            else:
+                targets = self._instance_pool.acquire_direct_snapshot()
+            try:
+                tasks = [
+                    self.scheduler.async_call_engine(
+                        worker_id=target.worker_id,
+                        method="config_perf_tracer",
+                        engine_name=target.engine_name,
+                        rank=rank,
+                        role=role,
+                        config=config,
+                    )
+                    for rank, target in enumerate(targets)
+                ]
+                return await asyncio.gather(*tasks)
+            finally:
+                if self._instance_pool is not None:
+                    self._instance_pool.release_direct_snapshot(targets)
 
         run_async_task(_call)
 
