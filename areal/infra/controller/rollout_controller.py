@@ -740,6 +740,8 @@ class RolloutController:
 
     def _rollout_rpc_targets(self) -> tuple[RolloutRPCTarget, ...]:
         """Snapshot static rollout RPC targets without changing rank naming."""
+        if self._instance_pool is not None:
+            return self._instance_pool.ready_snapshot()
         return tuple(
             RolloutRPCTarget(
                 instance_id=f"static-{rank}",
@@ -813,6 +815,23 @@ class RolloutController:
         self._current_worker_idx = (self._current_worker_idx + 1) % len(self.workers)
         return worker, rank
 
+    def _choose_rollout_target(self) -> RolloutRPCTarget:
+        """Choose a routable target without using a rank as elastic identity."""
+        if self._instance_pool is not None:
+            targets = self._instance_pool.ready_snapshot()
+            if not targets:
+                raise RuntimeError("No READY elastic rollout instances available")
+            target = targets[self._current_worker_idx % len(targets)]
+            self._current_worker_idx = (self._current_worker_idx + 1) % len(targets)
+            return target
+
+        worker, rank = self._choose_worker()
+        return RolloutRPCTarget(
+            instance_id=f"static-{rank}",
+            worker_id=worker.id,
+            engine_name=self._engine_name(rank),
+        )
+
     def _resolve_workflow_str(self, workflow: WorkflowLike | None) -> str | None:
         """Resolve workflow to a string import path.
 
@@ -870,14 +889,13 @@ class RolloutController:
 
     def _create_submit_callback(self, pending_task: _RemoteRolloutTaskInput):
         async def _submit_then_wait() -> _RemoteRolloutResult | None:
-            # Choose worker via round-robin
-            worker, rank = self._choose_worker()
-            engine_name = self._engine_name(rank)
+            target = self._choose_rollout_target()
 
             # NOTE: No need to call `on_rollout_submitted` here.
             # This function will be passed to `BatchTaskDispather` where
             # `on_rollout_submitted` will be called upon dispatching
             task_id = pending_task.task_id
+            bound_instance_id: str | None = None
 
             manager = self.staleness_manager
 
@@ -887,13 +905,23 @@ class RolloutController:
                 with self._futures_lock:
                     self._pending_futures[task_id] = future
 
+                if self._instance_pool is not None:
+                    self._instance_pool.bind_task(str(task_id), target.instance_id)
+                    bound_instance_id = target.instance_id
+
                 proxy_addr = pending_task.proxy_addr
                 if self._proxy_started and proxy_addr is None:
-                    proxy_addr = self.get_proxy_addr(rank)
+                    if self._instance_pool is not None:
+                        raise RuntimeError(
+                            "elastic rollout does not yet support proxy routing"
+                        )
+                    proxy_addr = self.get_proxy_addr(
+                        int(target.engine_name.rsplit("/", maxsplit=1)[1])
+                    )
                 engine_task_id = await self.scheduler.async_call_engine(
-                    worker.id,
+                    target.worker_id,
                     "submit",
-                    engine_name=engine_name,
+                    engine_name=target.engine_name,
                     data=pending_task.data,
                     workflow=pending_task.workflow,
                     workflow_kwargs=pending_task.workflow_kwargs,
@@ -913,9 +941,9 @@ class RolloutController:
 
                 # Fetch the result
                 result = await self.scheduler.async_call_engine(
-                    worker.id,
+                    target.worker_id,
                     "wait_for_task",
-                    engine_name=engine_name,
+                    engine_name=target.engine_name,
                     task_id=engine_task_id,
                     timeout=0.1,  # A short time to prevent blocking other requests
                     raise_timeout=False,
@@ -950,6 +978,9 @@ class RolloutController:
                 manager.on_rollout_rejected()
                 logger.error("Workflow execution failed: %s", exc, exc_info=True)
                 return None
+            finally:
+                if bound_instance_id is not None:
+                    self._instance_pool.release_task(str(task_id))
 
         return _submit_then_wait
 
@@ -1133,16 +1164,19 @@ class RolloutController:
         ModelResponse
             The generated response from the model
         """
-        # Choose worker and delegate
-        worker, rank = self._choose_worker()
-
-        # Call agenerate on engine via scheduler
-        return await self.scheduler.async_call_engine(
-            worker_id=worker.id,
-            method="agenerate",
-            engine_name=self._engine_name(rank),
-            req=req,
-        )
+        target = self._choose_rollout_target()
+        if self._instance_pool is not None:
+            self._instance_pool.acquire_direct_request(target.instance_id)
+        try:
+            return await self.scheduler.async_call_engine(
+                worker_id=target.worker_id,
+                method="agenerate",
+                engine_name=target.engine_name,
+                req=req,
+            )
+        finally:
+            if self._instance_pool is not None:
+                self._instance_pool.release_direct_request(target.instance_id)
 
     async def init_weights_update_group(self, meta: WeightUpdateMeta) -> None:
         targets = self._rollout_rpc_targets()
