@@ -2335,6 +2335,15 @@ class ElasticRolloutConfig:
         default=1,
         metadata={"help": "Persisted elastic controller state schema version."},
     )
+    report_freq_steps: int = field(
+        default=10,
+        metadata={
+            "help": (
+                "Generate an AstraFlow-compatible scaling report every N "
+                "training versions. Set to 0 to disable automatic reports."
+            )
+        },
+    )
 
     def __post_init__(self):
         if self.min_instances < 1:
@@ -2364,6 +2373,8 @@ class ElasticRolloutConfig:
             )
         if self.recovery_schema_version != 1:
             raise ValueError("elastic.recovery_schema_version must be 1")
+        if self.report_freq_steps < 0:
+            raise ValueError("elastic.report_freq_steps must be non-negative")
 
 
 @dataclass

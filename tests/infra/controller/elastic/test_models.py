@@ -56,7 +56,13 @@ def test_instance_draining_is_not_routable_until_cancelled():
 
 @pytest.mark.parametrize(
     "field_name",
-    ["workflow_task_ids", "direct_inflight", "active_sessions", "update_leases"],
+    [
+        "workflow_task_ids",
+        "result_lease_ids",
+        "direct_inflight",
+        "active_sessions",
+        "update_leases",
+    ],
 )
 def test_instance_with_inflight_work_cannot_stop(field_name):
     """Every tracked work category independently prevents resource teardown."""
@@ -65,8 +71,8 @@ def test_instance_with_inflight_work_cannot_stop(field_name):
     instance.transition_to(RolloutInstanceState.READY)
     instance.request_drain()
 
-    if field_name == "workflow_task_ids":
-        instance.workflow_task_ids.add("task-a")
+    if field_name in {"workflow_task_ids", "result_lease_ids"}:
+        getattr(instance, field_name).add("task-a")
     else:
         setattr(instance, field_name, 1)
 
@@ -84,3 +90,20 @@ def test_rpc_target_does_not_change_with_instance_state():
     assert target.instance_id == "ri-a"
     assert target.worker_id == "rollout-elastic-a/0"
     assert target.engine_name == "rollout/ri-a"
+
+
+def test_rpc_target_carries_stable_instance_proxy_identity():
+    instance = _instance()
+    instance.attach_proxy(
+        role="proxy-rollout-elastic-a",
+        worker_id="proxy-rollout-elastic-a/0",
+        engine_name="proxy/ri-a",
+        addr="http://127.0.0.1:31000",
+    )
+
+    target = instance.rpc_target
+
+    assert instance.proxy_ready
+    assert target.proxy_addr == "http://127.0.0.1:31000"
+    assert target.proxy_worker_id == "proxy-rollout-elastic-a/0"
+    assert target.proxy_engine_name == "proxy/ri-a"

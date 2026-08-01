@@ -29,9 +29,13 @@ class _FakeScheduler:
     def __init__(self, n_gpus_per_node: int = 8) -> None:
         self.n_gpus_per_node = n_gpus_per_node
         self.worker = Worker(id="elastic-a/0", ip="127.0.0.1")
+        self.proxy_worker = Worker(
+            id="proxy-elastic-a/0", ip="127.0.0.1", worker_ports=["31000"]
+        )
         self.created_job = None
         self.engine_calls = []
         self.deleted_roles = []
+        self.forked_roles = []
         self.server_info = LocalInfServerInfo(host="127.0.0.1", port=30000)
 
     def create_workers(self, job):
@@ -39,7 +43,13 @@ class _FakeScheduler:
         return [self.worker.id]
 
     def get_workers(self, role):
+        if role.startswith("proxy-"):
+            return [self.proxy_worker]
         return [self.worker]
+
+    def fork_workers(self, role, target_role, command):
+        self.forked_roles.append((role, target_role, command))
+        return [self.proxy_worker.id]
 
     async def create_engine(self, worker_id, engine, engine_name, config):
         self.engine_calls.append(("create_engine", worker_id, engine_name, config))
@@ -115,6 +125,86 @@ async def test_launch_failure_deletes_only_its_role():
         )
 
     assert scheduler.deleted_roles == ["rollout-elastic-ri-a"]
+
+
+@pytest.mark.asyncio
+async def test_launch_proxy_is_bound_to_one_elastic_instance():
+    launcher, scheduler = _launcher()
+    result = await launcher.launch(
+        instance_id="ri-a",
+        worker_role="rollout-elastic-ri-a",
+        server_args={},
+    )
+
+    await launcher.launch_proxy(result.instance)
+
+    assert scheduler.forked_roles == [
+        (
+            "proxy-rollout-elastic-ri-a",
+            "rollout-elastic-ri-a",
+            "areal.experimental.openai.proxy.proxy_rollout_server",
+        )
+    ]
+    assert result.instance.proxy_ready
+    assert result.instance.proxy_worker_id == scheduler.proxy_worker.id
+    assert result.instance.proxy_engine_name == "proxy/ri-a"
+    assert result.instance.proxy_addr == "http://127.0.0.1:31000"
+    initialize_proxy = [
+        call
+        for call in scheduler.engine_calls
+        if call[0] == "initialize" and call[2] == "proxy/ri-a"
+    ]
+    assert initialize_proxy[0][3]["addr"] == "127.0.0.1:30000"
+
+
+@pytest.mark.asyncio
+async def test_launch_proxy_failure_removes_only_proxy_role():
+    launcher, scheduler = _launcher()
+    result = await launcher.launch(
+        instance_id="ri-a",
+        worker_role="rollout-elastic-ri-a",
+        server_args={},
+    )
+    original_call = scheduler.async_call_engine
+
+    async def fail_proxy_initialize(worker_id, method, engine_name, **kwargs):
+        if method == "initialize" and engine_name == "proxy/ri-a":
+            raise RuntimeError("proxy initialize failed")
+        return await original_call(worker_id, method, engine_name, **kwargs)
+
+    scheduler.async_call_engine = fail_proxy_initialize
+
+    with pytest.raises(RuntimeError, match="proxy initialize failed"):
+        await launcher.launch_proxy(result.instance)
+
+    assert scheduler.deleted_roles == ["proxy-rollout-elastic-ri-a"]
+    assert not result.instance.proxy_ready
+    assert result.instance.state is RolloutInstanceState.CATCHING_UP
+
+
+@pytest.mark.asyncio
+async def test_catch_up_publishes_version_to_instance_proxy(tmp_path):
+    launcher, scheduler = _launcher()
+    result = await launcher.launch(
+        instance_id="ri-a",
+        worker_role="rollout-elastic-ri-a",
+        server_args={},
+    )
+    await launcher.launch_proxy(result.instance)
+    checkpoint = tmp_path / "weight_update_v7"
+    checkpoint.mkdir()
+
+    await launcher.catch_up_from_disk(
+        result.instance,
+        DiskCheckpointManifest(version=7, path=str(checkpoint)),
+    )
+
+    proxy_version_calls = [
+        call
+        for call in scheduler.engine_calls
+        if call[0] == "set_version" and call[2] == "proxy/ri-a"
+    ]
+    assert proxy_version_calls[0][3]["version"] == 7
 
 
 @pytest.mark.asyncio
@@ -200,3 +290,23 @@ def test_destroy_requires_drain_teardown_state():
         launcher.destroy(instance)
 
     assert scheduler.deleted_roles == []
+
+
+@pytest.mark.asyncio
+async def test_destroy_removes_proxy_before_rollout_role():
+    launcher, scheduler = _launcher()
+    result = await launcher.launch(
+        instance_id="ri-a",
+        worker_role="rollout-elastic-ri-a",
+        server_args={},
+    )
+    await launcher.launch_proxy(result.instance)
+    result.instance.transition_to(RolloutInstanceState.STOPPING)
+
+    launcher.destroy(result.instance)
+
+    assert scheduler.deleted_roles == [
+        "proxy-rollout-elastic-ri-a",
+        "rollout-elastic-ri-a",
+    ]
+    assert result.instance.state is RolloutInstanceState.STOPPED

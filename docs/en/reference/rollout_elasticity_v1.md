@@ -9,6 +9,11 @@ Each elastic instance is one complete `TP × PP` rollout server owned by an inde
 Scheduler role and a stable, non-positional instance ID. A single instance must fit on
 one node. Cross-node instances and dynamic Proxy online sessions are not supported.
 
+Offline AgentWorkflow uses an instance-local V1 ProxyRolloutServer. Each proxy has a
+stable Scheduler role and is created, routed, drained, and deleted with its owning
+rollout instance. This does not start the Proxy Gateway or accept external online
+sessions.
+
 Elastic mode supports disk weight synchronization only. AWEX and XCCL retain their
 existing static behavior.
 
@@ -48,7 +53,9 @@ POST /elastic/scaling-recommendation
 ```
 
 `GET /elastic/instances` reports both `serving_version` and
-`pending_update_version`, plus each instance's `loaded_version`.
+`pending_update_version`, plus each instance's `loaded_version`, `proxy_role`,
+`proxy_addr`, and `proxy_ready`. The top-level `proxy_enabled` field distinguishes an
+AgentWorkflow controller from a RolloutWorkflow controller that needs no proxy.
 
 Set desired capacity with:
 
@@ -61,10 +68,11 @@ independent Scheduler roles. A new instance becomes `READY` only after server
 initialization and loading the exact committed disk version.
 
 Scale-in first changes an instance to `DRAINING`. It receives no new work and is deleted
-only after workflow tasks, direct requests, and weight-update leases are empty. The
-instance model reserves active-session accounting, but dynamic Proxy session routing and
-drain are deferred. Exceeding `drain_timeout_seconds` reports a reconcile error and does
-not force-delete an instance that still owns work.
+only after workflow tasks, direct requests, and weight-update leases are empty. An
+offline AgentWorkflow session is covered by its owning workflow-task lease; dynamic
+Proxy Gateway online-session routing and drain remain deferred. Exceeding
+`drain_timeout_seconds` reports a reconcile error and does not force-delete an instance
+that still owns work.
 
 ## Scaling recommendation
 
@@ -110,7 +118,7 @@ Run the Controller HTTP spike:
 
 ```bash
 AREAL_SPMD_MODE=false python examples/math/rollout_elastic_controller_spike.py \
-  --verify-recommendation --verify-recovery -- \
+  --verify-recommendation --verify-recovery --verify-proxy -- \
   --config examples/math/gsm8k_grpo_npu.yaml scheduler.type=ray
 ```
 

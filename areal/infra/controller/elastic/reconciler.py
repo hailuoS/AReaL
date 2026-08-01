@@ -29,6 +29,11 @@ class _InstanceLauncher(Protocol):
         self, instance: RolloutInstance, checkpoint: DiskCheckpointManifest
     ) -> None: ...
 
+    @staticmethod
+    def proxy_role(instance: RolloutInstance) -> str: ...
+
+    async def launch_proxy(self, instance: RolloutInstance) -> None: ...
+
     def destroy(self, instance: RolloutInstance) -> None: ...
 
 
@@ -59,6 +64,7 @@ class RolloutInstanceReconciler:
         end_catch_up: Callable[[], None] | None = None,
         record_launch_intent: Callable[[str], None] | None = None,
         clear_launch_intent: Callable[[str], None] | None = None,
+        proxy_enabled: Callable[[], bool] | None = None,
     ) -> None:
         self._pool = pool
         self._launcher = launcher
@@ -72,6 +78,17 @@ class RolloutInstanceReconciler:
         self._end_catch_up = end_catch_up or (lambda: None)
         self._record_launch_intent = record_launch_intent or (lambda _role: None)
         self._clear_launch_intent = clear_launch_intent or (lambda _role: None)
+        self._proxy_enabled = proxy_enabled or (lambda: False)
+
+    async def _ensure_proxy(self, instance: RolloutInstance) -> None:
+        if not self._proxy_enabled() or instance.proxy_ready:
+            return
+        proxy_role = self._launcher.proxy_role(instance)
+        self._record_launch_intent(proxy_role)
+        try:
+            await self._launcher.launch_proxy(instance)
+        finally:
+            self._clear_launch_intent(proxy_role)
 
     async def reconcile_once(self) -> ReconcileResult:
         """Move observed capacity one pass toward the requested desired count."""
@@ -82,6 +99,12 @@ class RolloutInstanceReconciler:
         instances = [
             self._pool.get(instance_id) for instance_id in self._pool.instance_ids()
         ]
+        for instance in instances:
+            if (
+                instance.desired_state is InstanceDesiredState.RUNNING
+                and instance.state is RolloutInstanceState.READY
+            ):
+                await self._ensure_proxy(instance)
         running = [
             instance
             for instance in instances
@@ -138,6 +161,7 @@ class RolloutInstanceReconciler:
             self._clear_launch_intent(worker_role)
             self._begin_catch_up()
             try:
+                await self._ensure_proxy(instance)
                 checkpoint = self._latest_checkpoint()
                 if checkpoint is None:
                     instance.loaded_version = self._current_version()

@@ -29,6 +29,7 @@ def test_elastic_rollout_config_is_disabled_by_default():
         ({"drain_timeout_seconds": -1}, "non-negative"),
         ({"checkpoint_retention": 1}, "at least 2"),
         ({"recovery_schema_version": 2}, "schema_version"),
+        ({"report_freq_steps": -1}, "non-negative"),
     ],
 )
 def test_elastic_rollout_config_rejects_invalid_contracts(kwargs, message):
@@ -44,10 +45,12 @@ def test_elastic_rollout_config_accepts_scale_out_contract():
         max_instances=4,
         role_prefix="rollout-elastic",
         checkpoint_retention=3,
+        report_freq_steps=20,
     )
 
     assert config.enabled
     assert config.max_instances == 4
+    assert config.report_freq_steps == 20
 
 
 def _trainer_for_elastic_validation(weight_update_mode: str) -> PPOTrainer:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import shutil
 import threading
 import traceback
@@ -42,6 +44,7 @@ from areal.infra.controller.elastic import (
     DiskCheckpointManifest,
     ElasticRecoveryState,
     ElasticRecoveryStore,
+    ElasticScalingReporter,
     ElasticScalingWindow,
     InvalidDesiredCountError,
     RolloutInstanceLauncher,
@@ -50,6 +53,7 @@ from areal.infra.controller.elastic import (
     RolloutRPCTarget,
     recommend_instances,
 )
+from areal.infra.rpc.rtensor import RTensor
 from areal.infra.rpc.serialization import deserialize_value
 from areal.infra.utils.concurrent import run_async_task
 from areal.utils import logging, perf_tracer
@@ -117,15 +121,28 @@ class RolloutController:
         self._elastic_reconcile_thread: threading.Thread | None = None
         self._elastic_last_reconcile_error: str | None = None
         self._elastic_scaling_report: dict[str, Any] | None = None
+        self._elastic_scaling_report_lock = threading.Lock()
+        self._elastic_scaling_reporter: ElasticScalingReporter | None = None
         self._elastic_recovery_store: ElasticRecoveryStore | None = None
+        self._elastic_reconcile_lock = threading.Lock()
         self._elastic_update_condition = threading.Condition()
         self._elastic_pending_update_version: int | None = None
         self._elastic_catchups_inflight = 0
         self._elastic_pending_worker_roles: set[str] = set()
+        self._elastic_proxy_enabled = False
+        self._elastic_result_lease_lock = threading.Lock()
+        self._elastic_result_lease_instance: dict[str, str] = {}
+        self._elastic_result_lease_shards: dict[str, set[Any]] = {}
+        self._elastic_shard_to_result_lease: dict[Any, str] = {}
         if config.elastic.enabled:
             self._instance_pool = RolloutInstancePool(
                 min_instances=config.elastic.min_instances,
                 initial_instances=config.elastic.initial_instances,
+                max_instances=config.elastic.max_instances,
+            )
+            self._elastic_scaling_reporter = ElasticScalingReporter(
+                report_frequency_steps=config.elastic.report_freq_steps,
+                min_instances=config.elastic.min_instances,
                 max_instances=config.elastic.max_instances,
             )
 
@@ -311,6 +328,7 @@ class RolloutController:
             end_catch_up=self._end_elastic_catch_up,
             record_launch_intent=self._record_elastic_launch_intent,
             clear_launch_intent=self._clear_elastic_launch_intent,
+            proxy_enabled=lambda: self._elastic_proxy_enabled,
         )
         run_async_task(self._reconcile_elastic_once)
         self._elastic_reconcile_thread = threading.Thread(
@@ -357,9 +375,10 @@ class RolloutController:
 
     async def _reconcile_elastic_once(self) -> None:
         assert self._elastic_reconciler is not None
-        await self._elastic_reconciler.reconcile_once()
-        self._refresh_elastic_capacity()
-        self._save_elastic_recovery_state()
+        with self._elastic_reconcile_lock:
+            await self._elastic_reconciler.reconcile_once()
+            self._refresh_elastic_capacity()
+            self._save_elastic_recovery_state()
 
     def _begin_elastic_catch_up(self) -> None:
         with self._elastic_update_condition:
@@ -458,6 +477,12 @@ class RolloutController:
             with self._elastic_update_condition:
                 pending_worker_roles = frozenset(self._elastic_pending_worker_roles)
             instances = self._instance_pool.instances_snapshot()
+            instance_roles = {instance.worker_role for instance in instances}
+            instance_roles.update(
+                instance.proxy_role
+                for instance in instances
+                if instance.proxy_role is not None
+            )
             self._elastic_recovery_store.save(
                 ElasticRecoveryState(
                     schema_version=self.config.elastic.recovery_schema_version,
@@ -469,41 +494,76 @@ class RolloutController:
                     checkpoint_path=(
                         checkpoint.path if checkpoint is not None else None
                     ),
-                    worker_roles=tuple(
-                        sorted(
-                            {instance.worker_role for instance in instances}
-                            | pending_worker_roles
-                        )
-                    ),
+                    worker_roles=tuple(sorted(instance_roles | pending_worker_roles)),
                 )
             )
 
     def record_elastic_scaling_window(
-        self, *, entered: int, consumed: int, wait_seconds: float, step_seconds: float
-    ) -> dict[str, Any]:
-        """Store an AstraFlow-compatible report without changing desired state."""
+        self,
+        *,
+        report_version: int,
+        entered: int,
+        consumed: int,
+        wait_seconds: float,
+        step_seconds: float,
+    ) -> dict[str, Any] | None:
+        """Accumulate one step and publish only a completed report window."""
         assert self._instance_pool is not None
-        window = ElasticScalingWindow(
+        assert self._elastic_scaling_reporter is not None
+        report = self._elastic_scaling_reporter.record(
+            report_version=report_version,
             ready_instances=len(self._instance_pool.ready_snapshot()),
             entered=entered,
             consumed=consumed,
             wait_seconds=wait_seconds,
             step_seconds=step_seconds,
         )
-        recommendation = recommend_instances(
-            window,
-            min_instances=self.config.elastic.min_instances,
-            max_instances=self.config.elastic.max_instances,
+        if report is None:
+            return None
+        self._publish_elastic_scaling_report(report, persist=True)
+        return report
+
+    def _elastic_scaling_report_path(self, report_version: int) -> Path | None:
+        if not self.config.fileroot:
+            return None
+        report_root = Path(self.config.fileroot)
+        if self.config.experiment_name and self.config.trial_name:
+            report_root = (
+                report_root / self.config.experiment_name / self.config.trial_name
+            )
+        return (
+            report_root
+            / "balance_reports"
+            / f"rollout_balance_report_v{report_version}.json"
         )
-        self._elastic_scaling_report = {
-            "branch": recommendation.branch,
-            "recommended_instances": recommendation.recommended_instances,
-            "rollout_wait_fraction": recommendation.rollout_wait_fraction,
-            "entered": entered,
-            "consumed": consumed,
-            "ready_instances": window.ready_instances,
-        }
-        return self._elastic_scaling_report
+
+    def _publish_elastic_scaling_report(
+        self, report: dict[str, Any], *, persist: bool
+    ) -> None:
+        with self._elastic_scaling_report_lock:
+            self._elastic_scaling_report = dict(report)
+        if not persist:
+            return
+        report_version = report.get("report_version")
+        if isinstance(report_version, bool) or not isinstance(report_version, int):
+            raise ValueError("scaling report requires an integer report_version")
+        path = self._elastic_scaling_report_path(report_version)
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path = path.with_suffix(f"{path.suffix}.tmp")
+            with temporary_path.open("w", encoding="utf-8") as file:
+                json.dump(report, file, indent=2, sort_keys=True)
+                file.write("\n")
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary_path, path)
+            logger.info("Elastic scaling report saved: %s", path)
+        except OSError:
+            logger.warning(
+                "Failed to save elastic scaling report %s", path, exc_info=True
+            )
 
     def _elastic_reconcile_loop(self) -> None:
         while not self._elastic_reconcile_stop.wait(
@@ -653,11 +713,13 @@ class RolloutController:
             for instance_id in self._instance_pool.instance_ids():
                 instance = self._instance_pool.get(instance_id)
                 try:
+                    if instance.proxy_role is not None:
+                        self.scheduler.delete_workers(role=instance.proxy_role)
                     self.scheduler.delete_workers(role=instance.worker_role)
                 except Exception:
                     logger.error(
-                        "Error deleting elastic worker role %s: %s",
-                        instance.worker_role,
+                        "Error deleting elastic instance %s roles: %s",
+                        instance.instance_id,
                         traceback.format_exc(),
                     )
         elif hasattr(self, "_worker_role"):
@@ -669,7 +731,7 @@ class RolloutController:
                 logger.error(f"Error deleting workers: {traceback.format_exc()}")
 
         # Delete proxy workers if initialized
-        if self._proxy_started:
+        if self._proxy_started and self._instance_pool is None:
             try:
                 self.scheduler.delete_workers(role=self._proxy_role)
                 self.proxy_workers.clear()
@@ -678,6 +740,8 @@ class RolloutController:
                 logger.info("Proxy workers deleted")
             except Exception:
                 logger.error(f"Error deleting proxy workers: {traceback.format_exc()}")
+        elif self._instance_pool is not None:
+            self._proxy_started = False
 
         # Shutdown proxy gateway if initialized
         self._stop_proxy_gateway()
@@ -693,6 +757,32 @@ class RolloutController:
         """
         if self._proxy_started:
             logger.warning("Proxy workers already initialized")
+            return
+
+        if self._instance_pool is not None:
+            if self._elastic_reconciler is None:
+                raise RuntimeError(
+                    "Cannot initialize elastic proxy workers before rollout initialize()"
+                )
+            self._elastic_proxy_enabled = True
+            try:
+                run_async_task(self._reconcile_elastic_once)
+            except BaseException:
+                self._elastic_proxy_enabled = False
+                raise
+            missing_proxy = [
+                instance.instance_id
+                for instance in self._instance_pool.instances_snapshot()
+                if instance.is_routable and not instance.proxy_ready
+            ]
+            if missing_proxy:
+                self._elastic_proxy_enabled = False
+                raise RuntimeError(
+                    "Elastic proxy initialization did not cover READY instances: "
+                    f"{missing_proxy}"
+                )
+            self._proxy_started = True
+            logger.info("Elastic instance-local proxy workers initialized")
             return
 
         if not self.server_infos:
@@ -780,6 +870,11 @@ class RolloutController:
         Creates a FastAPI server that routes requests to backend proxy
         workers. Requires ``start_proxy()`` to have been called first.
         """
+        if self._instance_pool is not None:
+            raise NotImplementedError(
+                "Elastic RolloutController V1 supports instance-local offline "
+                "AgentWorkflow proxies only; Proxy Gateway online routing is deferred"
+            )
         if not self._proxy_started:
             raise RuntimeError(
                 "Proxy workers not initialized. Call start_proxy() first."
@@ -969,6 +1064,12 @@ class RolloutController:
                 return jsonify({"error": "elastic rollout is disabled"}), 409
             with self._elastic_update_condition:
                 pending_update_version = self._elastic_pending_update_version
+            with self._elastic_scaling_report_lock:
+                latest_report_version = (
+                    self._elastic_scaling_report.get("report_version")
+                    if self._elastic_scaling_report is not None
+                    else None
+                )
             instances = []
             for instance in self._instance_pool.instances_snapshot():
                 instances.append(
@@ -977,10 +1078,16 @@ class RolloutController:
                         "worker_role": instance.worker_role,
                         "worker_id": instance.worker_id,
                         "engine_name": instance.engine_name,
+                        "proxy_role": instance.proxy_role,
+                        "proxy_worker_id": instance.proxy_worker_id,
+                        "proxy_engine_name": instance.proxy_engine_name,
+                        "proxy_addr": instance.proxy_addr,
+                        "proxy_ready": instance.proxy_ready,
                         "state": instance.state.value,
                         "desired_state": instance.desired_state.value,
                         "loaded_version": instance.loaded_version,
                         "active_tasks": len(instance.workflow_task_ids),
+                        "result_leases": len(instance.result_lease_ids),
                         "direct_inflight": instance.direct_inflight,
                         "active_sessions": instance.active_sessions,
                         "update_leases": instance.update_leases,
@@ -992,12 +1099,15 @@ class RolloutController:
                     "ready_instances": len(self._instance_pool.ready_snapshot()),
                     "serving_version": self.get_version(),
                     "pending_update_version": pending_update_version,
+                    "proxy_enabled": self._elastic_proxy_enabled,
                     "max_concurrent_rollouts": (
                         self._staleness_manager.max_concurrent_rollouts
                         if self._staleness_manager is not None
                         else None
                     ),
                     "last_reconcile_error": self._elastic_last_reconcile_error,
+                    "report_freq_steps": self.config.elastic.report_freq_steps,
+                    "latest_report_version": latest_report_version,
                     "instances": instances,
                 }
             )
@@ -1007,7 +1117,13 @@ class RolloutController:
             if self._instance_pool is None:
                 return jsonify({"error": "elastic rollout is disabled"}), 409
             if request.method == "GET":
-                return jsonify(self._elastic_scaling_report or {"status": "empty"})
+                with self._elastic_scaling_report_lock:
+                    report = (
+                        dict(self._elastic_scaling_report)
+                        if self._elastic_scaling_report is not None
+                        else {"status": "empty"}
+                    )
+                return jsonify(report)
             payload = request.get_json(silent=True) or {}
             try:
                 window = ElasticScalingWindow(
@@ -1024,15 +1140,32 @@ class RolloutController:
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 return jsonify({"error": str(exc)}), 400
-            self._elastic_scaling_report = {
+            with self._elastic_scaling_report_lock:
+                previous_version = (
+                    self._elastic_scaling_report.get("report_version", 0)
+                    if self._elastic_scaling_report is not None
+                    else 0
+                )
+            report_version = max(self.get_version(), int(previous_version)) + 1
+            report = {
+                "report_version": report_version,
+                "window_start_version": report_version,
+                "window_end_version": report_version,
+                "window_iterations": 1,
+                "timing_samples": int(window.step_seconds > 0),
                 "branch": recommendation.branch,
                 "recommended_instances": recommendation.recommended_instances,
                 "rollout_wait_fraction": recommendation.rollout_wait_fraction,
                 "entered": window.entered,
                 "consumed": window.consumed,
                 "ready_instances": window.ready_instances,
+                "wait_seconds": window.wait_seconds,
+                "step_seconds": window.step_seconds,
+                "avg_batch_wait_seconds": window.wait_seconds,
+                "avg_step_seconds": window.step_seconds,
             }
-            return jsonify(self._elastic_scaling_report)
+            self._publish_elastic_scaling_report(report, persist=False)
+            return jsonify(report)
 
         @app.route("/callback/pause_generation", methods=["POST"])
         def pause_generation():
@@ -1171,9 +1304,32 @@ class RolloutController:
     async def _proxy_collective_rpc_async(
         self, method: str, *args, **kwargs
     ) -> list[Any]:
-        return await self._collective_rpc_on_targets_async(
-            method, self._proxy_rpc_targets(), *args, **kwargs
-        )
+        if self._instance_pool is None:
+            return await self._collective_rpc_on_targets_async(
+                method, self._proxy_rpc_targets(), *args, **kwargs
+            )
+
+        rollout_targets = self._instance_pool.acquire_direct_snapshot()
+        try:
+            proxy_targets = []
+            for target in rollout_targets:
+                if target.proxy_worker_id is None or target.proxy_engine_name is None:
+                    raise RuntimeError(
+                        f"READY instance {target.instance_id} has no initialized proxy"
+                    )
+                proxy_targets.append(
+                    RolloutRPCTarget(
+                        instance_id=target.instance_id,
+                        worker_id=target.proxy_worker_id,
+                        engine_name=target.proxy_engine_name,
+                        proxy_addr=target.proxy_addr,
+                    )
+                )
+            return await self._collective_rpc_on_targets_async(
+                method, tuple(proxy_targets), *args, **kwargs
+            )
+        finally:
+            self._instance_pool.release_direct_snapshot(rollout_targets)
 
     async def _collective_rpc_on_targets_async(
         self,
@@ -1273,6 +1429,20 @@ class RolloutController:
                 )
         return should_accept_fn
 
+    def _proxy_addr_for_target(
+        self, target: RolloutRPCTarget, explicit_addr: str | None
+    ) -> str | None:
+        """Resolve the proxy that belongs to the already-selected target."""
+        if explicit_addr is not None or not self._proxy_started:
+            return explicit_addr
+        if self._instance_pool is not None:
+            if target.proxy_addr is None:
+                raise RuntimeError(
+                    f"Elastic instance {target.instance_id} has no proxy"
+                )
+            return target.proxy_addr
+        return self.get_proxy_addr(int(target.engine_name.rsplit("/", maxsplit=1)[1]))
+
     def _rollout_stats(self) -> str:
         stats = self._staleness_manager.get_stats()
         return (
@@ -1307,15 +1477,9 @@ class RolloutController:
                 with self._futures_lock:
                     self._pending_futures[task_id] = future
 
-                proxy_addr = pending_task.proxy_addr
-                if self._proxy_started and proxy_addr is None:
-                    if self._instance_pool is not None:
-                        raise RuntimeError(
-                            "elastic rollout does not yet support proxy routing"
-                        )
-                    proxy_addr = self.get_proxy_addr(
-                        int(target.engine_name.rsplit("/", maxsplit=1)[1])
-                    )
+                proxy_addr = self._proxy_addr_for_target(
+                    target, pending_task.proxy_addr
+                )
                 engine_task_id = await self.scheduler.async_call_engine(
                     target.worker_id,
                     "submit",
@@ -1355,7 +1519,14 @@ class RolloutController:
                         logger.info(
                             f"Finish and accept rollout. {self._rollout_stats()}"
                         )
-                    return _RemoteRolloutResult(task_id=task_id, trajectory=traj)
+                    result = _RemoteRolloutResult(task_id=task_id, trajectory=traj)
+                    if bound_instance_id is not None:
+                        self._acquire_result_lease(
+                            instance_id=bound_instance_id,
+                            task_id=task_id,
+                            trajectory=traj,
+                        )
+                    return result
 
                 manager.on_rollout_rejected()
                 if self.config.enable_rollout_tracing:
@@ -1381,6 +1552,76 @@ class RolloutController:
                     self._instance_pool.release_task(str(task_id))
 
         return _submit_then_wait
+
+    def _acquire_result_lease(
+        self,
+        *,
+        instance_id: str,
+        task_id: int,
+        trajectory: dict[str, Any],
+    ) -> None:
+        """Keep the trajectory's storage owner alive until the batch is cleared."""
+        if self._instance_pool is None:
+            return
+        shards_by_node = RTensor.collect_shards(trajectory)
+        shard_ids = {
+            shard_id for shard_ids in shards_by_node.values() for shard_id in shard_ids
+        }
+        if not shard_ids:
+            return
+
+        lease_id = str(task_id)
+        with self._elastic_result_lease_lock:
+            if lease_id in self._elastic_result_lease_instance:
+                raise RuntimeError(f"duplicate elastic result lease {lease_id}")
+            collisions = shard_ids.intersection(self._elastic_shard_to_result_lease)
+            if collisions:
+                raise RuntimeError(
+                    "elastic result shards already have an owner: "
+                    f"{sorted(str(shard_id) for shard_id in collisions)}"
+                )
+            # Acquire the pool lease before publishing the shard mapping. The
+            # workflow-task lease is still held here, so the reconciler cannot
+            # remove this instance between the two operations.
+            self._instance_pool.acquire_result_lease(instance_id, lease_id)
+            self._elastic_result_lease_instance[lease_id] = instance_id
+            self._elastic_result_lease_shards[lease_id] = shard_ids
+            for shard_id in shard_ids:
+                self._elastic_shard_to_result_lease[shard_id] = lease_id
+
+    def release_batch(self, *targets: Any) -> None:
+        """Release elastic instances after consumers finish returned RTensors.
+
+        Results waiting in the dispatcher retain their leases because their
+        shard IDs do not appear in ``targets`` yet. Cleanup is idempotent so a
+        batch may safely contain the same shard through derived structures.
+        """
+        if self._instance_pool is None:
+            return
+        shards_by_node = RTensor.collect_shards(targets)
+        shard_ids = {
+            shard_id for shard_ids in shards_by_node.values() for shard_id in shard_ids
+        }
+        if not shard_ids:
+            return
+
+        released: list[tuple[str, str]] = []
+        with self._elastic_result_lease_lock:
+            lease_ids = {
+                lease_id
+                for shard_id in shard_ids
+                if (lease_id := self._elastic_shard_to_result_lease.get(shard_id))
+                is not None
+            }
+            for lease_id in lease_ids:
+                instance_id = self._elastic_result_lease_instance.pop(lease_id)
+                lease_shards = self._elastic_result_lease_shards.pop(lease_id)
+                for shard_id in lease_shards:
+                    self._elastic_shard_to_result_lease.pop(shard_id, None)
+                released.append((instance_id, lease_id))
+
+        for instance_id, lease_id in released:
+            self._instance_pool.release_result_lease(instance_id, lease_id)
 
     def get_capacity(self):
         return self.staleness_manager.get_capacity()
