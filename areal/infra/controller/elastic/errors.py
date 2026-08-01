@@ -11,6 +11,10 @@ class DuplicateInstanceError(ElasticRolloutError):
     """Raised when an instance identity is already registered."""
 
 
+class DiskCheckpointCatalogError(ElasticRolloutError):
+    """Raised when a committed disk checkpoint manifest is invalid."""
+
+
 class InstanceNotFoundError(ElasticRolloutError):
     """Raised when an instance identity is not registered."""
 

@@ -9,6 +9,7 @@ import traceback
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from threading import Lock
 from typing import Any
 
@@ -35,7 +36,16 @@ from areal.api.cli_args import (
     PerfTracerConfig,
     SchedulingSpec,
 )
-from areal.infra.controller.elastic import RolloutRPCTarget
+from areal.infra.controller.elastic import (
+    DiskCheckpointCatalog,
+    DiskCheckpointCatalogError,
+    DiskCheckpointManifest,
+    InvalidDesiredCountError,
+    RolloutInstanceLauncher,
+    RolloutInstancePool,
+    RolloutInstanceReconciler,
+    RolloutRPCTarget,
+)
 from areal.infra.rpc.serialization import deserialize_value
 from areal.infra.utils.concurrent import run_async_task
 from areal.utils import logging, perf_tracer
@@ -95,6 +105,19 @@ class RolloutController:
         # State
         self._version_lock = Lock()
         self._version = 0
+        self._elastic_capacity_per_instance: int | None = None
+        self._disk_checkpoint_catalog: DiskCheckpointCatalog | None = None
+        self._instance_pool: RolloutInstancePool | None = None
+        self._elastic_reconciler: RolloutInstanceReconciler | None = None
+        self._elastic_reconcile_stop = threading.Event()
+        self._elastic_reconcile_thread: threading.Thread | None = None
+        self._elastic_last_reconcile_error: str | None = None
+        if config.elastic.enabled:
+            self._instance_pool = RolloutInstancePool(
+                min_instances=config.elastic.min_instances,
+                initial_instances=config.elastic.initial_instances,
+                max_instances=config.elastic.max_instances,
+            )
 
         self._task_id_generator = TaskIdGenerator()
 
@@ -169,12 +192,17 @@ class RolloutController:
         # usually TP x PP.
         self._worker_role = role
 
-        job = self._build_rollout_job(role)
-
-        # Call async scheduler methods synchronously
-        run_async_task(
-            self._async_initialize, job, server_args, server_infos, *args, **kwargs
-        )
+        if self.config.elastic.enabled:
+            if server_infos is not None:
+                raise NotImplementedError(
+                    "elastic rollout does not support externally supplied servers"
+                )
+            self._initialize_elastic(role, server_args or {}, kwargs)
+        else:
+            job = self._build_rollout_job(role)
+            run_async_task(
+                self._async_initialize, job, server_args, server_infos, *args, **kwargs
+            )
 
         # Initialize staleness manager for global capacity control
         max_concurrent_rollouts = (
@@ -187,6 +215,9 @@ class RolloutController:
             consumer_batch_size=consumer_batch_size,
             max_staleness=self.config.max_head_offpolicyness,
         )
+        if self._instance_pool is not None:
+            self._elastic_capacity_per_instance = max_concurrent_rollouts
+            self._refresh_elastic_capacity()
 
         # Create and initialize the dispatcher
         qsize = self.config.queue_size or max_concurrent_rollouts * 16
@@ -203,6 +234,67 @@ class RolloutController:
 
         # Start callback server for weight sync coordination
         self._start_callback_server()
+
+    def _initialize_elastic(
+        self,
+        role: str,
+        server_args: dict[str, Any],
+        initialize_kwargs: dict[str, Any],
+    ) -> None:
+        assert self._instance_pool is not None
+        launcher = RolloutInstanceLauncher(
+            scheduler=self.scheduler,
+            inf_engine=self.inf_engine,
+            config=self.config,
+            rollout_alloc=self.rollout_alloc,
+        )
+        self._elastic_reconciler = RolloutInstanceReconciler(
+            pool=self._instance_pool,
+            launcher=launcher,
+            role_prefix=self.config.elastic.role_prefix,
+            server_args=server_args,
+            initialize_kwargs=initialize_kwargs,
+            latest_checkpoint=self._latest_elastic_checkpoint,
+            current_version=self.get_version,
+        )
+        run_async_task(self._reconcile_elastic_once)
+        self._elastic_reconcile_thread = threading.Thread(
+            target=self._elastic_reconcile_loop,
+            name="rollout-elastic-reconciler",
+            daemon=True,
+        )
+        self._elastic_reconcile_thread.start()
+
+    def _latest_elastic_checkpoint(self) -> DiskCheckpointManifest | None:
+        if self._disk_checkpoint_catalog is None:
+            return None
+        checkpoints = self._disk_checkpoint_catalog.list()
+        return checkpoints[-1] if checkpoints else None
+
+    async def _reconcile_elastic_once(self) -> None:
+        assert self._elastic_reconciler is not None
+        await self._elastic_reconciler.reconcile_once()
+        self._refresh_elastic_capacity()
+
+    def _refresh_elastic_capacity(self) -> None:
+        if self._instance_pool is None or self._staleness_manager is None:
+            return
+        assert self._elastic_capacity_per_instance is not None
+        ready_instances = len(self._instance_pool.ready_snapshot())
+        self._staleness_manager.set_max_concurrent_rollouts(
+            max(1, ready_instances * self._elastic_capacity_per_instance)
+        )
+
+    def _elastic_reconcile_loop(self) -> None:
+        while not self._elastic_reconcile_stop.wait(
+            self.config.elastic.reconcile_interval_seconds
+        ):
+            try:
+                run_async_task(self._reconcile_elastic_once)
+                self._elastic_last_reconcile_error = None
+            except Exception:
+                self._elastic_last_reconcile_error = traceback.format_exc()
+                logger.error("Elastic reconciliation failed", exc_info=True)
 
     def _build_rollout_job(self, role: str) -> Job:
         """Build the unchanged static V1 Scheduler job for rollout workers."""
@@ -325,12 +417,28 @@ class RolloutController:
         if self._dispatcher is not None:
             self._dispatcher.destroy()
 
+        if self._elastic_reconcile_thread is not None:
+            self._elastic_reconcile_stop.set()
+            self._elastic_reconcile_thread.join(timeout=5.0)
+            self._elastic_reconcile_thread = None
+
         self._stop_callback_server()
 
         self._collective_rpc("destroy", http_timeout=60.0)
 
         # Delete workers via scheduler
-        if hasattr(self, "_worker_role"):
+        if self._instance_pool is not None:
+            for instance_id in self._instance_pool.instance_ids():
+                instance = self._instance_pool.get(instance_id)
+                try:
+                    self.scheduler.delete_workers(role=instance.worker_role)
+                except Exception:
+                    logger.error(
+                        "Error deleting elastic worker role %s: %s",
+                        instance.worker_role,
+                        traceback.format_exc(),
+                    )
+        elif hasattr(self, "_worker_role"):
             try:
                 self.scheduler.delete_workers(role=self._worker_role)
                 self.workers.clear()
@@ -597,6 +705,77 @@ class RolloutController:
             )
             return jsonify({"status": "ok"})
 
+        @app.route("/elastic/desired-instances", methods=["GET", "PUT"])
+        def elastic_desired_instances():
+            """Read or update desired complete TP x PP rollout instances.
+
+            This endpoint is intentionally a desired-state control plane.  A
+            later reconciler owns resource creation and graceful teardown, so
+            an HTTP request never creates or kills Scheduler workers inline.
+            """
+            if self._instance_pool is None:
+                return jsonify({"error": "elastic rollout is disabled"}), 409
+
+            if request.method == "GET":
+                return jsonify(
+                    {
+                        "desired_instances": self._instance_pool.desired_count,
+                        "instance_ids": self._instance_pool.instance_ids(),
+                    }
+                )
+
+            payload = request.get_json(silent=True) or {}
+            desired_count = payload.get("desired_instances")
+            if isinstance(desired_count, bool) or not isinstance(desired_count, int):
+                return jsonify({"error": "desired_instances must be an integer"}), 400
+            try:
+                self._instance_pool.set_desired_count(desired_count)
+            except InvalidDesiredCountError as exc:
+                return jsonify({"error": str(exc)}), 400
+            return jsonify(
+                {
+                    "desired_instances": self._instance_pool.desired_count,
+                    "instance_ids": self._instance_pool.instance_ids(),
+                }
+            )
+
+        @app.route("/elastic/instances", methods=["GET"])
+        def elastic_instances():
+            """Return a stable JSON snapshot for external control loops."""
+            if self._instance_pool is None:
+                return jsonify({"error": "elastic rollout is disabled"}), 409
+            instances = []
+            for instance_id in self._instance_pool.instance_ids():
+                instance = self._instance_pool.get(instance_id)
+                instances.append(
+                    {
+                        "instance_id": instance.instance_id,
+                        "worker_role": instance.worker_role,
+                        "worker_id": instance.worker_id,
+                        "engine_name": instance.engine_name,
+                        "state": instance.state.value,
+                        "desired_state": instance.desired_state.value,
+                        "loaded_version": instance.loaded_version,
+                        "active_tasks": len(instance.workflow_task_ids),
+                        "direct_inflight": instance.direct_inflight,
+                        "active_sessions": instance.active_sessions,
+                        "update_leases": instance.update_leases,
+                    }
+                )
+            return jsonify(
+                {
+                    "desired_instances": self._instance_pool.desired_count,
+                    "ready_instances": len(self._instance_pool.ready_snapshot()),
+                    "max_concurrent_rollouts": (
+                        self._staleness_manager.max_concurrent_rollouts
+                        if self._staleness_manager is not None
+                        else None
+                    ),
+                    "last_reconcile_error": self._elastic_last_reconcile_error,
+                    "instances": instances,
+                }
+            )
+
         @app.route("/callback/pause_generation", methods=["POST"])
         def pause_generation():
             self._callback_loop.run_until_complete(self.pause_generation())
@@ -690,6 +869,8 @@ class RolloutController:
 
     def _rollout_rpc_targets(self) -> tuple[RolloutRPCTarget, ...]:
         """Snapshot static rollout RPC targets without changing rank naming."""
+        if self._instance_pool is not None:
+            return self._instance_pool.ready_snapshot()
         return tuple(
             RolloutRPCTarget(
                 instance_id=f"static-{rank}",
@@ -763,6 +944,23 @@ class RolloutController:
         self._current_worker_idx = (self._current_worker_idx + 1) % len(self.workers)
         return worker, rank
 
+    def _choose_rollout_target(self) -> RolloutRPCTarget:
+        """Choose a routable target without using a rank as elastic identity."""
+        if self._instance_pool is not None:
+            targets = self._instance_pool.ready_snapshot()
+            if not targets:
+                raise RuntimeError("No READY elastic rollout instances available")
+            target = targets[self._current_worker_idx % len(targets)]
+            self._current_worker_idx = (self._current_worker_idx + 1) % len(targets)
+            return target
+
+        worker, rank = self._choose_worker()
+        return RolloutRPCTarget(
+            instance_id=f"static-{rank}",
+            worker_id=worker.id,
+            engine_name=self._engine_name(rank),
+        )
+
     def _resolve_workflow_str(self, workflow: WorkflowLike | None) -> str | None:
         """Resolve workflow to a string import path.
 
@@ -820,14 +1018,13 @@ class RolloutController:
 
     def _create_submit_callback(self, pending_task: _RemoteRolloutTaskInput):
         async def _submit_then_wait() -> _RemoteRolloutResult | None:
-            # Choose worker via round-robin
-            worker, rank = self._choose_worker()
-            engine_name = self._engine_name(rank)
+            target = self._choose_rollout_target()
 
             # NOTE: No need to call `on_rollout_submitted` here.
             # This function will be passed to `BatchTaskDispather` where
             # `on_rollout_submitted` will be called upon dispatching
             task_id = pending_task.task_id
+            bound_instance_id: str | None = None
 
             manager = self.staleness_manager
 
@@ -837,13 +1034,23 @@ class RolloutController:
                 with self._futures_lock:
                     self._pending_futures[task_id] = future
 
+                if self._instance_pool is not None:
+                    self._instance_pool.bind_task(str(task_id), target.instance_id)
+                    bound_instance_id = target.instance_id
+
                 proxy_addr = pending_task.proxy_addr
                 if self._proxy_started and proxy_addr is None:
-                    proxy_addr = self.get_proxy_addr(rank)
+                    if self._instance_pool is not None:
+                        raise RuntimeError(
+                            "elastic rollout does not yet support proxy routing"
+                        )
+                    proxy_addr = self.get_proxy_addr(
+                        int(target.engine_name.rsplit("/", maxsplit=1)[1])
+                    )
                 engine_task_id = await self.scheduler.async_call_engine(
-                    worker.id,
+                    target.worker_id,
                     "submit",
-                    engine_name=engine_name,
+                    engine_name=target.engine_name,
                     data=pending_task.data,
                     workflow=pending_task.workflow,
                     workflow_kwargs=pending_task.workflow_kwargs,
@@ -863,9 +1070,9 @@ class RolloutController:
 
                 # Fetch the result
                 result = await self.scheduler.async_call_engine(
-                    worker.id,
+                    target.worker_id,
                     "wait_for_task",
-                    engine_name=engine_name,
+                    engine_name=target.engine_name,
                     task_id=engine_task_id,
                     timeout=0.1,  # A short time to prevent blocking other requests
                     raise_timeout=False,
@@ -900,6 +1107,9 @@ class RolloutController:
                 manager.on_rollout_rejected()
                 logger.error("Workflow execution failed: %s", exc, exc_info=True)
                 return None
+            finally:
+                if bound_instance_id is not None:
+                    self._instance_pool.release_task(str(task_id))
 
         return _submit_then_wait
 
@@ -1083,16 +1293,19 @@ class RolloutController:
         ModelResponse
             The generated response from the model
         """
-        # Choose worker and delegate
-        worker, rank = self._choose_worker()
-
-        # Call agenerate on engine via scheduler
-        return await self.scheduler.async_call_engine(
-            worker_id=worker.id,
-            method="agenerate",
-            engine_name=self._engine_name(rank),
-            req=req,
-        )
+        target = self._choose_rollout_target()
+        if self._instance_pool is not None:
+            self._instance_pool.acquire_direct_request(target.instance_id)
+        try:
+            return await self.scheduler.async_call_engine(
+                worker_id=target.worker_id,
+                method="agenerate",
+                engine_name=target.engine_name,
+                req=req,
+            )
+        finally:
+            if self._instance_pool is not None:
+                self._instance_pool.release_direct_request(target.instance_id)
 
     async def init_weights_update_group(self, meta: WeightUpdateMeta) -> None:
         targets = self._rollout_rpc_targets()
@@ -1117,8 +1330,58 @@ class RolloutController:
 
     async def update_weights_from_disk(self, meta: WeightUpdateMeta):
         meta.clear_checkpoint_after_load = False
-        await self._collective_rpc_async("update_weights_from_disk", meta=meta)
-        shutil.rmtree(meta.path, ignore_errors=True)
+        targets = self._rollout_rpc_targets()
+        leased_instance_ids: list[str] = []
+        try:
+            if self._instance_pool is not None:
+                for target in targets:
+                    self._instance_pool.acquire_update_lease(target.instance_id)
+                    leased_instance_ids.append(target.instance_id)
+            await self._collective_rpc_on_targets_async(
+                "update_weights_from_disk", targets, meta=meta
+            )
+            if self.config.elastic.enabled:
+                self._record_elastic_disk_checkpoint(meta)
+            else:
+                shutil.rmtree(meta.path, ignore_errors=True)
+        finally:
+            if self._instance_pool is not None:
+                for instance_id in leased_instance_ids:
+                    self._instance_pool.release_update_lease(instance_id)
+
+    def _record_elastic_disk_checkpoint(self, meta: WeightUpdateMeta) -> None:
+        """Persist a successfully loaded checkpoint for a future elastic instance.
+
+        This runs only after every current V1 rollout worker has completed the
+        disk update.  The static lifecycle intentionally keeps its historical
+        immediate cleanup behavior.
+        """
+        if meta.type != "disk":
+            raise DiskCheckpointCatalogError(
+                "elastic rollout checkpoint catalog requires disk updates"
+            )
+        if meta.version is None:
+            raise DiskCheckpointCatalogError(
+                "elastic disk weight updates require a checkpoint version"
+            )
+        if meta.path is None:
+            raise DiskCheckpointCatalogError(
+                "elastic disk weight updates require a checkpoint path"
+            )
+
+        checkpoint_path = Path(meta.path).resolve()
+        if self._disk_checkpoint_catalog is None:
+            self._disk_checkpoint_catalog = DiskCheckpointCatalog(
+                checkpoint_path.parent
+            )
+        elif self._disk_checkpoint_catalog.path.parent != checkpoint_path.parent:
+            raise DiskCheckpointCatalogError(
+                "elastic disk checkpoint directory changed during one run"
+            )
+
+        self._disk_checkpoint_catalog.commit(
+            DiskCheckpointManifest(version=meta.version, path=str(checkpoint_path))
+        )
 
     async def update_weights_from_awex(
         self,

@@ -1,5 +1,5 @@
 import asyncio
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import requests
@@ -14,12 +14,14 @@ from areal.api import (
     Worker,
 )
 from areal.api.cli_args import (
+    ElasticRolloutConfig,
     GenerationHyperparameters,
     InferenceEngineConfig,
     SchedulingSpec,
     SGLangConfig,
 )
 from areal.infra import RolloutController
+from areal.infra.controller.elastic import DiskCheckpointCatalogError
 from areal.infra.scheduler.local import LocalScheduler
 from areal.utils.hf_utils import load_hf_tokenizer
 
@@ -1419,6 +1421,46 @@ class TestRolloutControllerCollectiveRPC:
         assert len(test_calls) == 3
 
         controller.destroy()
+
+
+class TestElasticDiskCheckpointCatalog:
+    def _controller(self, tmp_path):
+        config = create_test_config(
+            elastic=ElasticRolloutConfig(enabled=True, max_instances=2)
+        )
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=config,
+            scheduler=MockScheduler(),
+        )
+        controller._collective_rpc_async = AsyncMock()
+        return controller
+
+    def test_elastic_disk_update_keeps_and_records_loaded_checkpoint(self, tmp_path):
+        controller = self._controller(tmp_path)
+        checkpoint = tmp_path / "weight_update_v7"
+        checkpoint.mkdir()
+        meta = WeightUpdateMeta(type="disk", path=str(checkpoint), version=7)
+
+        asyncio.run(controller.update_weights_from_disk(meta))
+
+        assert checkpoint.is_dir()
+        assert controller._disk_checkpoint_catalog is not None
+        assert controller._disk_checkpoint_catalog.latest().version == 7
+        controller._collective_rpc_async.assert_awaited_once_with(
+            "update_weights_from_disk", meta=meta
+        )
+
+    def test_elastic_disk_update_requires_a_versioned_checkpoint(self, tmp_path):
+        controller = self._controller(tmp_path)
+        checkpoint = tmp_path / "weight_update"
+        checkpoint.mkdir()
+        meta = WeightUpdateMeta(type="disk", path=str(checkpoint))
+
+        with pytest.raises(
+            DiskCheckpointCatalogError, match="require a checkpoint version"
+        ):
+            asyncio.run(controller.update_weights_from_disk(meta))
 
 
 if __name__ == "__main__":

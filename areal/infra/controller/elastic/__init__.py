@@ -2,7 +2,9 @@
 
 """In-memory lifecycle primitives for RolloutController V1 elasticity."""
 
+from .disk_catalog import DiskCheckpointCatalog, DiskCheckpointManifest
 from .errors import (
+    DiskCheckpointCatalogError,
     DuplicateInstanceError,
     ElasticRolloutError,
     InstanceNotFoundError,
@@ -21,9 +23,13 @@ from .models import (
     RolloutInstanceState,
     RolloutRPCTarget,
 )
+from .reconciler import ReconcileResult, RolloutInstanceReconciler
 
 __all__ = [
     "DuplicateInstanceError",
+    "DiskCheckpointCatalog",
+    "DiskCheckpointCatalogError",
+    "DiskCheckpointManifest",
     "ElasticRolloutError",
     "InstanceDesiredState",
     "InstanceNotFoundError",
@@ -35,8 +41,10 @@ __all__ = [
     "RolloutInstanceLauncher",
     "RolloutLaunchResult",
     "RolloutInstancePool",
+    "RolloutInstanceReconciler",
     "RolloutInstanceState",
     "RolloutRPCTarget",
+    "ReconcileResult",
     "SingleNodeInstanceError",
     "TaskBindingError",
 ]
