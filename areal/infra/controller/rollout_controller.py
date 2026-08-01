@@ -50,6 +50,7 @@ from areal.infra.controller.elastic import (
     RolloutRPCTarget,
     recommend_instances,
 )
+from areal.infra.rpc.rtensor import RTensor
 from areal.infra.rpc.serialization import deserialize_value
 from areal.infra.utils.concurrent import run_async_task
 from areal.utils import logging, perf_tracer
@@ -124,6 +125,10 @@ class RolloutController:
         self._elastic_catchups_inflight = 0
         self._elastic_pending_worker_roles: set[str] = set()
         self._elastic_proxy_enabled = False
+        self._elastic_result_lease_lock = threading.Lock()
+        self._elastic_result_lease_instance: dict[str, str] = {}
+        self._elastic_result_lease_shards: dict[str, set[Any]] = {}
+        self._elastic_shard_to_result_lease: dict[Any, str] = {}
         if config.elastic.enabled:
             self._instance_pool = RolloutInstancePool(
                 min_instances=config.elastic.min_instances,
@@ -1026,6 +1031,7 @@ class RolloutController:
                         "desired_state": instance.desired_state.value,
                         "loaded_version": instance.loaded_version,
                         "active_tasks": len(instance.workflow_task_ids),
+                        "result_leases": len(instance.result_lease_ids),
                         "direct_inflight": instance.direct_inflight,
                         "active_sessions": instance.active_sessions,
                         "update_leases": instance.update_leases,
@@ -1432,7 +1438,14 @@ class RolloutController:
                         logger.info(
                             f"Finish and accept rollout. {self._rollout_stats()}"
                         )
-                    return _RemoteRolloutResult(task_id=task_id, trajectory=traj)
+                    result = _RemoteRolloutResult(task_id=task_id, trajectory=traj)
+                    if bound_instance_id is not None:
+                        self._acquire_result_lease(
+                            instance_id=bound_instance_id,
+                            task_id=task_id,
+                            trajectory=traj,
+                        )
+                    return result
 
                 manager.on_rollout_rejected()
                 if self.config.enable_rollout_tracing:
@@ -1458,6 +1471,76 @@ class RolloutController:
                     self._instance_pool.release_task(str(task_id))
 
         return _submit_then_wait
+
+    def _acquire_result_lease(
+        self,
+        *,
+        instance_id: str,
+        task_id: int,
+        trajectory: dict[str, Any],
+    ) -> None:
+        """Keep the trajectory's storage owner alive until the batch is cleared."""
+        if self._instance_pool is None:
+            return
+        shards_by_node = RTensor.collect_shards(trajectory)
+        shard_ids = {
+            shard_id for shard_ids in shards_by_node.values() for shard_id in shard_ids
+        }
+        if not shard_ids:
+            return
+
+        lease_id = str(task_id)
+        with self._elastic_result_lease_lock:
+            if lease_id in self._elastic_result_lease_instance:
+                raise RuntimeError(f"duplicate elastic result lease {lease_id}")
+            collisions = shard_ids.intersection(self._elastic_shard_to_result_lease)
+            if collisions:
+                raise RuntimeError(
+                    "elastic result shards already have an owner: "
+                    f"{sorted(str(shard_id) for shard_id in collisions)}"
+                )
+            # Acquire the pool lease before publishing the shard mapping. The
+            # workflow-task lease is still held here, so the reconciler cannot
+            # remove this instance between the two operations.
+            self._instance_pool.acquire_result_lease(instance_id, lease_id)
+            self._elastic_result_lease_instance[lease_id] = instance_id
+            self._elastic_result_lease_shards[lease_id] = shard_ids
+            for shard_id in shard_ids:
+                self._elastic_shard_to_result_lease[shard_id] = lease_id
+
+    def release_batch(self, *targets: Any) -> None:
+        """Release elastic instances after consumers finish returned RTensors.
+
+        Results waiting in the dispatcher retain their leases because their
+        shard IDs do not appear in ``targets`` yet. Cleanup is idempotent so a
+        batch may safely contain the same shard through derived structures.
+        """
+        if self._instance_pool is None:
+            return
+        shards_by_node = RTensor.collect_shards(targets)
+        shard_ids = {
+            shard_id for shard_ids in shards_by_node.values() for shard_id in shard_ids
+        }
+        if not shard_ids:
+            return
+
+        released: list[tuple[str, str]] = []
+        with self._elastic_result_lease_lock:
+            lease_ids = {
+                lease_id
+                for shard_id in shard_ids
+                if (lease_id := self._elastic_shard_to_result_lease.get(shard_id))
+                is not None
+            }
+            for lease_id in lease_ids:
+                instance_id = self._elastic_result_lease_instance.pop(lease_id)
+                lease_shards = self._elastic_result_lease_shards.pop(lease_id)
+                for shard_id in lease_shards:
+                    self._elastic_shard_to_result_lease.pop(shard_id, None)
+                released.append((instance_id, lease_id))
+
+        for instance_id, lease_id in released:
+            self._instance_pool.release_result_lease(instance_id, lease_id)
 
     def get_capacity(self):
         return self.staleness_manager.get_capacity()

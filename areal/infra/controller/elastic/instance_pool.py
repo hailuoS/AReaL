@@ -271,6 +271,27 @@ class RolloutInstancePool:
                 instance.workflow_task_ids.discard(task_id)
             return instance_id
 
+    def acquire_result_lease(self, instance_id: str, lease_id: str) -> None:
+        """Keep an instance alive while returned RTensor shards remain readable."""
+        if not lease_id:
+            raise ValueError("lease_id must not be empty")
+        with self._lock:
+            instance = self.get(instance_id)
+            if lease_id in instance.result_lease_ids:
+                raise TaskBindingError(
+                    f"result lease {lease_id} already belongs to instance {instance_id}"
+                )
+            instance.result_lease_ids.add(lease_id)
+
+    def release_result_lease(self, instance_id: str, lease_id: str) -> bool:
+        """Release returned-data ownership; repeated cleanup is idempotent."""
+        with self._lock:
+            instance = self._instances.get(instance_id)
+            if instance is None or lease_id not in instance.result_lease_ids:
+                return False
+            instance.result_lease_ids.remove(lease_id)
+            return True
+
     def acquire_direct_request(self, instance_id: str) -> None:
         """Track one direct generation request on an instance."""
         with self._lock:

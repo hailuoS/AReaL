@@ -113,6 +113,24 @@ def test_task_reservation_is_atomic_with_drain():
     assert instance.can_stop
 
 
+def test_returned_result_lease_blocks_stop_after_workflow_task_completes():
+    """A completed task remains protected while its remote tensors are consumed."""
+    pool = _pool()
+    instance = _add_ready(pool, "ri-first")
+    pool.bind_task("task-a", instance.instance_id)
+    pool.acquire_result_lease(instance.instance_id, "task-a")
+
+    pool.release_task("task-a")
+    instance.request_drain()
+
+    assert not instance.workflow_task_ids
+    assert instance.result_lease_ids == {"task-a"}
+    assert not instance.can_stop
+    assert pool.release_result_lease(instance.instance_id, "task-a")
+    assert instance.can_stop
+    assert not pool.release_result_lease(instance.instance_id, "task-a")
+
+
 def test_weight_update_snapshot_holds_drain_lease_until_release():
     pool = _pool()
     instance = _add_ready(pool, "ri-first")

@@ -114,6 +114,7 @@ class RolloutInstance:
     desired_state: InstanceDesiredState = InstanceDesiredState.RUNNING
     loaded_version: int | None = None
     workflow_task_ids: set[str] = field(default_factory=set)
+    result_lease_ids: set[str] = field(default_factory=set)
     direct_inflight: int = 0
     active_sessions: int = 0
     update_leases: int = 0
@@ -206,6 +207,7 @@ class RolloutInstance:
         """Whether every tracked source of in-flight work has reached zero."""
         return (
             not self.workflow_task_ids
+            and not self.result_lease_ids
             and self.direct_inflight == 0
             and self.active_sessions == 0
             and self.update_leases == 0

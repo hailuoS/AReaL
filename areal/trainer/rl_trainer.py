@@ -962,6 +962,11 @@ class PPOTrainer:
                         self.critic.clear_all_local_rtensors()
                     if self.ref is not None:
                         self.ref.clear_all_local_rtensors()
+                    if (
+                        isinstance(self.rollout, RolloutController)
+                        and self.rollout.config.elastic.enabled
+                    ):
+                        self.rollout.release_batch(rollout_batch)
 
             with perf_tracer.trace_scope(
                 "train.log_stats",

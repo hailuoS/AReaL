@@ -166,6 +166,34 @@ async def test_reconciler_drains_before_destroying_an_instance():
 
 
 @pytest.mark.asyncio
+async def test_reconciler_waits_for_returned_result_lease():
+    pool = RolloutInstancePool(min_instances=1, initial_instances=2, max_instances=2)
+    launcher = _FakeLauncher()
+    reconciler = RolloutInstanceReconciler(
+        pool=pool,
+        launcher=launcher,
+        role_prefix="rollout-elastic",
+        server_args={},
+        latest_checkpoint=lambda: None,
+        current_version=lambda: 0,
+    )
+    await reconciler.reconcile_once()
+    draining_id = pool.instance_ids()[-1]
+    pool.acquire_result_lease(draining_id, "task-1")
+    pool.set_desired_count(1)
+
+    first = await reconciler.reconcile_once()
+
+    assert first.removed_instance_ids == ()
+    assert pool.get(draining_id).state is RolloutInstanceState.DRAINING
+    pool.release_result_lease(draining_id, "task-1")
+
+    second = await reconciler.reconcile_once()
+
+    assert second.removed_instance_ids == (draining_id,)
+
+
+@pytest.mark.asyncio
 async def test_reconciler_cancels_drain_before_launching_replacement():
     pool = RolloutInstancePool(min_instances=1, initial_instances=2, max_instances=2)
     launcher = _FakeLauncher()
