@@ -12,6 +12,10 @@ one node. Cross-node instances and dynamic Proxy online sessions are not support
 Elastic mode supports disk weight synchronization only. AWEX and XCCL retain their
 existing static behavior.
 
+Elastic V1 currently disables the separate shared-server evaluation rollout. Training
+rollouts remain available, but validation rollout is skipped with a warning until
+dynamic evaluation backends are implemented.
+
 ## Configuration
 
 `rollout.elastic.enabled` defaults to `false`. When disabled, the original static
@@ -43,6 +47,9 @@ GET /elastic/scaling-recommendation
 POST /elastic/scaling-recommendation
 ```
 
+`GET /elastic/instances` reports both `serving_version` and
+`pending_update_version`, plus each instance's `loaded_version`.
+
 Set desired capacity with:
 
 ```json
@@ -56,7 +63,8 @@ initialization and loading the exact committed disk version.
 Scale-in first changes an instance to `DRAINING`. It receives no new work and is deleted
 only after workflow tasks, direct requests, and weight-update leases are empty. The
 instance model reserves active-session accounting, but dynamic Proxy session routing and
-drain are deferred.
+drain are deferred. Exceeding `drain_timeout_seconds` reports a reconcile error and does
+not force-delete an instance that still owns work.
 
 ## Scaling recommendation
 
@@ -83,11 +91,18 @@ Committed checkpoints are cataloged atomically. The newest `checkpoint_retention
 versions are retained, along with any version protected by catch-up or weight-update
 leases.
 
+Disk update and instance catch-up are mutually excluded across the version transition.
+An instance cannot become `READY` in the gap between loading a new checkpoint and
+publishing its serving version.
+
 When `rollout.fileroot` is configured, the Controller atomically persists desired
 capacity, serving version, committed checkpoint, and owned Scheduler roles. After
 restart it validates the exact checkpoint, removes recorded stale roles, and lets the
 reconciler recreate the requested capacity. A nonzero serving version without its
 committed disk checkpoint fails recovery.
+
+Recovery files are isolated under `rollout.fileroot/experiment_name/trial_name` so
+independent trials do not reuse each other's desired state or checkpoint.
 
 ## Single-node validation
 
@@ -102,6 +117,17 @@ AREAL_SPMD_MODE=false python examples/math/rollout_elastic_controller_spike.py \
 Then run normal end-to-end training with disk updates. After at least one weight update,
 increase desired capacity and verify from `GET /elastic/instances` that the new instance
 has the current `loaded_version` before it reaches `ready`.
+
+For the NPU GSM8K example, add these overrides to the normal training command:
+
+```text
+actor.weight_update_mode=disk
+rollout.elastic.enabled=true
+rollout.elastic.min_instances=1
+rollout.elastic.initial_instances=1
+rollout.elastic.max_instances=2
+scheduler.type=ray
+```
 
 Finally run the same training configuration with `rollout.elastic.enabled=false` to
 verify the unchanged static path.
