@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import threading
 import uuid
+from copy import deepcopy
 
 from .errors import (
     DuplicateInstanceError,
@@ -111,6 +112,11 @@ class RolloutInstancePool:
         with self._lock:
             return tuple(self._instances)
 
+    def instances_snapshot(self) -> tuple[RolloutInstance, ...]:
+        """Return detached instance state for status, recovery, and GC decisions."""
+        with self._lock:
+            return tuple(deepcopy(instance) for instance in self._instances.values())
+
     def ready_snapshot(self) -> tuple[RolloutRPCTarget, ...]:
         """Snapshot instances currently eligible for new inference work."""
         with self._lock:
@@ -123,6 +129,113 @@ class RolloutInstancePool:
     def weight_update_snapshot(self) -> tuple[RolloutRPCTarget, ...]:
         """Snapshot READY instances participating in one disk weight update."""
         return self.ready_snapshot()
+
+    def reserve_task(self, task_id: str, selection_index: int) -> RolloutRPCTarget:
+        """Atomically choose a READY instance and bind one workflow task."""
+        if not task_id:
+            raise ValueError("task_id must not be empty")
+        with self._lock:
+            instances = [
+                instance
+                for instance in self._instances.values()
+                if instance.is_routable
+            ]
+            if not instances:
+                raise InstanceNotReadyError(
+                    "no READY elastic rollout instance can accept a task"
+                )
+            instance = instances[selection_index % len(instances)]
+            self.bind_task(task_id, instance.instance_id)
+            return instance.rpc_target
+
+    def reserve_direct_request(self, selection_index: int) -> RolloutRPCTarget:
+        """Atomically choose a READY instance and acquire a direct-request lease."""
+        with self._lock:
+            instances = [
+                instance
+                for instance in self._instances.values()
+                if instance.is_routable
+            ]
+            if not instances:
+                raise InstanceNotReadyError(
+                    "no READY elastic rollout instance can accept a direct request"
+                )
+            instance = instances[selection_index % len(instances)]
+            instance.direct_inflight += 1
+            return instance.rpc_target
+
+    def acquire_direct_snapshot(self) -> tuple[RolloutRPCTarget, ...]:
+        """Atomically lease every READY target for one collective/direct RPC."""
+        with self._lock:
+            instances = [
+                instance
+                for instance in self._instances.values()
+                if instance.is_routable
+            ]
+            for instance in instances:
+                instance.direct_inflight += 1
+            return tuple(instance.rpc_target for instance in instances)
+
+    def acquire_weight_update_snapshot(self) -> tuple[RolloutRPCTarget, ...]:
+        """Atomically snapshot and lease every READY disk-update target."""
+        with self._lock:
+            instances = [
+                instance
+                for instance in self._instances.values()
+                if instance.is_routable
+            ]
+            for instance in instances:
+                instance.update_leases += 1
+            return tuple(instance.rpc_target for instance in instances)
+
+    def release_direct_snapshot(self, targets: tuple[RolloutRPCTarget, ...]) -> None:
+        """Release leases acquired by :meth:`acquire_direct_snapshot`."""
+        with self._lock:
+            for target in targets:
+                self._decrement(self.get(target.instance_id), "direct_inflight")
+
+    def release_weight_update_snapshot(
+        self, targets: tuple[RolloutRPCTarget, ...]
+    ) -> None:
+        """Release leases acquired by :meth:`acquire_weight_update_snapshot`."""
+        with self._lock:
+            for target in targets:
+                self._decrement(self.get(target.instance_id), "update_leases")
+
+    def mark_loaded_version(
+        self, targets: tuple[RolloutRPCTarget, ...], version: int
+    ) -> None:
+        """Record the disk version loaded by a successful target snapshot."""
+        if version < 0:
+            raise ValueError("version must be non-negative")
+        with self._lock:
+            for target in targets:
+                self.get(target.instance_id).loaded_version = version
+
+    def request_drain(self, instance_id: str) -> RolloutInstance:
+        """Atomically remove one instance from routing eligibility."""
+        with self._lock:
+            instance = self.get(instance_id)
+            instance.request_drain()
+            return instance
+
+    def cancel_drain(self, instance_id: str) -> RolloutInstance:
+        """Atomically return a draining instance to READY service."""
+        with self._lock:
+            instance = self.get(instance_id)
+            instance.cancel_drain()
+            return instance
+
+    def begin_stop_if_drained(self, instance_id: str) -> RolloutInstance | None:
+        """Move a drained instance to STOPPING before resource deletion."""
+        with self._lock:
+            instance = self.get(instance_id)
+            if instance.state is RolloutInstanceState.STOPPING:
+                return instance
+            if not instance.can_stop:
+                return None
+            instance.transition_to(RolloutInstanceState.STOPPING)
+            return instance
 
     def bind_task(self, task_id: str, instance_id: str) -> None:
         """Bind a workflow task to one instance for its entire lifetime."""

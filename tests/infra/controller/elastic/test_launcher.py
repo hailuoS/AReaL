@@ -185,6 +185,7 @@ async def test_catch_up_failure_marks_instance_failed(tmp_path):
         )
 
     assert result.instance.state is RolloutInstanceState.FAILED
+    assert result.instance.loaded_version == 7
 
 
 def test_destroy_requires_drain_teardown_state():

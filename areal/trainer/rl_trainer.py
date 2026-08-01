@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import os
+import time
 from collections.abc import Callable
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, cast
@@ -76,6 +77,26 @@ if TYPE_CHECKING:
 logger = logging.getLogger("RLTrainer")
 
 
+def _validate_elastic_rollout_contract(config: PPOConfig) -> None:
+    if not config.rollout.elastic.enabled:
+        return
+    if not is_single_controller():
+        raise ValueError("rollout.elastic.enabled requires single-controller mode")
+    if config.rollout._version != "v1":
+        raise ValueError(
+            "rollout.elastic.enabled is supported only by RolloutController V1"
+        )
+    if config.actor.weight_update_mode != "disk":
+        raise ValueError(
+            "rollout.elastic.enabled requires actor.weight_update_mode=disk"
+        )
+    agent = config.rollout.agent
+    if agent is not None and agent.mode == "online":
+        raise ValueError(
+            "rollout.elastic.enabled does not yet support Proxy online mode"
+        )
+
+
 class _EmptyDataLoader:
     """Minimal dataloader for online mode that yields empty dicts.
 
@@ -116,6 +137,7 @@ class PPOTrainer:
             logging.setup_file_logging(StatsLogger.get_log_path(config.stats_logger))
 
         self.config = config
+        _validate_elastic_rollout_contract(config)
         self._awex_runtime = prepare_awex_runtime(config)
         self.processor, self.tokenizer = load_hf_processor_and_tokenizer(
             config.tokenizer_path
@@ -312,9 +334,14 @@ class PPOTrainer:
         )
 
         self.eval_rollout = None
-        if not self._online_mode:
+        if not self._online_mode and not config.rollout.elastic.enabled:
             self.eval_rollout = self._init_rollout(
                 config.rollout, is_eval=True, lora_path=initial_lora_path
+            )
+        elif config.rollout.elastic.enabled and not self._online_mode:
+            logger.warning(
+                "Elastic RolloutController V1 does not yet support the shared "
+                "eval-rollout worker. Validation rollout is disabled for this run."
             )
         if (
             self.config.teacher is not None
@@ -645,6 +672,7 @@ class PPOTrainer:
 
             if self._should_offload_rollout:
                 self._onload_rollout()
+            rollout_started_at = time.monotonic()
             with (
                 stats_tracker.record_timing("rollout"),
                 perf_tracer.trace_scope(
@@ -664,6 +692,32 @@ class PPOTrainer:
                     group_size=config.gconfig.n_samples,
                     dynamic_bs=self.config.dynamic_bs,
                 )
+            if (
+                isinstance(self.rollout, RolloutController)
+                and self.rollout.config.elastic.enabled
+            ):
+                accepted = self.rollout.staleness_manager.get_stats().accepted
+                previous_accepted = getattr(self, "_elastic_last_accepted", None)
+                previous_rollout_started = getattr(
+                    self, "_elastic_previous_rollout_started", None
+                )
+                entered = (
+                    0
+                    if previous_accepted is None
+                    else max(0, accepted - previous_accepted)
+                )
+                self._elastic_last_accepted = accepted
+                self.rollout.record_elastic_scaling_window(
+                    entered=entered,
+                    consumed=len(rollout_batch),
+                    wait_seconds=time.monotonic() - rollout_started_at,
+                    step_seconds=(
+                        0.0
+                        if previous_rollout_started is None
+                        else rollout_started_at - previous_rollout_started
+                    ),
+                )
+                self._elastic_previous_rollout_started = rollout_started_at
             if self._should_offload_rollout:
                 self._offload_rollout()
 
@@ -1370,6 +1424,8 @@ class PPOTrainer:
                 "weight_update_mode must be 'disk' when colocation scheduling is enabled. "
                 "Please set actor.weight_update_mode=disk."
             )
+
+        _validate_elastic_rollout_contract(self.config)
 
         if rollout_backend == "vllm" and self.config.rollout.return_routed_experts:
             raise ValueError(

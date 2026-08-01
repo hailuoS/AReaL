@@ -100,6 +100,32 @@ def test_draining_instance_is_excluded_from_ready_and_update_snapshots():
         pool.bind_task("task-a", instance.instance_id)
 
 
+def test_task_reservation_is_atomic_with_drain():
+    pool = _pool()
+    instance = _add_ready(pool, "ri-first")
+
+    target = pool.reserve_task("task-a", selection_index=0)
+    pool.request_drain(instance.instance_id)
+
+    assert target.instance_id == instance.instance_id
+    assert not instance.can_stop
+    pool.release_task("task-a")
+    assert instance.can_stop
+
+
+def test_weight_update_snapshot_holds_drain_lease_until_release():
+    pool = _pool()
+    instance = _add_ready(pool, "ri-first")
+
+    targets = pool.acquire_weight_update_snapshot()
+    pool.request_drain(instance.instance_id)
+
+    assert tuple(target.instance_id for target in targets) == (instance.instance_id,)
+    assert not instance.can_stop
+    pool.release_weight_update_snapshot(targets)
+    assert instance.can_stop
+
+
 @pytest.mark.parametrize(
     "acquire,release",
     [
