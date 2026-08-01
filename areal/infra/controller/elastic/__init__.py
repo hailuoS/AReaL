@@ -27,6 +27,7 @@ from .reconciler import ReconcileResult, RolloutInstanceReconciler
 from .recovery_state import ElasticRecoveryState, ElasticRecoveryStore
 from .scaling_report import (
     ElasticScalingRecommendation,
+    ElasticScalingReporter,
     ElasticScalingWindow,
     recommend_instances,
 )
@@ -54,6 +55,7 @@ __all__ = [
     "ElasticRecoveryState",
     "ElasticRecoveryStore",
     "ElasticScalingRecommendation",
+    "ElasticScalingReporter",
     "ElasticScalingWindow",
     "recommend_instances",
     "SingleNodeInstanceError",

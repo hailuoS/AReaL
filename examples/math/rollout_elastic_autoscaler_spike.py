@@ -147,7 +147,12 @@ def _wait_for_convergence(
 ) -> dict[str, Any]:
     deadline = time.monotonic() + convergence_timeout
     while time.monotonic() < deadline:
-        status = _get_status(base_url, request_timeout)
+        try:
+            status = _get_status(base_url, request_timeout)
+        except requests.RequestException as exc:
+            logger.warning("Status request failed while converging: %s", exc)
+            time.sleep(poll_interval)
+            continue
         stable, detail = _validate_stable_status(
             status, expected_instances, require_proxy=require_proxy
         )
@@ -185,7 +190,9 @@ def _apply_report(
     status = _get_status(base_url, request_timeout)
     current_desired = status.get("desired_instances")
     logger.info(
-        "Report branch=%s wait_fraction=%s ready=%s desired=%s recommended=%s",
+        "Report version=%s branch=%s wait_fraction=%s ready=%s desired=%s "
+        "recommended=%s",
+        report.get("report_version"),
         report.get("branch"),
         report.get("rollout_wait_fraction"),
         report.get("ready_instances"),
@@ -274,17 +281,26 @@ def _run_injected_spike(options: argparse.Namespace) -> None:
 
 
 def _run_live_loop(options: argparse.Namespace) -> None:
-    last_report: str | None = None
+    last_report_version: int | None = None
     last_action_at = 0.0
     logger.info("Polling real training reports; press Ctrl-C to stop")
     while True:
         try:
             report = _get_recommendation(options.base_url, options.request_timeout)
-            report_key = json.dumps(report, sort_keys=True)
+            if report.get("status") == "empty":
+                time.sleep(options.poll_interval)
+                continue
+            report_version = report.get("report_version")
+            if isinstance(report_version, bool) or not isinstance(report_version, int):
+                raise AutoscalerError(
+                    f"Scaling report has no integer report_version: {report!r}"
+                )
             now = time.monotonic()
-            if report_key != last_report:
+            if report_version != last_report_version:
                 if now - last_action_at < options.cooldown:
-                    logger.info("New report observed during cooldown")
+                    logger.info(
+                        "Report version=%d observed during cooldown", report_version
+                    )
                 else:
                     changed = _apply_report(
                         options.base_url,
@@ -297,7 +313,7 @@ def _run_live_loop(options: argparse.Namespace) -> None:
                     )
                     if changed:
                         last_action_at = time.monotonic()
-                    last_report = report_key
+                    last_report_version = report_version
             time.sleep(options.poll_interval)
         except requests.RequestException as exc:
             logger.warning("HTTP request failed: %s", exc)
@@ -328,7 +344,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--poll-interval", type=float, default=2.0)
     parser.add_argument("--cooldown", type=float, default=30.0)
-    parser.add_argument("--request-timeout", type=float, default=10.0)
+    parser.add_argument("--request-timeout", type=float, default=300.0)
     parser.add_argument("--convergence-timeout", type=float, default=600.0)
     options = parser.parse_args()
     options.base_url = options.base_url.rstrip("/")

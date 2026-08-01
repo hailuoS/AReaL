@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import shutil
 import threading
 import traceback
@@ -42,6 +44,7 @@ from areal.infra.controller.elastic import (
     DiskCheckpointManifest,
     ElasticRecoveryState,
     ElasticRecoveryStore,
+    ElasticScalingReporter,
     ElasticScalingWindow,
     InvalidDesiredCountError,
     RolloutInstanceLauncher,
@@ -118,6 +121,8 @@ class RolloutController:
         self._elastic_reconcile_thread: threading.Thread | None = None
         self._elastic_last_reconcile_error: str | None = None
         self._elastic_scaling_report: dict[str, Any] | None = None
+        self._elastic_scaling_report_lock = threading.Lock()
+        self._elastic_scaling_reporter: ElasticScalingReporter | None = None
         self._elastic_recovery_store: ElasticRecoveryStore | None = None
         self._elastic_reconcile_lock = threading.Lock()
         self._elastic_update_condition = threading.Condition()
@@ -133,6 +138,11 @@ class RolloutController:
             self._instance_pool = RolloutInstancePool(
                 min_instances=config.elastic.min_instances,
                 initial_instances=config.elastic.initial_instances,
+                max_instances=config.elastic.max_instances,
+            )
+            self._elastic_scaling_reporter = ElasticScalingReporter(
+                report_frequency_steps=config.elastic.report_freq_steps,
+                min_instances=config.elastic.min_instances,
                 max_instances=config.elastic.max_instances,
             )
 
@@ -489,31 +499,71 @@ class RolloutController:
             )
 
     def record_elastic_scaling_window(
-        self, *, entered: int, consumed: int, wait_seconds: float, step_seconds: float
-    ) -> dict[str, Any]:
-        """Store an AstraFlow-compatible report without changing desired state."""
+        self,
+        *,
+        report_version: int,
+        entered: int,
+        consumed: int,
+        wait_seconds: float,
+        step_seconds: float,
+    ) -> dict[str, Any] | None:
+        """Accumulate one step and publish only a completed report window."""
         assert self._instance_pool is not None
-        window = ElasticScalingWindow(
+        assert self._elastic_scaling_reporter is not None
+        report = self._elastic_scaling_reporter.record(
+            report_version=report_version,
             ready_instances=len(self._instance_pool.ready_snapshot()),
             entered=entered,
             consumed=consumed,
             wait_seconds=wait_seconds,
             step_seconds=step_seconds,
         )
-        recommendation = recommend_instances(
-            window,
-            min_instances=self.config.elastic.min_instances,
-            max_instances=self.config.elastic.max_instances,
+        if report is None:
+            return None
+        self._publish_elastic_scaling_report(report, persist=True)
+        return report
+
+    def _elastic_scaling_report_path(self, report_version: int) -> Path | None:
+        if not self.config.fileroot:
+            return None
+        report_root = Path(self.config.fileroot)
+        if self.config.experiment_name and self.config.trial_name:
+            report_root = (
+                report_root / self.config.experiment_name / self.config.trial_name
+            )
+        return (
+            report_root
+            / "balance_reports"
+            / f"rollout_balance_report_v{report_version}.json"
         )
-        self._elastic_scaling_report = {
-            "branch": recommendation.branch,
-            "recommended_instances": recommendation.recommended_instances,
-            "rollout_wait_fraction": recommendation.rollout_wait_fraction,
-            "entered": entered,
-            "consumed": consumed,
-            "ready_instances": window.ready_instances,
-        }
-        return self._elastic_scaling_report
+
+    def _publish_elastic_scaling_report(
+        self, report: dict[str, Any], *, persist: bool
+    ) -> None:
+        with self._elastic_scaling_report_lock:
+            self._elastic_scaling_report = dict(report)
+        if not persist:
+            return
+        report_version = report.get("report_version")
+        if isinstance(report_version, bool) or not isinstance(report_version, int):
+            raise ValueError("scaling report requires an integer report_version")
+        path = self._elastic_scaling_report_path(report_version)
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path = path.with_suffix(f"{path.suffix}.tmp")
+            with temporary_path.open("w", encoding="utf-8") as file:
+                json.dump(report, file, indent=2, sort_keys=True)
+                file.write("\n")
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary_path, path)
+            logger.info("Elastic scaling report saved: %s", path)
+        except OSError:
+            logger.warning(
+                "Failed to save elastic scaling report %s", path, exc_info=True
+            )
 
     def _elastic_reconcile_loop(self) -> None:
         while not self._elastic_reconcile_stop.wait(
@@ -1014,6 +1064,12 @@ class RolloutController:
                 return jsonify({"error": "elastic rollout is disabled"}), 409
             with self._elastic_update_condition:
                 pending_update_version = self._elastic_pending_update_version
+            with self._elastic_scaling_report_lock:
+                latest_report_version = (
+                    self._elastic_scaling_report.get("report_version")
+                    if self._elastic_scaling_report is not None
+                    else None
+                )
             instances = []
             for instance in self._instance_pool.instances_snapshot():
                 instances.append(
@@ -1050,6 +1106,8 @@ class RolloutController:
                         else None
                     ),
                     "last_reconcile_error": self._elastic_last_reconcile_error,
+                    "report_freq_steps": self.config.elastic.report_freq_steps,
+                    "latest_report_version": latest_report_version,
                     "instances": instances,
                 }
             )
@@ -1059,7 +1117,13 @@ class RolloutController:
             if self._instance_pool is None:
                 return jsonify({"error": "elastic rollout is disabled"}), 409
             if request.method == "GET":
-                return jsonify(self._elastic_scaling_report or {"status": "empty"})
+                with self._elastic_scaling_report_lock:
+                    report = (
+                        dict(self._elastic_scaling_report)
+                        if self._elastic_scaling_report is not None
+                        else {"status": "empty"}
+                    )
+                return jsonify(report)
             payload = request.get_json(silent=True) or {}
             try:
                 window = ElasticScalingWindow(
@@ -1076,15 +1140,32 @@ class RolloutController:
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 return jsonify({"error": str(exc)}), 400
-            self._elastic_scaling_report = {
+            with self._elastic_scaling_report_lock:
+                previous_version = (
+                    self._elastic_scaling_report.get("report_version", 0)
+                    if self._elastic_scaling_report is not None
+                    else 0
+                )
+            report_version = max(self.get_version(), int(previous_version)) + 1
+            report = {
+                "report_version": report_version,
+                "window_start_version": report_version,
+                "window_end_version": report_version,
+                "window_iterations": 1,
+                "timing_samples": int(window.step_seconds > 0),
                 "branch": recommendation.branch,
                 "recommended_instances": recommendation.recommended_instances,
                 "rollout_wait_fraction": recommendation.rollout_wait_fraction,
                 "entered": window.entered,
                 "consumed": window.consumed,
                 "ready_instances": window.ready_instances,
+                "wait_seconds": window.wait_seconds,
+                "step_seconds": window.step_seconds,
+                "avg_batch_wait_seconds": window.wait_seconds,
+                "avg_step_seconds": window.step_seconds,
             }
-            return jsonify(self._elastic_scaling_report)
+            self._publish_elastic_scaling_report(report, persist=False)
+            return jsonify(report)
 
         @app.route("/callback/pause_generation", methods=["POST"])
         def pause_generation():

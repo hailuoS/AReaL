@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import functools
 import os
 import time
 from collections.abc import Callable
@@ -672,6 +671,15 @@ class PPOTrainer:
 
             if self._should_offload_rollout:
                 self._onload_rollout()
+            elastic_scaling_observation: dict[str, int | float] | None = None
+            elastic_accepted_before: int | None = None
+            if (
+                isinstance(self.rollout, RolloutController)
+                and self.rollout.config.elastic.enabled
+            ):
+                elastic_accepted_before = (
+                    self.rollout.staleness_manager.get_stats().accepted
+                )
             rollout_started_at = time.monotonic()
             with (
                 stats_tracker.record_timing("rollout"),
@@ -692,32 +700,27 @@ class PPOTrainer:
                     group_size=config.gconfig.n_samples,
                     dynamic_bs=self.config.dynamic_bs,
                 )
+            rollout_completed_at = time.monotonic()
             if (
                 isinstance(self.rollout, RolloutController)
                 and self.rollout.config.elastic.enabled
             ):
+                assert elastic_accepted_before is not None
                 accepted = self.rollout.staleness_manager.get_stats().accepted
-                previous_accepted = getattr(self, "_elastic_last_accepted", None)
-                previous_rollout_started = getattr(
-                    self, "_elastic_previous_rollout_started", None
+                previous_rollout_completed = getattr(
+                    self, "_elastic_previous_rollout_completed", None
                 )
-                entered = (
-                    0
-                    if previous_accepted is None
-                    else max(0, accepted - previous_accepted)
-                )
-                self._elastic_last_accepted = accepted
-                self.rollout.record_elastic_scaling_window(
-                    entered=entered,
-                    consumed=len(rollout_batch),
-                    wait_seconds=time.monotonic() - rollout_started_at,
-                    step_seconds=(
+                elastic_scaling_observation = {
+                    "entered": max(0, accepted - elastic_accepted_before),
+                    "consumed": len(rollout_batch),
+                    "wait_seconds": rollout_completed_at - rollout_started_at,
+                    "step_seconds": (
                         0.0
-                        if previous_rollout_started is None
-                        else rollout_started_at - previous_rollout_started
+                        if previous_rollout_completed is None
+                        else rollout_completed_at - previous_rollout_completed
                     ),
-                )
-                self._elastic_previous_rollout_started = rollout_started_at
+                }
+                self._elastic_previous_rollout_completed = rollout_completed_at
             if self._should_offload_rollout:
                 self._offload_rollout()
 
@@ -882,6 +885,14 @@ class PPOTrainer:
                 if self.critic is not None:
                     self.critic.set_version(new_version)
                 self.rollout.set_version(new_version)
+                if elastic_scaling_observation is not None:
+                    self.rollout.record_elastic_scaling_window(
+                        report_version=new_version,
+                        entered=int(elastic_scaling_observation["entered"]),
+                        consumed=int(elastic_scaling_observation["consumed"]),
+                        wait_seconds=float(elastic_scaling_observation["wait_seconds"]),
+                        step_seconds=float(elastic_scaling_observation["step_seconds"]),
+                    )
                 if self.eval_rollout is not None:
                     self.eval_rollout.set_version(new_version)
 
@@ -921,13 +932,22 @@ class PPOTrainer:
                     args={"global_step": global_step},
                 ),
             ):
-                self._evaluate(
+                evaluation_ran = self._evaluate(
                     eval_workflow=eval_workflow,
                     eval_workflow_kwargs=eval_workflow_kwargs,
                     epoch=epoch,
                     epoch_step=step,
                     global_step=global_step,
                 )
+                if (
+                    evaluation_ran
+                    and isinstance(self.rollout, RolloutController)
+                    and self.rollout.config.elastic.enabled
+                ):
+                    # Match AstraFlow: do not pair the next batch completion
+                    # with a pre-eval completion because that step time would
+                    # incorrectly include the evaluation gap.
+                    self._elastic_previous_rollout_completed = None
             if self._should_offload_rollout:
                 self._offload_rollout(is_eval=True)
 
@@ -1368,19 +1388,25 @@ class PPOTrainer:
         epoch: int,
         epoch_step: int,
         global_step: int,
-    ):
+    ) -> bool:
         if (
             self.eval_rollout is None
             or self.valid_dataloader is None
             or eval_workflow is None
         ):
-            return
-        self.evaluator.evaluate(
-            functools.partial(
-                self._evaluate_fn,
+            return False
+        evaluation_ran = False
+
+        def evaluate_once() -> None:
+            nonlocal evaluation_ran
+            evaluation_ran = True
+            self._evaluate_fn(
                 eval_workflow=eval_workflow,
                 eval_workflow_kwargs=eval_workflow_kwargs,
-            ),
+            )
+
+        self.evaluator.evaluate(
+            evaluate_once,
             epoch,
             epoch_step,
             global_step,
@@ -1388,6 +1414,7 @@ class PPOTrainer:
         if not is_single_controller():
             dist.barrier(group=self.actor.cpu_group)
             current_platform.synchronize()
+        return evaluation_ran
 
     def _export_and_commit_stats(self, epoch: int, epoch_step: int, global_step: int):
         # Upload statistics to the logger (e.g., wandb)

@@ -283,12 +283,15 @@ Controller 重启时会校验 checkpoint，清理恢复记录中的旧 role，�
 
 ## 5. 扩缩容建议
 
-建议逻辑复用 AstraFlow 的三段式规则。
+建议逻辑复用 AstraFlow 的多 step 窗口和三段式规则。默认
+`rollout.elastic.report_freq_steps=10`，在 serving version 为
+`10、20、30...` 时关闭当前窗口并生成报告。窗口生成后重置精确计数，下一窗口重新
+累计。
 
 设：
 
 ```text
-wait_fraction = prepare_batch_wait_seconds / step_seconds
+wait_fraction = sum(prepare_batch_wait_seconds) / sum(step_seconds)
 ```
 
 规则：
@@ -298,7 +301,10 @@ wait_fraction > 0.10:
     scale_up = ceil(ready_instances / (1 - wait_fraction))
 
 wait_fraction < 0.05 且 entered > 0 且 consumed > 0:
-    scale_down = ceil(ready_instances × consumed / entered × 1.10)
+    scale_down = min(
+        ready_instances,
+        ceil(ready_instances × sum(consumed) / sum(entered) × 1.10),
+    )
 
 其他情况:
     hold
@@ -313,6 +319,20 @@ wait_fraction < 0.05 且 entered > 0 且 consumed > 0:
 - 进入 rollout buffer 的数量；
 - 训练消费的样本数量；
 - 当前 `READY` 实例数。
+
+和 AstraFlow 一致，启动后或 eval 后第一个无法与上一次 batch 完成时间配对的样本
+不会进入 wait/step 时间求和。每 step 的 `entered` 和 `consumed` 仍会进入窗口累计。
+
+最新报告保存在 Controller 内存中供 HTTP 查询，同时原子写入：
+
+```text
+${rollout.fileroot}/${experiment_name}/${trial_name}/balance_reports/
+  rollout_balance_report_v10.json
+  rollout_balance_report_v20.json
+```
+
+报告包含唯一的 `report_version`、窗口起止 version、窗口 step 数、有效 timing 样本
+数、累计 wait/step 时间、累计 entered/consumed 以及最终建议。
 
 建议只形成报告。外部控制系统可以读取报告后，再调用
 `PUT /elastic/desired-instances`。
@@ -543,8 +563,9 @@ python examples/math/rollout_elastic_autoscaler_spike.py \
   --require-proxy
 ```
 
-真实报告模式持续运行，使用 `Ctrl-C` 停止。脚本只在建议目标与当前 desired state
-不同时发送 PUT，并在每次动作后验证实例数量、状态和权重版本是否收敛。
+真实报告模式持续运行，使用 `Ctrl-C` 停止。脚本按照 `report_version` 去重，只处理
+新的完整窗口报告；仅在建议目标与当前 desired state 不同时发送 PUT，并在每次动作
+后验证实例数量、状态和权重版本是否收敛。
 
 ### 9.5 端到端训练
 
