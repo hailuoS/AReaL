@@ -1,0 +1,220 @@
+# SPDX-License-Identifier: Apache-2.0
+
+"""Thread-safe in-memory registry for elastic rollout instances."""
+
+from __future__ import annotations
+
+import threading
+import uuid
+
+from .errors import (
+    DuplicateInstanceError,
+    InstanceNotFoundError,
+    InstanceNotReadyError,
+    InstanceNotRemovableError,
+    InvalidDesiredCountError,
+    TaskBindingError,
+)
+from .models import RolloutInstance, RolloutInstanceState, RolloutRPCTarget
+
+
+class RolloutInstancePool:
+    """Own stable instance identities, lifecycle state, and in-flight counters."""
+
+    def __init__(
+        self,
+        *,
+        min_instances: int,
+        initial_instances: int,
+        max_instances: int,
+    ) -> None:
+        if min_instances < 1:
+            raise InvalidDesiredCountError("min_instances must be at least 1")
+        if not min_instances <= initial_instances <= max_instances:
+            raise InvalidDesiredCountError(
+                "instance bounds must satisfy "
+                "min_instances <= initial_instances <= max_instances"
+            )
+        self._min_instances = min_instances
+        self._max_instances = max_instances
+        self._desired_count = initial_instances
+        self._instances: dict[str, RolloutInstance] = {}
+        self._task_to_instance: dict[str, str] = {}
+        self._lock = threading.RLock()
+
+    @property
+    def desired_count(self) -> int:
+        """Return the current desired number of complete rollout instances."""
+        with self._lock:
+            return self._desired_count
+
+    def set_desired_count(self, desired_count: int) -> None:
+        """Set desired capacity within the configured instance bounds."""
+        if not self._min_instances <= desired_count <= self._max_instances:
+            raise InvalidDesiredCountError(
+                f"desired_count must be in [{self._min_instances}, "
+                f"{self._max_instances}], got {desired_count}"
+            )
+        with self._lock:
+            self._desired_count = desired_count
+
+    def create(
+        self,
+        *,
+        worker_role: str,
+        worker_id: str,
+        engine_name: str,
+        instance_id: str | None = None,
+    ) -> RolloutInstance:
+        """Create and register an instance with a stable non-positional identity."""
+        instance = RolloutInstance(
+            instance_id=instance_id or f"ri-{uuid.uuid4().hex}",
+            worker_role=worker_role,
+            worker_id=worker_id,
+            engine_name=engine_name,
+        )
+        self.add(instance)
+        return instance
+
+    def add(self, instance: RolloutInstance) -> None:
+        """Register a preconstructed instance."""
+        with self._lock:
+            if instance.instance_id in self._instances:
+                raise DuplicateInstanceError(
+                    f"instance {instance.instance_id} is already registered"
+                )
+            self._instances[instance.instance_id] = instance
+
+    def get(self, instance_id: str) -> RolloutInstance:
+        """Return a registered instance or raise a domain-specific error."""
+        with self._lock:
+            try:
+                return self._instances[instance_id]
+            except KeyError as exc:
+                raise InstanceNotFoundError(
+                    f"instance {instance_id} is not registered"
+                ) from exc
+
+    def remove(self, instance_id: str) -> RolloutInstance:
+        """Remove a fully stopped and drained instance."""
+        with self._lock:
+            instance = self.get(instance_id)
+            if not instance.is_removable:
+                raise InstanceNotRemovableError(
+                    f"instance {instance_id} is not stopped and drained"
+                )
+            del self._instances[instance_id]
+            return instance
+
+    def instance_ids(self) -> tuple[str, ...]:
+        """Return a stable snapshot of registered instance identities."""
+        with self._lock:
+            return tuple(self._instances)
+
+    def ready_snapshot(self) -> tuple[RolloutRPCTarget, ...]:
+        """Snapshot instances currently eligible for new inference work."""
+        with self._lock:
+            return tuple(
+                instance.rpc_target
+                for instance in self._instances.values()
+                if instance.is_routable
+            )
+
+    def weight_update_snapshot(self) -> tuple[RolloutRPCTarget, ...]:
+        """Snapshot READY instances participating in one disk weight update."""
+        return self.ready_snapshot()
+
+    def bind_task(self, task_id: str, instance_id: str) -> None:
+        """Bind a workflow task to one instance for its entire lifetime."""
+        if not task_id:
+            raise ValueError("task_id must not be empty")
+        with self._lock:
+            instance = self.get(instance_id)
+            if not instance.is_routable:
+                raise TaskBindingError(
+                    f"instance {instance_id} is not eligible for new tasks"
+                )
+            existing = self._task_to_instance.get(task_id)
+            if existing is not None and existing != instance_id:
+                raise TaskBindingError(
+                    f"task {task_id} is already bound to instance {existing}"
+                )
+            self._task_to_instance[task_id] = instance_id
+            instance.workflow_task_ids.add(task_id)
+
+    def instance_for_task(self, task_id: str) -> str | None:
+        """Return the stable instance identity bound to a workflow task."""
+        with self._lock:
+            return self._task_to_instance.get(task_id)
+
+    def release_task(self, task_id: str) -> str | None:
+        """Release a workflow task; repeated cleanup is intentionally idempotent."""
+        with self._lock:
+            instance_id = self._task_to_instance.pop(task_id, None)
+            if instance_id is None:
+                return None
+            instance = self._instances.get(instance_id)
+            if instance is not None:
+                instance.workflow_task_ids.discard(task_id)
+            return instance_id
+
+    def acquire_direct_request(self, instance_id: str) -> None:
+        """Track one direct generation request on an instance."""
+        with self._lock:
+            instance = self.get(instance_id)
+            if not instance.is_routable:
+                raise InstanceNotReadyError(
+                    f"instance {instance_id} cannot accept direct requests"
+                )
+            instance.direct_inflight += 1
+
+    def release_direct_request(self, instance_id: str) -> None:
+        """Release one tracked direct generation request."""
+        with self._lock:
+            instance = self.get(instance_id)
+            self._decrement(instance, "direct_inflight")
+
+    def acquire_session(self, instance_id: str) -> None:
+        """Track one online session pinned to an instance."""
+        with self._lock:
+            instance = self.get(instance_id)
+            if not instance.is_routable:
+                raise InstanceNotReadyError(
+                    f"instance {instance_id} cannot accept sessions"
+                )
+            instance.active_sessions += 1
+
+    def release_session(self, instance_id: str) -> None:
+        """Release one tracked online session."""
+        with self._lock:
+            instance = self.get(instance_id)
+            self._decrement(instance, "active_sessions")
+
+    def acquire_update_lease(self, instance_id: str) -> None:
+        """Protect an instance from removal during a weight update."""
+        with self._lock:
+            instance = self.get(instance_id)
+            if instance.state not in {
+                RolloutInstanceState.CATCHING_UP,
+                RolloutInstanceState.READY,
+                RolloutInstanceState.DRAINING,
+            }:
+                raise InstanceNotReadyError(
+                    f"instance {instance_id} cannot acquire an update lease"
+                )
+            instance.update_leases += 1
+
+    def release_update_lease(self, instance_id: str) -> None:
+        """Release one weight update lease."""
+        with self._lock:
+            instance = self.get(instance_id)
+            self._decrement(instance, "update_leases")
+
+    @staticmethod
+    def _decrement(instance: RolloutInstance, field_name: str) -> None:
+        value = getattr(instance, field_name)
+        if value <= 0:
+            raise ValueError(
+                f"instance {instance.instance_id} has no {field_name} to release"
+            )
+        setattr(instance, field_name, value - 1)
