@@ -9,12 +9,47 @@ pytest.importorskip("requests")
 from examples.math import rollout_elastic_autoscaler_spike as autoscaler
 
 
+def _stable_status(desired: int, serving_version: int) -> dict:
+    return {
+        "desired_instances": desired,
+        "ready_instances": desired,
+        "serving_version": serving_version,
+        "pending_update_version": None,
+        "proxy_enabled": False,
+        "last_reconcile_error": None,
+        "instances": [
+            {
+                "instance_id": f"ri-{index}",
+                "state": "ready",
+                "loaded_version": serving_version,
+                "proxy_ready": False,
+            }
+            for index in range(desired)
+        ],
+    }
+
+
 def test_live_autoscaler_processes_each_report_version_once(monkeypatch):
     reports = iter(
         [
-            {"report_version": 10, "recommended_instances": 1},
-            {"report_version": 10, "recommended_instances": 1},
-            {"report_version": 20, "recommended_instances": 2},
+            {
+                "report_version": 10,
+                "window_start_version": 1,
+                "ready_instances": 1,
+                "recommended_instances": 1,
+            },
+            {
+                "report_version": 10,
+                "window_start_version": 1,
+                "ready_instances": 1,
+                "recommended_instances": 1,
+            },
+            {
+                "report_version": 20,
+                "window_start_version": 11,
+                "ready_instances": 1,
+                "recommended_instances": 2,
+            },
         ]
     )
     applied_versions = []
@@ -30,6 +65,9 @@ def test_live_autoscaler_processes_each_report_version_once(monkeypatch):
         return False
 
     monkeypatch.setattr(autoscaler, "_get_recommendation", get_recommendation)
+    monkeypatch.setattr(
+        autoscaler, "_get_status", lambda *_args: _stable_status(1, 10)
+    )
     monkeypatch.setattr(autoscaler, "_apply_report", apply_report)
     monkeypatch.setattr(autoscaler.time, "sleep", lambda _seconds: None)
     options = SimpleNamespace(
@@ -45,7 +83,132 @@ def test_live_autoscaler_processes_each_report_version_once(monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         autoscaler._run_live_loop(options)
 
-    assert applied_versions == [10, 20]
+    # The first observed report establishes a restart-safe baseline.
+    assert applied_versions == [20]
+
+
+def test_live_autoscaler_discards_cooldown_report_without_replaying(monkeypatch):
+    reports = iter(
+        [
+            {
+                "report_version": 10,
+                "window_start_version": 1,
+                "ready_instances": 1,
+                "recommended_instances": 1,
+            },
+            {
+                "report_version": 20,
+                "window_start_version": 11,
+                "ready_instances": 1,
+                "recommended_instances": 2,
+            },
+            {
+                "report_version": 30,
+                "window_start_version": 21,
+                "ready_instances": 2,
+                "recommended_instances": 3,
+            },
+            {
+                "report_version": 30,
+                "window_start_version": 21,
+                "ready_instances": 2,
+                "recommended_instances": 3,
+            },
+        ]
+    )
+    statuses = iter(
+        [
+            _stable_status(1, 10),
+            _stable_status(1, 10),
+            _stable_status(2, 20),
+            _stable_status(2, 20),
+        ]
+    )
+    applied_versions = []
+
+    def get_recommendation(*_args):
+        try:
+            return next(reports)
+        except StopIteration:
+            raise KeyboardInterrupt from None
+
+    def apply_report(_base_url, report, **_kwargs):
+        applied_versions.append(report["report_version"])
+        return report["report_version"] == 20
+
+    monotonic_values = iter([100.0, 100.0, 110.0, 120.0, 200.0])
+    monkeypatch.setattr(autoscaler, "_get_recommendation", get_recommendation)
+    monkeypatch.setattr(autoscaler, "_get_status", lambda *_args: next(statuses))
+    monkeypatch.setattr(autoscaler, "_apply_report", apply_report)
+    monkeypatch.setattr(autoscaler.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(autoscaler.time, "sleep", lambda _seconds: None)
+    options = SimpleNamespace(
+        base_url="http://127.0.0.1:18080",
+        request_timeout=1.0,
+        cooldown=30.0,
+        convergence_timeout=1.0,
+        poll_interval=0.1,
+        dry_run=False,
+        require_proxy=False,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        autoscaler._run_live_loop(options)
+
+    assert applied_versions == [20]
+
+
+def test_live_autoscaler_discards_report_for_previous_capacity(monkeypatch):
+    reports = iter(
+        [
+            {
+                "report_version": 10,
+                "window_start_version": 1,
+                "ready_instances": 4,
+                "recommended_instances": 4,
+            },
+            {
+                "report_version": 20,
+                "window_start_version": 11,
+                "ready_instances": 2,
+                "recommended_instances": 5,
+            },
+        ]
+    )
+    applied_versions = []
+
+    def get_recommendation(*_args):
+        try:
+            return next(reports)
+        except StopIteration:
+            raise KeyboardInterrupt from None
+
+    monkeypatch.setattr(autoscaler, "_get_recommendation", get_recommendation)
+    monkeypatch.setattr(
+        autoscaler, "_get_status", lambda *_args: _stable_status(4, 10)
+    )
+    monkeypatch.setattr(
+        autoscaler,
+        "_apply_report",
+        lambda _base_url, report, **_kwargs: applied_versions.append(
+            report["report_version"]
+        ),
+    )
+    monkeypatch.setattr(autoscaler.time, "sleep", lambda _seconds: None)
+    options = SimpleNamespace(
+        base_url="http://127.0.0.1:18080",
+        request_timeout=1.0,
+        cooldown=0.0,
+        convergence_timeout=1.0,
+        poll_interval=0.1,
+        dry_run=False,
+        require_proxy=False,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        autoscaler._run_live_loop(options)
+
+    assert applied_versions == []
 
 
 def test_live_autoscaler_rejects_report_without_version(monkeypatch):

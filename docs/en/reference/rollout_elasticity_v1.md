@@ -67,6 +67,12 @@ The HTTP request changes desired state only. The background reconciler creates o
 independent Scheduler roles. A new instance becomes `READY` only after server
 initialization and loading the exact committed disk version.
 
+During scale-out, the reconciler first registers stable identities for the entire
+capacity deficit. An instance is `PENDING` while waiting for Scheduler worker
+allocation, `STARTING` while initializing its server, and `CATCHING_UP` while loading
+the latest committed weights. These non-routable states appear immediately in the
+status endpoint.
+
 Scale-in first changes an instance to `DRAINING`. It receives no new work and is deleted
 only after workflow tasks, direct requests, and weight-update leases are empty. An
 offline AgentWorkflow session is covered by its owning workflow-task lease; dynamic
@@ -92,6 +98,11 @@ otherwise:
 
 The result is clamped to configured min/max instances. It is report-only and never
 changes desired state automatically.
+
+The example autoscaler consumes reports observed during cooldown or unstable capacity
+instead of replaying them later. After convergence it accepts only a report whose
+complete window starts after the convergence version and whose reported capacity
+matches the current stable capacity.
 
 ## Disk checkpoint retention and recovery
 

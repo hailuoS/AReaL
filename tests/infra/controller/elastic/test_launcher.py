@@ -9,6 +9,7 @@ from areal.api import LocalInfServerInfo, Worker
 from areal.api.cli_args import SchedulingSpec
 from areal.infra.controller.elastic import (
     DiskCheckpointManifest,
+    RolloutInstance,
     RolloutInstanceLauncher,
     RolloutInstanceState,
     SingleNodeInstanceError,
@@ -81,14 +82,38 @@ def _launcher(
     return launcher, scheduler
 
 
+def _pending_instance() -> RolloutInstance:
+    return RolloutInstance(
+        instance_id="ri-a",
+        worker_role="rollout-elastic-ri-a",
+        worker_id=None,
+        engine_name="rollout/ri-a",
+    )
+
+
 @pytest.mark.asyncio
 async def test_launch_creates_one_complete_instance_in_catching_up():
     """A role owns one logical Worker and a stable non-rank engine name."""
     launcher, scheduler = _launcher()
+    instance = _pending_instance()
+    original_create_workers = scheduler.create_workers
+    original_create_engine = scheduler.create_engine
+
+    def observe_pending(job):
+        assert instance.state is RolloutInstanceState.PENDING
+        assert instance.worker_id is None
+        return original_create_workers(job)
+
+    async def observe_starting(worker_id, engine, engine_name, config):
+        assert instance.state is RolloutInstanceState.STARTING
+        assert instance.worker_id == worker_id
+        await original_create_engine(worker_id, engine, engine_name, config)
+
+    scheduler.create_workers = observe_pending
+    scheduler.create_engine = observe_starting
 
     result = await launcher.launch(
-        instance_id="ri-a",
-        worker_role="rollout-elastic-ri-a",
+        instance=instance,
         server_args={"model_path": "/model"},
     )
 
@@ -109,6 +134,7 @@ async def test_launch_creates_one_complete_instance_in_catching_up():
 async def test_launch_failure_deletes_only_its_role():
     """A failed launch cleans up its Scheduler role before propagating the error."""
     launcher, scheduler = _launcher()
+    instance = _pending_instance()
 
     async def fail_launch_server(*args, **kwargs):
         if kwargs["method"] == "launch_server":
@@ -119,8 +145,7 @@ async def test_launch_failure_deletes_only_its_role():
 
     with pytest.raises(RuntimeError, match="launch failed"):
         await launcher.launch(
-            instance_id="ri-a",
-            worker_role="rollout-elastic-ri-a",
+            instance=instance,
             server_args={},
         )
 
@@ -130,9 +155,9 @@ async def test_launch_failure_deletes_only_its_role():
 @pytest.mark.asyncio
 async def test_launch_proxy_is_bound_to_one_elastic_instance():
     launcher, scheduler = _launcher()
+    instance = _pending_instance()
     result = await launcher.launch(
-        instance_id="ri-a",
-        worker_role="rollout-elastic-ri-a",
+        instance=instance,
         server_args={},
     )
 
@@ -160,9 +185,9 @@ async def test_launch_proxy_is_bound_to_one_elastic_instance():
 @pytest.mark.asyncio
 async def test_launch_proxy_failure_removes_only_proxy_role():
     launcher, scheduler = _launcher()
+    instance = _pending_instance()
     result = await launcher.launch(
-        instance_id="ri-a",
-        worker_role="rollout-elastic-ri-a",
+        instance=instance,
         server_args={},
     )
     original_call = scheduler.async_call_engine
@@ -185,9 +210,9 @@ async def test_launch_proxy_failure_removes_only_proxy_role():
 @pytest.mark.asyncio
 async def test_catch_up_publishes_version_to_instance_proxy(tmp_path):
     launcher, scheduler = _launcher()
+    instance = _pending_instance()
     result = await launcher.launch(
-        instance_id="ri-a",
-        worker_role="rollout-elastic-ri-a",
+        instance=instance,
         server_args={},
     )
     await launcher.launch_proxy(result.instance)
@@ -211,11 +236,11 @@ async def test_catch_up_publishes_version_to_instance_proxy(tmp_path):
 async def test_launch_rejects_cross_node_instance_before_creating_workers():
     """Single-node launcher does not change existing TP/PP communication groups."""
     launcher, scheduler = _launcher(n_gpus_per_node=2)
+    instance = _pending_instance()
 
     with pytest.raises(SingleNodeInstanceError, match="fit one node"):
         await launcher.launch(
-            instance_id="ri-a",
-            worker_role="rollout-elastic-ri-a",
+            instance=instance,
             server_args={},
         )
 
@@ -226,9 +251,9 @@ async def test_launch_rejects_cross_node_instance_before_creating_workers():
 async def test_catch_up_loads_committed_checkpoint_before_ready(tmp_path):
     """A launched instance cannot route before disk loading and versioning finish."""
     launcher, scheduler = _launcher()
+    instance = _pending_instance()
     result = await launcher.launch(
-        instance_id="ri-a",
-        worker_role="rollout-elastic-ri-a",
+        instance=instance,
         server_args={},
     )
     checkpoint = tmp_path / "weight_update_v7"
@@ -253,9 +278,9 @@ async def test_catch_up_loads_committed_checkpoint_before_ready(tmp_path):
 async def test_catch_up_failure_marks_instance_failed(tmp_path):
     """A failed disk load never accidentally exposes a partially caught-up server."""
     launcher, scheduler = _launcher()
+    instance = _pending_instance()
     result = await launcher.launch(
-        instance_id="ri-a",
-        worker_role="rollout-elastic-ri-a",
+        instance=instance,
         server_args={},
     )
     checkpoint = tmp_path / "weight_update_v7"
@@ -295,9 +320,9 @@ def test_destroy_requires_drain_teardown_state():
 @pytest.mark.asyncio
 async def test_destroy_removes_proxy_before_rollout_role():
     launcher, scheduler = _launcher()
+    instance = _pending_instance()
     result = await launcher.launch(
-        instance_id="ri-a",
-        worker_role="rollout-elastic-ri-a",
+        instance=instance,
         server_args={},
     )
     await launcher.launch_proxy(result.instance)

@@ -76,7 +76,7 @@ proxy_addr
 实例状态机主要包含：
 
 ```text
-CREATING
+PENDING
 STARTING
 CATCHING_UP
 READY
@@ -563,9 +563,10 @@ python examples/math/rollout_elastic_autoscaler_spike.py \
   --require-proxy
 ```
 
-真实报告模式持续运行，使用 `Ctrl-C` 停止。脚本按照 `report_version` 去重，只处理
-新的完整窗口报告；仅在建议目标与当前 desired state 不同时发送 PUT，并在每次动作
-后验证实例数量、状态和权重版本是否收敛。
+真实报告模式持续运行，使用 `Ctrl-C` 停止。脚本按照 `report_version` 去重，并立即
+消费冷却期、容量未收敛或容量快照不匹配的报告，避免稍后重放旧建议。扩缩容收敛后，
+只有采样窗口完全开始于收敛版本之后的新报告才可执行；仅在建议目标与当前 desired
+state 不同时发送 PUT，并在每次动作后验证实例数量、状态和权重版本是否收敛。
 
 ### 9.5 端到端训练
 

@@ -283,6 +283,9 @@ def _run_injected_spike(options: argparse.Namespace) -> None:
 def _run_live_loop(options: argparse.Namespace) -> None:
     last_report_version: int | None = None
     last_action_at = 0.0
+    minimum_window_start_version = 0
+    last_desired_instances: int | None = None
+    capacity_was_stable = False
     logger.info("Polling real training reports; press Ctrl-C to stop")
     while True:
         try:
@@ -296,12 +299,107 @@ def _run_live_loop(options: argparse.Namespace) -> None:
                     f"Scaling report has no integer report_version: {report!r}"
                 )
             now = time.monotonic()
-            if report_version != last_report_version:
+            if last_report_version is None or report_version > last_report_version:
+                # Consume a report as soon as it is observed. Reports produced while
+                # cooling down or while capacity is converging describe an obsolete
+                # topology and must never be replayed after the condition clears.
+                last_report_version = report_version
+                window_start_version = report.get("window_start_version")
+                if (
+                    isinstance(window_start_version, bool)
+                    or not isinstance(window_start_version, int)
+                ):
+                    raise AutoscalerError(
+                        "Scaling report has no integer window_start_version: "
+                        f"{report!r}"
+                    )
+                status = _get_status(options.base_url, options.request_timeout)
+                desired = status.get("desired_instances")
+                serving_version = status.get("serving_version")
+                if (
+                    isinstance(desired, bool)
+                    or not isinstance(desired, int)
+                    or isinstance(serving_version, bool)
+                    or not isinstance(serving_version, int)
+                ):
+                    raise AutoscalerError(f"Malformed instance status: {status!r}")
+                stable, detail = _validate_stable_status(
+                    status, desired, require_proxy=options.require_proxy
+                )
+
+                if last_desired_instances is None:
+                    last_desired_instances = desired
+                    capacity_was_stable = stable
+                    minimum_window_start_version = serving_version
+                    logger.info(
+                        "Discarding report version=%d while establishing startup "
+                        "watermark=%d",
+                        report_version,
+                        serving_version,
+                    )
+                    time.sleep(options.poll_interval)
+                    continue
+                if desired != last_desired_instances:
+                    last_desired_instances = desired
+                    capacity_was_stable = stable
+                    minimum_window_start_version = serving_version
+                    logger.info(
+                        "Discarding report version=%d after desired capacity changed; "
+                        "new watermark=%d",
+                        report_version,
+                        serving_version,
+                    )
+                    time.sleep(options.poll_interval)
+                    continue
+                if not stable:
+                    capacity_was_stable = False
+                    minimum_window_start_version = max(
+                        minimum_window_start_version, serving_version
+                    )
+                    logger.info(
+                        "Discarding report version=%d while capacity is not stable: %s",
+                        report_version,
+                        detail,
+                    )
+                    time.sleep(options.poll_interval)
+                    continue
+                if not capacity_was_stable:
+                    capacity_was_stable = True
+                    minimum_window_start_version = serving_version
+                    logger.info(
+                        "Discarding report version=%d while establishing "
+                        "post-convergence watermark=%d",
+                        report_version,
+                        serving_version,
+                    )
+                    time.sleep(options.poll_interval)
+                    continue
                 if now - last_action_at < options.cooldown:
                     logger.info(
-                        "Report version=%d observed during cooldown", report_version
+                        "Discarding report version=%d observed during cooldown",
+                        report_version,
                     )
                 else:
+                    if report.get("ready_instances") != desired:
+                        logger.info(
+                            "Discarding report version=%d for stale capacity: "
+                            "report_ready=%s current_ready=%d",
+                            report_version,
+                            report.get("ready_instances"),
+                            desired,
+                        )
+                        time.sleep(options.poll_interval)
+                        continue
+                    if window_start_version <= minimum_window_start_version:
+                        logger.info(
+                            "Discarding report version=%d whose window started at "
+                            "version=%d before the post-convergence watermark=%d",
+                            report_version,
+                            window_start_version,
+                            minimum_window_start_version,
+                        )
+                        time.sleep(options.poll_interval)
+                        continue
                     changed = _apply_report(
                         options.base_url,
                         report,
@@ -313,7 +411,23 @@ def _run_live_loop(options: argparse.Namespace) -> None:
                     )
                     if changed:
                         last_action_at = time.monotonic()
-                    last_report_version = report_version
+                        converged = _get_status(
+                            options.base_url, options.request_timeout
+                        )
+                        serving_version = converged.get("serving_version")
+                        converged_desired = converged.get("desired_instances")
+                        if (
+                            isinstance(serving_version, bool)
+                            or not isinstance(serving_version, int)
+                            or isinstance(converged_desired, bool)
+                            or not isinstance(converged_desired, int)
+                        ):
+                            raise AutoscalerError(
+                                f"Malformed converged instance status: {converged!r}"
+                            )
+                        minimum_window_start_version = serving_version
+                        last_desired_instances = converged_desired
+                        capacity_was_stable = True
             time.sleep(options.poll_interval)
         except requests.RequestException as exc:
             logger.warning("HTTP request failed: %s", exc)

@@ -19,8 +19,7 @@ class _InstanceLauncher(Protocol):
     async def launch(
         self,
         *,
-        instance_id: str,
-        worker_role: str,
+        instance: RolloutInstance,
         server_args: dict[str, Any],
         initialize_kwargs: dict[str, Any] | None = None,
     ) -> Any: ...
@@ -142,25 +141,53 @@ class RolloutInstanceReconciler:
             not in {RolloutInstanceState.STOPPED, RolloutInstanceState.FAILED}
         ]
 
-        while len(running) < self._pool.desired_count:
+        pending_launches: list[RolloutInstance] = []
+        for _ in range(self._pool.desired_count - len(running)):
             instance_id = f"ri-{uuid.uuid4().hex}"
             worker_role = f"{self._role_prefix}-{instance_id}"
-            self._record_launch_intent(worker_role)
+            instance = RolloutInstance(
+                instance_id=instance_id,
+                worker_role=worker_role,
+                worker_id=None,
+                engine_name=f"rollout/{instance_id}",
+            )
+            self._pool.add(instance)
+            pending_launches.append(instance)
+            running.append(instance)
+
+        for launch_index, instance in enumerate(pending_launches):
+            worker_role = instance.worker_role
+            launch_intent_recorded = False
             try:
+                self._record_launch_intent(worker_role)
+                launch_intent_recorded = True
                 result = await self._launcher.launch(
-                    instance_id=instance_id,
-                    worker_role=worker_role,
+                    instance=instance,
                     server_args=dict(self._server_args),
                     initialize_kwargs=self._initialize_kwargs,
                 )
+                if result.instance is not instance:
+                    raise RuntimeError(
+                        "launcher replaced the registered elastic instance"
+                    )
             except BaseException:
-                self._clear_launch_intent(worker_role)
+                if instance.state is not RolloutInstanceState.FAILED:
+                    instance.transition_to(RolloutInstanceState.FAILED)
+                instance.desired_state = InstanceDesiredState.STOPPED
+                instance.transition_to(RolloutInstanceState.STOPPED)
+                self._pool.remove(instance.instance_id)
+                for unstarted in pending_launches[launch_index + 1 :]:
+                    unstarted.desired_state = InstanceDesiredState.STOPPED
+                    unstarted.transition_to(RolloutInstanceState.STOPPED)
+                    self._pool.remove(unstarted.instance_id)
                 raise
-            instance = result.instance
-            self._pool.add(instance)
-            self._clear_launch_intent(worker_role)
-            self._begin_catch_up()
+            finally:
+                if launch_intent_recorded:
+                    self._clear_launch_intent(worker_role)
+            catch_up_started = False
             try:
+                self._begin_catch_up()
+                catch_up_started = True
                 await self._ensure_proxy(instance)
                 checkpoint = self._latest_checkpoint()
                 if checkpoint is None:
@@ -175,11 +202,15 @@ class RolloutInstanceReconciler:
                 instance.transition_to(RolloutInstanceState.STOPPING)
                 self._launcher.destroy(instance)
                 self._pool.remove(instance.instance_id)
+                for unstarted in pending_launches[launch_index + 1 :]:
+                    unstarted.desired_state = InstanceDesiredState.STOPPED
+                    unstarted.transition_to(RolloutInstanceState.STOPPED)
+                    self._pool.remove(unstarted.instance_id)
                 raise
             finally:
-                self._end_catch_up()
+                if catch_up_started:
+                    self._end_catch_up()
             created.append(instance.instance_id)
-            running.append(instance)
 
         excess = len(running) - self._pool.desired_count
         for instance in reversed(running[-excess:] if excess > 0 else []):

@@ -41,6 +41,18 @@ def test_instance_invalid_transition_raises():
         instance.transition_to(RolloutInstanceState.READY)
 
 
+def test_pending_instance_without_worker_cannot_create_rpc_target():
+    instance = RolloutInstance(
+        instance_id="ri-pending",
+        worker_role="rollout-elastic-pending",
+        worker_id=None,
+        engine_name="rollout/ri-pending",
+    )
+
+    with pytest.raises(ValueError, match="no assigned worker"):
+        _ = instance.rpc_target
+
+
 def test_instance_draining_is_not_routable_until_cancelled():
     """DRAINING removes an instance from routing and cancellation restores it."""
     instance = _instance()

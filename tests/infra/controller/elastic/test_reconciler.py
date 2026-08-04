@@ -23,16 +23,11 @@ class _FakeLauncher:
         self.caught_up = []
         self.destroyed = []
 
-    async def launch(self, *, instance_id, worker_role, **kwargs):
-        instance = RolloutInstance(
-            instance_id=instance_id,
-            worker_role=worker_role,
-            worker_id=f"{worker_role}/0",
-            engine_name=f"rollout/{instance_id}",
-            server_host="127.0.0.1",
-            server_port=30000,
-        )
+    async def launch(self, *, instance, **kwargs):
         instance.transition_to(RolloutInstanceState.STARTING)
+        instance.worker_id = f"{instance.worker_role}/0"
+        instance.server_host = "127.0.0.1"
+        instance.server_port = 30000
         instance.transition_to(RolloutInstanceState.CATCHING_UP)
         self.launched.append(instance)
         return _FakeLaunchResult(instance)
@@ -102,6 +97,39 @@ async def test_reconciler_launches_each_instance_in_its_own_role(tmp_path):
     ]
     assert recorded_roles == [instance.worker_role for instance in launcher.launched]
     assert cleared_roles == recorded_roles
+
+
+@pytest.mark.asyncio
+async def test_reconciler_registers_pending_instance_before_launch_completes():
+    pool = RolloutInstancePool(min_instances=1, initial_instances=2, max_instances=2)
+    launcher = _FakeLauncher()
+    observed_states = []
+
+    def record_launch_intent(_worker_role):
+        snapshot = pool.instances_snapshot()
+        observed_states.append(
+            [(instance.state, instance.worker_id) for instance in snapshot]
+        )
+
+    reconciler = RolloutInstanceReconciler(
+        pool=pool,
+        launcher=launcher,
+        role_prefix="rollout-elastic",
+        server_args={},
+        latest_checkpoint=lambda: None,
+        current_version=lambda: 0,
+        record_launch_intent=record_launch_intent,
+    )
+
+    await reconciler.reconcile_once()
+
+    assert observed_states[0] == [
+        (RolloutInstanceState.PENDING, None),
+        (RolloutInstanceState.PENDING, None),
+    ]
+    instances = [pool.get(instance_id) for instance_id in pool.instance_ids()]
+    assert all(instance.state is RolloutInstanceState.READY for instance in instances)
+    assert all(instance.worker_id is not None for instance in instances)
 
 
 @pytest.mark.asyncio
@@ -221,7 +249,7 @@ async def test_reconciler_cancels_drain_before_launching_replacement():
 
 @pytest.mark.asyncio
 async def test_reconciler_removes_instance_after_catch_up_failure(tmp_path):
-    pool = RolloutInstancePool(min_instances=1, initial_instances=1, max_instances=1)
+    pool = RolloutInstancePool(min_instances=1, initial_instances=2, max_instances=2)
     launcher = _FailingCatchUpLauncher()
     checkpoint_dir = tmp_path / "weight_update_v4"
     checkpoint_dir.mkdir()

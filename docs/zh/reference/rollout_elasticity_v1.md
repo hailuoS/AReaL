@@ -58,6 +58,10 @@ HTTP 请求只修改 desired state，后台 reconciler 负责创建或排空独�
 Scheduler role。新实例完成 server 初始化并加载准确的已提交 disk 版本后，
 才能进入 `READY`。
 
+扩容时，reconciler 会先为全部缺口注册稳定实例身份。等待 Scheduler 分配 worker
+时状态为 `PENDING`，获得 worker 并初始化 server 时为 `STARTING`，加载最新已提交
+权重时为 `CATCHING_UP`。这些状态均不可路由，但会立即出现在状态接口中。
+
 `GET /elastic/instances` 会返回 `serving_version`、
 `pending_update_version` 以及每个实例的 `loaded_version`、`proxy_role`、
 `proxy_addr` 和 `proxy_ready`。顶层 `proxy_enabled` 用于区分需要 Proxy 的
@@ -87,6 +91,10 @@ wait_fraction < 0.05 且生产、消费均非零:
 
 结果会限制在配置的 min/max 范围内。该建议只生成报告，不会自动修改 desired
 state。
+
+示例 autoscaler 会立即消费冷却期或容量未收敛时观察到的报告，不会在条件解除后
+重放。一次扩缩容收敛后，它只接受采样窗口完全开始于收敛版本之后、且报告容量与
+当前稳定容量一致的新报告。
 
 ## Disk checkpoint 保留和恢复
 

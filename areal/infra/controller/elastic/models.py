@@ -102,7 +102,7 @@ class RolloutInstance:
 
     instance_id: str
     worker_role: str
-    worker_id: str
+    worker_id: str | None
     engine_name: str
     server_host: str | None = None
     server_port: int | None = None
@@ -121,9 +121,11 @@ class RolloutInstance:
     drain_started_at: float | None = None
 
     def __post_init__(self) -> None:
-        for field_name in ("instance_id", "worker_role", "worker_id", "engine_name"):
+        for field_name in ("instance_id", "worker_role", "engine_name"):
             if not getattr(self, field_name):
                 raise ValueError(f"{field_name} must not be empty")
+        if self.worker_id == "":
+            raise ValueError("worker_id must be non-empty when assigned")
         if self.loaded_version is not None and self.loaded_version < 0:
             raise ValueError("loaded_version must be non-negative")
         if (self.server_host is None) != (self.server_port is None):
@@ -147,6 +149,10 @@ class RolloutInstance:
     @property
     def rpc_target(self) -> RolloutRPCTarget:
         """Return an immutable RPC target detached from mutable instance state."""
+        if self.worker_id is None:
+            raise ValueError(
+                f"instance {self.instance_id} has no assigned worker yet"
+            )
         return RolloutRPCTarget(
             instance_id=self.instance_id,
             worker_id=self.worker_id,

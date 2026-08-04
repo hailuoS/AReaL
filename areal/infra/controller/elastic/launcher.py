@@ -78,54 +78,45 @@ class RolloutInstanceLauncher:
     async def launch(
         self,
         *,
-        instance_id: str,
-        worker_role: str,
+        instance: RolloutInstance,
         server_args: dict[str, Any],
         initialize_kwargs: dict[str, Any] | None = None,
     ) -> RolloutLaunchResult:
         """Launch one instance and leave it in CATCHING_UP before it can route."""
         self._validate_single_node_capacity()
-        if not instance_id:
-            raise ValueError("instance_id must not be empty")
-        if not worker_role:
-            raise ValueError("worker_role must not be empty")
+        if instance.state is not RolloutInstanceState.PENDING:
+            raise ValueError("instance must be PENDING before launch")
 
         job = Job(
-            role=worker_role,
+            role=instance.worker_role,
             replicas=1,
             tasks=[self._instance_scheduling_spec()],
             scheduling_strategy=self._config.scheduling_strategy,
         )
         workers_created = False
-        instance: RolloutInstance | None = None
         try:
             self._scheduler.create_workers(job=job)
             workers_created = True
-            workers = self._scheduler.get_workers(role=worker_role)
+            workers = self._scheduler.get_workers(role=instance.worker_role)
             if len(workers) != 1:
                 raise RuntimeError(
-                    f"Expected one logical Worker for {worker_role}, got {len(workers)}"
+                    "Expected one logical Worker for "
+                    f"{instance.worker_role}, got {len(workers)}"
                 )
 
             worker = workers[0]
-            engine_name = f"rollout/{instance_id}"
-            instance = RolloutInstance(
-                instance_id=instance_id,
-                worker_role=worker_role,
-                worker_id=worker.id,
-                engine_name=engine_name,
-            )
+            instance.worker_id = worker.id
             instance.transition_to(RolloutInstanceState.STARTING)
             await self._scheduler.create_engine(
                 worker_id=worker.id,
                 engine=f"{self._inf_engine.__module__}.{self._inf_engine.__name__}",
-                engine_name=engine_name,
+                engine_name=instance.engine_name,
                 config=self._config,
             )
             server_info = await self._scheduler.async_call_engine(
                 worker_id=worker.id,
                 method="launch_server",
-                engine_name=engine_name,
+                engine_name=instance.engine_name,
                 server_args=deepcopy(server_args),
             )
             if not isinstance(server_info, LocalInfServerInfo):
@@ -142,8 +133,8 @@ class RolloutInstanceLauncher:
             await self._scheduler.async_call_engine(
                 worker_id=worker.id,
                 method="initialize",
-                engine_name=engine_name,
-                engine_id=instance_id,
+                engine_name=instance.engine_name,
+                engine_id=instance.instance_id,
                 engine_rank=0,
                 num_engines=1,
                 **init_kwargs,
@@ -151,10 +142,10 @@ class RolloutInstanceLauncher:
             instance.transition_to(RolloutInstanceState.CATCHING_UP)
             return RolloutLaunchResult(instance=instance, server_info=server_info)
         except BaseException:
-            if instance is not None:
+            if instance.state is not RolloutInstanceState.FAILED:
                 instance.transition_to(RolloutInstanceState.FAILED)
             if workers_created:
-                self._scheduler.delete_workers(role=worker_role)
+                self._scheduler.delete_workers(role=instance.worker_role)
             raise
 
     async def launch_proxy(self, instance: RolloutInstance) -> None:
