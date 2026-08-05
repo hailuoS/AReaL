@@ -75,17 +75,15 @@ class RolloutInstanceLauncher:
         """Return the stable Scheduler role for an instance-local V1 proxy."""
         return f"proxy-{instance.worker_role}"
 
-    async def launch(
-        self,
-        *,
-        instance: RolloutInstance,
-        server_args: dict[str, Any],
-        initialize_kwargs: dict[str, Any] | None = None,
-    ) -> RolloutLaunchResult:
-        """Launch one instance and leave it in CATCHING_UP before it can route."""
+    def provision(self, *, instance: RolloutInstance) -> None:
+        """Create one Scheduler role without initializing its inference engine.
+
+        Scheduler implementations mutate shared resource and worker registries from
+        synchronous methods, so callers must serialize this phase.
+        """
         self._validate_single_node_capacity()
         if instance.state is not RolloutInstanceState.PENDING:
-            raise ValueError("instance must be PENDING before launch")
+            raise ValueError("instance must be PENDING before provisioning")
 
         job = Job(
             role=instance.worker_role,
@@ -95,8 +93,34 @@ class RolloutInstanceLauncher:
         )
         workers_created = False
         try:
-            self._scheduler.create_workers(job=job)
+            worker_ids = self._scheduler.create_workers(job=job)
             workers_created = True
+            if len(worker_ids) != 1:
+                raise RuntimeError(
+                    "Expected one provisioned Worker ID for "
+                    f"{instance.worker_role}, got {len(worker_ids)}"
+                )
+            instance.worker_id = worker_ids[0]
+            instance.transition_to(RolloutInstanceState.STARTING)
+        except BaseException:
+            if instance.state is not RolloutInstanceState.FAILED:
+                instance.transition_to(RolloutInstanceState.FAILED)
+            if workers_created:
+                self._scheduler.delete_workers(role=instance.worker_role)
+            raise
+
+    async def start(
+        self,
+        *,
+        instance: RolloutInstance,
+        server_args: dict[str, Any],
+        initialize_kwargs: dict[str, Any] | None = None,
+    ) -> RolloutLaunchResult:
+        """Initialize one provisioned role and leave it in CATCHING_UP."""
+        if instance.state is not RolloutInstanceState.STARTING:
+            raise ValueError("instance must be STARTING before start")
+
+        try:
             workers = self._scheduler.get_workers(role=instance.worker_role)
             if len(workers) != 1:
                 raise RuntimeError(
@@ -105,8 +129,11 @@ class RolloutInstanceLauncher:
                 )
 
             worker = workers[0]
-            instance.worker_id = worker.id
-            instance.transition_to(RolloutInstanceState.STARTING)
+            if instance.worker_id != worker.id:
+                raise RuntimeError(
+                    f"Provisioned Worker ID {instance.worker_id} does not match "
+                    f"ready Worker ID {worker.id}"
+                )
             await self._scheduler.create_engine(
                 worker_id=worker.id,
                 engine=f"{self._inf_engine.__module__}.{self._inf_engine.__name__}",
@@ -144,7 +171,27 @@ class RolloutInstanceLauncher:
         except BaseException:
             if instance.state is not RolloutInstanceState.FAILED:
                 instance.transition_to(RolloutInstanceState.FAILED)
-            if workers_created:
+            raise
+
+    async def launch(
+        self,
+        *,
+        instance: RolloutInstance,
+        server_args: dict[str, Any],
+        initialize_kwargs: dict[str, Any] | None = None,
+    ) -> RolloutLaunchResult:
+        """Provision and start one instance for direct launcher callers."""
+        provisioned = False
+        try:
+            self.provision(instance=instance)
+            provisioned = True
+            return await self.start(
+                instance=instance,
+                server_args=server_args,
+                initialize_kwargs=initialize_kwargs,
+            )
+        except BaseException:
+            if provisioned:
                 self._scheduler.delete_workers(role=instance.worker_role)
             raise
 

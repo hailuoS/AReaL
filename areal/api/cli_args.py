@@ -2325,6 +2325,24 @@ class ElasticRolloutConfig:
         default=300.0,
         metadata={"help": "Maximum time to wait for an instance drain in seconds."},
     )
+    startup_timeout_seconds: float = field(
+        default=300.0,
+        metadata={
+            "help": (
+                "Shared deadline for parallel elastic engine/server startup after "
+                "Scheduler worker provisioning, in seconds."
+            )
+        },
+    )
+    catch_up_concurrency: int = field(
+        default=4,
+        metadata={
+            "help": (
+                "Maximum number of new elastic instances that may load the shared "
+                "checkpoint concurrently."
+            )
+        },
+    )
     checkpoint_retention: int = field(
         default=3,
         metadata={
@@ -2367,6 +2385,10 @@ class ElasticRolloutConfig:
             raise ValueError("elastic.reconcile_interval_seconds must be positive")
         if self.drain_timeout_seconds < 0:
             raise ValueError("elastic.drain_timeout_seconds must be non-negative")
+        if self.startup_timeout_seconds <= 0:
+            raise ValueError("elastic.startup_timeout_seconds must be positive")
+        if self.catch_up_concurrency <= 0:
+            raise ValueError("elastic.catch_up_concurrency must be positive")
         if self.checkpoint_retention < 2:
             raise ValueError(
                 "elastic.checkpoint_retention must be at least 2 for disk catch-up"

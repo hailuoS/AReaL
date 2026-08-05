@@ -53,6 +53,7 @@ LOGGER_COLORS_EXACT = {
     # Controllers - white
     "TrainController": "white",
     "RolloutController": "white",
+    "RolloutInstanceReconciler": "white",
     "WorkflowExecutor": "white",
     # Stats/Perf - green
     "StatsLogger": "light_green",

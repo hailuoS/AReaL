@@ -4,19 +4,27 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from areal.utils import logging
+
 from .disk_catalog import DiskCheckpointManifest
 from .instance_pool import RolloutInstancePool
 from .models import InstanceDesiredState, RolloutInstance, RolloutInstanceState
 
 
+logger = logging.getLogger("RolloutInstanceReconciler")
+
+
 class _InstanceLauncher(Protocol):
-    async def launch(
+    def provision(self, *, instance: RolloutInstance) -> None: ...
+
+    async def start(
         self,
         *,
         instance: RolloutInstance,
@@ -43,6 +51,7 @@ class ReconcileResult:
     created_instance_ids: tuple[str, ...]
     removed_instance_ids: tuple[str, ...]
     draining_instance_ids: tuple[str, ...]
+    failed_instance_ids: tuple[str, ...] = ()
 
 
 class RolloutInstanceReconciler:
@@ -59,6 +68,8 @@ class RolloutInstanceReconciler:
         latest_checkpoint: Callable[[], DiskCheckpointManifest | None],
         current_version: Callable[[], int],
         drain_timeout_seconds: float = 300.0,
+        startup_timeout_seconds: float = 300.0,
+        catch_up_concurrency: int = 4,
         begin_catch_up: Callable[[], None] | None = None,
         end_catch_up: Callable[[], None] | None = None,
         record_launch_intent: Callable[[str], None] | None = None,
@@ -73,6 +84,12 @@ class RolloutInstanceReconciler:
         self._latest_checkpoint = latest_checkpoint
         self._current_version = current_version
         self._drain_timeout_seconds = drain_timeout_seconds
+        if startup_timeout_seconds <= 0:
+            raise ValueError("startup_timeout_seconds must be positive")
+        if catch_up_concurrency <= 0:
+            raise ValueError("catch_up_concurrency must be positive")
+        self._startup_timeout_seconds = startup_timeout_seconds
+        self._catch_up_concurrency = catch_up_concurrency
         self._begin_catch_up = begin_catch_up or (lambda: None)
         self._end_catch_up = end_catch_up or (lambda: None)
         self._record_launch_intent = record_launch_intent or (lambda _role: None)
@@ -89,11 +106,51 @@ class RolloutInstanceReconciler:
         finally:
             self._clear_launch_intent(proxy_role)
 
+    def _remove_new_instance(
+        self, instance: RolloutInstance, *, provisioned: bool
+    ) -> None:
+        """Remove a failed or no-longer-needed instance from the launch batch."""
+        instance.desired_state = InstanceDesiredState.STOPPED
+        if provisioned:
+            if instance.state is not RolloutInstanceState.STOPPING:
+                instance.transition_to(RolloutInstanceState.STOPPING)
+            self._launcher.destroy(instance)
+        elif instance.state is not RolloutInstanceState.STOPPED:
+            instance.transition_to(RolloutInstanceState.STOPPED)
+        self._pool.remove(instance.instance_id)
+
+    async def _start_instance(self, instance: RolloutInstance) -> RolloutInstance:
+        result = await self._launcher.start(
+            instance=instance,
+            server_args=dict(self._server_args),
+            initialize_kwargs=self._initialize_kwargs,
+        )
+        if result.instance is not instance:
+            raise RuntimeError("launcher replaced the registered elastic instance")
+        await self._ensure_proxy(instance)
+        return instance
+
+    async def _catch_up_instance(
+        self,
+        instance: RolloutInstance,
+        checkpoint: DiskCheckpointManifest | None,
+        version: int,
+        semaphore: asyncio.Semaphore,
+    ) -> RolloutInstance:
+        async with semaphore:
+            if checkpoint is None:
+                instance.loaded_version = version
+                instance.transition_to(RolloutInstanceState.READY)
+            else:
+                await self._launcher.catch_up_from_disk(instance, checkpoint)
+        return instance
+
     async def reconcile_once(self) -> ReconcileResult:
         """Move observed capacity one pass toward the requested desired count."""
         created: list[str] = []
         removed: list[str] = []
         draining: list[str] = []
+        failed: list[str] = []
 
         instances = [
             self._pool.get(instance_id) for instance_id in self._pool.instance_ids()
@@ -155,62 +212,131 @@ class RolloutInstanceReconciler:
             pending_launches.append(instance)
             running.append(instance)
 
+        provisioned: list[RolloutInstance] = []
         for launch_index, instance in enumerate(pending_launches):
             worker_role = instance.worker_role
             launch_intent_recorded = False
             try:
                 self._record_launch_intent(worker_role)
                 launch_intent_recorded = True
-                result = await self._launcher.launch(
-                    instance=instance,
-                    server_args=dict(self._server_args),
-                    initialize_kwargs=self._initialize_kwargs,
+                self._launcher.provision(instance=instance)
+                provisioned.append(instance)
+            except Exception as error:
+                failed.append(instance.instance_id)
+                self._remove_new_instance(instance, provisioned=False)
+                logger.warning(
+                    "Failed to provision elastic instance %s: %s: %s",
+                    instance.instance_id,
+                    type(error).__name__,
+                    error,
                 )
-                if result.instance is not instance:
-                    raise RuntimeError(
-                        "launcher replaced the registered elastic instance"
-                    )
-            except BaseException:
-                if instance.state is not RolloutInstanceState.FAILED:
-                    instance.transition_to(RolloutInstanceState.FAILED)
-                instance.desired_state = InstanceDesiredState.STOPPED
-                instance.transition_to(RolloutInstanceState.STOPPED)
-                self._pool.remove(instance.instance_id)
                 for unstarted in pending_launches[launch_index + 1 :]:
-                    unstarted.desired_state = InstanceDesiredState.STOPPED
-                    unstarted.transition_to(RolloutInstanceState.STOPPED)
-                    self._pool.remove(unstarted.instance_id)
-                raise
+                    self._remove_new_instance(unstarted, provisioned=False)
+                break
             finally:
                 if launch_intent_recorded:
                     self._clear_launch_intent(worker_role)
-            catch_up_started = False
-            try:
-                self._begin_catch_up()
-                catch_up_started = True
-                await self._ensure_proxy(instance)
-                checkpoint = self._latest_checkpoint()
-                if checkpoint is None:
-                    instance.loaded_version = self._current_version()
-                    instance.transition_to(RolloutInstanceState.READY)
+
+        started: list[RolloutInstance] = []
+        if provisioned:
+            start_tasks = [
+                asyncio.create_task(self._start_instance(instance))
+                for instance in provisioned
+            ]
+            _done, pending = await asyncio.wait(
+                start_tasks, timeout=self._startup_timeout_seconds
+            )
+            for task in pending:
+                task.cancel()
+            outcomes = await asyncio.gather(*start_tasks, return_exceptions=True)
+            for instance, outcome in zip(provisioned, outcomes, strict=True):
+                if isinstance(outcome, BaseException):
+                    failed.append(instance.instance_id)
+                    self._remove_new_instance(instance, provisioned=True)
+                    logger.warning(
+                        "Failed to start elastic instance %s: %s: %s",
+                        instance.instance_id,
+                        type(outcome).__name__,
+                        outcome,
+                    )
                 else:
-                    await self._launcher.catch_up_from_disk(instance, checkpoint)
-            except BaseException:
-                if instance.state is not RolloutInstanceState.FAILED:
-                    instance.transition_to(RolloutInstanceState.FAILED)
-                instance.desired_state = InstanceDesiredState.STOPPED
-                instance.transition_to(RolloutInstanceState.STOPPING)
-                self._launcher.destroy(instance)
-                self._pool.remove(instance.instance_id)
-                for unstarted in pending_launches[launch_index + 1 :]:
-                    unstarted.desired_state = InstanceDesiredState.STOPPED
-                    unstarted.transition_to(RolloutInstanceState.STOPPED)
-                    self._pool.remove(unstarted.instance_id)
-                raise
+                    started.append(instance)
+            if pending:
+                logger.warning(
+                    "Elastic startup batch timed out after %.1fs; cancelled %d "
+                    "unfinished instances",
+                    self._startup_timeout_seconds,
+                    len(pending),
+                )
+
+        current_instances = [
+            self._pool.get(instance_id) for instance_id in self._pool.instance_ids()
+        ]
+        started_ids = {instance.instance_id for instance in started}
+        existing_running = sum(
+            instance.instance_id not in started_ids
+            and instance.desired_state is InstanceDesiredState.RUNNING
+            and instance.state
+            not in {RolloutInstanceState.STOPPED, RolloutInstanceState.FAILED}
+            for instance in current_instances
+        )
+        keep_count = max(0, self._pool.desired_count - existing_running)
+        for instance in started[keep_count:]:
+            self._remove_new_instance(instance, provisioned=True)
+        started = started[:keep_count]
+
+        if started:
+            self._begin_catch_up()
+            try:
+                try:
+                    checkpoint = self._latest_checkpoint()
+                    version = (
+                        checkpoint.version
+                        if checkpoint is not None
+                        else self._current_version()
+                    )
+                    # Pin one target version for the entire batch before any
+                    # semaphore waiter starts loading it. Checkpoint GC can then
+                    # see the shared dependency for queued CATCHING_UP instances.
+                    for instance in started:
+                        instance.loaded_version = version
+                    semaphore = asyncio.Semaphore(self._catch_up_concurrency)
+                    outcomes = await asyncio.gather(
+                        *(
+                            self._catch_up_instance(
+                                instance, checkpoint, version, semaphore
+                            )
+                            for instance in started
+                        ),
+                        return_exceptions=True,
+                    )
+                except Exception as error:
+                    outcomes = [error] * len(started)
             finally:
-                if catch_up_started:
-                    self._end_catch_up()
-            created.append(instance.instance_id)
+                self._end_catch_up()
+            for instance, outcome in zip(started, outcomes, strict=True):
+                if isinstance(outcome, BaseException):
+                    failed.append(instance.instance_id)
+                    self._remove_new_instance(instance, provisioned=True)
+                    logger.warning(
+                        "Failed to catch up elastic instance %s: %s: %s",
+                        instance.instance_id,
+                        type(outcome).__name__,
+                        outcome,
+                    )
+                else:
+                    created.append(instance.instance_id)
+
+        instances = [
+            self._pool.get(instance_id) for instance_id in self._pool.instance_ids()
+        ]
+        running = [
+            instance
+            for instance in instances
+            if instance.desired_state is InstanceDesiredState.RUNNING
+            and instance.state
+            not in {RolloutInstanceState.STOPPED, RolloutInstanceState.FAILED}
+        ]
 
         excess = len(running) - self._pool.desired_count
         for instance in reversed(running[-excess:] if excess > 0 else []):
@@ -240,4 +366,5 @@ class RolloutInstanceReconciler:
             created_instance_ids=tuple(created),
             removed_instance_ids=tuple(removed),
             draining_instance_ids=tuple(draining),
+            failed_instance_ids=tuple(failed),
         )

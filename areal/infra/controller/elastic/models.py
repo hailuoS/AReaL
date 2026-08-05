@@ -35,6 +35,7 @@ _ALLOWED_TRANSITIONS: dict[RolloutInstanceState, frozenset[RolloutInstanceState]
     RolloutInstanceState.PENDING: frozenset(
         {
             RolloutInstanceState.STARTING,
+            RolloutInstanceState.STOPPING,
             RolloutInstanceState.STOPPED,
             RolloutInstanceState.FAILED,
         }

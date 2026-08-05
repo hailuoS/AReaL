@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
+
 import pytest
 
 from areal.infra.controller.elastic import (
@@ -23,9 +25,13 @@ class _FakeLauncher:
         self.caught_up = []
         self.destroyed = []
 
-    async def launch(self, *, instance, **kwargs):
-        instance.transition_to(RolloutInstanceState.STARTING)
+    def provision(self, *, instance):
+        assert instance.state is RolloutInstanceState.PENDING
         instance.worker_id = f"{instance.worker_role}/0"
+        instance.transition_to(RolloutInstanceState.STARTING)
+
+    async def start(self, *, instance, **kwargs):
+        assert instance.state is RolloutInstanceState.STARTING
         instance.server_host = "127.0.0.1"
         instance.server_port = 30000
         instance.transition_to(RolloutInstanceState.CATCHING_UP)
@@ -61,9 +67,64 @@ class _FailingCatchUpLauncher(_FakeLauncher):
         raise RuntimeError("catch-up failed")
 
 
+class _PartiallyFailingCatchUpLauncher(_FakeLauncher):
+    def __init__(self):
+        super().__init__()
+        self.failed_once = False
+
+    async def catch_up_from_disk(self, instance, checkpoint):
+        if not self.failed_once:
+            self.failed_once = True
+            raise RuntimeError("one catch-up failed")
+        await super().catch_up_from_disk(instance, checkpoint)
+
+
 class _FailingProxyLauncher(_FakeLauncher):
     async def launch_proxy(self, instance):
         raise RuntimeError("proxy launch failed")
+
+
+class _ParallelLauncher(_FakeLauncher):
+    def __init__(self, expected_starts):
+        super().__init__()
+        self.expected_starts = expected_starts
+        self.start_gate = asyncio.Event()
+        self.active_starts = 0
+        self.max_active_starts = 0
+        self.active_catchups = 0
+        self.max_active_catchups = 0
+
+    async def start(self, *, instance, **kwargs):
+        assert instance.state is RolloutInstanceState.STARTING
+        self.launched.append(instance)
+        self.active_starts += 1
+        self.max_active_starts = max(self.max_active_starts, self.active_starts)
+        if self.active_starts == self.expected_starts:
+            self.start_gate.set()
+        try:
+            await self.start_gate.wait()
+        finally:
+            self.active_starts -= 1
+        instance.server_host = "127.0.0.1"
+        instance.server_port = 30000
+        instance.transition_to(RolloutInstanceState.CATCHING_UP)
+        return _FakeLaunchResult(instance)
+
+    async def catch_up_from_disk(self, instance, checkpoint):
+        self.active_catchups += 1
+        self.max_active_catchups = max(
+            self.max_active_catchups, self.active_catchups
+        )
+        try:
+            await asyncio.sleep(0.01)
+            await super().catch_up_from_disk(instance, checkpoint)
+        finally:
+            self.active_catchups -= 1
+
+
+class _HangingStartLauncher(_FakeLauncher):
+    async def start(self, *, instance, **kwargs):
+        await asyncio.Event().wait()
 
 
 @pytest.mark.asyncio
@@ -130,6 +191,70 @@ async def test_reconciler_registers_pending_instance_before_launch_completes():
     instances = [pool.get(instance_id) for instance_id in pool.instance_ids()]
     assert all(instance.state is RolloutInstanceState.READY for instance in instances)
     assert all(instance.worker_id is not None for instance in instances)
+
+
+@pytest.mark.asyncio
+async def test_reconciler_starts_in_parallel_and_uses_one_checkpoint(tmp_path):
+    pool = RolloutInstancePool(min_instances=1, initial_instances=3, max_instances=3)
+    launcher = _ParallelLauncher(expected_starts=3)
+    checkpoint_dir = tmp_path / "weight_update_v7"
+    checkpoint_dir.mkdir()
+    checkpoint_reads = 0
+    catch_up_guards = []
+
+    def latest_checkpoint():
+        nonlocal checkpoint_reads
+        checkpoint_reads += 1
+        return DiskCheckpointManifest(7, str(checkpoint_dir))
+
+    reconciler = RolloutInstanceReconciler(
+        pool=pool,
+        launcher=launcher,
+        role_prefix="rollout-elastic",
+        server_args={},
+        latest_checkpoint=latest_checkpoint,
+        current_version=lambda: 0,
+        startup_timeout_seconds=1,
+        catch_up_concurrency=2,
+        begin_catch_up=lambda: catch_up_guards.append("begin"),
+        end_catch_up=lambda: catch_up_guards.append("end"),
+    )
+
+    result = await reconciler.reconcile_once()
+
+    assert len(result.created_instance_ids) == 3
+    assert result.failed_instance_ids == ()
+    assert launcher.max_active_starts == 3
+    assert launcher.max_active_catchups == 2
+    assert checkpoint_reads == 1
+    assert {version for _, version in launcher.caught_up} == {7}
+    assert catch_up_guards == ["begin", "end"]
+
+
+@pytest.mark.asyncio
+async def test_reconciler_cancels_startup_batch_at_shared_deadline():
+    pool = RolloutInstancePool(min_instances=1, initial_instances=1, max_instances=1)
+    launcher = _HangingStartLauncher()
+    catch_up_guards = []
+    reconciler = RolloutInstanceReconciler(
+        pool=pool,
+        launcher=launcher,
+        role_prefix="rollout-elastic",
+        server_args={},
+        latest_checkpoint=lambda: None,
+        current_version=lambda: 0,
+        startup_timeout_seconds=0.01,
+        begin_catch_up=lambda: catch_up_guards.append("begin"),
+        end_catch_up=lambda: catch_up_guards.append("end"),
+    )
+
+    result = await reconciler.reconcile_once()
+
+    assert len(result.failed_instance_ids) == 1
+    assert result.created_instance_ids == ()
+    assert pool.instance_ids() == ()
+    assert len(launcher.destroyed) == 1
+    assert catch_up_guards == []
 
 
 @pytest.mark.asyncio
@@ -262,10 +387,33 @@ async def test_reconciler_removes_instance_after_catch_up_failure(tmp_path):
         current_version=lambda: 4,
     )
 
-    with pytest.raises(RuntimeError, match="catch-up failed"):
-        await reconciler.reconcile_once()
+    result = await reconciler.reconcile_once()
 
     assert pool.instance_ids() == ()
+    assert len(launcher.destroyed) == 2
+    assert len(result.failed_instance_ids) == 2
+
+
+@pytest.mark.asyncio
+async def test_reconciler_keeps_successful_instances_after_partial_failure(tmp_path):
+    pool = RolloutInstancePool(min_instances=1, initial_instances=3, max_instances=3)
+    launcher = _PartiallyFailingCatchUpLauncher()
+    checkpoint_dir = tmp_path / "weight_update_v4"
+    checkpoint_dir.mkdir()
+    reconciler = RolloutInstanceReconciler(
+        pool=pool,
+        launcher=launcher,
+        role_prefix="rollout-elastic",
+        server_args={},
+        latest_checkpoint=lambda: DiskCheckpointManifest(4, str(checkpoint_dir)),
+        current_version=lambda: 4,
+    )
+
+    result = await reconciler.reconcile_once()
+
+    assert len(result.created_instance_ids) == 2
+    assert len(result.failed_instance_ids) == 1
+    assert len(pool.ready_snapshot()) == 2
     assert len(launcher.destroyed) == 1
 
 
@@ -287,11 +435,11 @@ async def test_reconciler_removes_new_instance_after_proxy_failure():
         clear_launch_intent=cleared_roles.append,
     )
 
-    with pytest.raises(RuntimeError, match="proxy launch failed"):
-        await reconciler.reconcile_once()
+    result = await reconciler.reconcile_once()
 
     assert pool.instance_ids() == ()
     assert len(launcher.destroyed) == 1
+    assert len(result.failed_instance_ids) == 1
     assert recorded_roles[1].startswith("proxy-rollout-elastic-")
     assert cleared_roles == recorded_roles
 
