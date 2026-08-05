@@ -76,25 +76,27 @@ Gateway online session 路由和 drain 尚未接入。
 ## 扩缩容建议
 
 训练侧采集 `prepare_batch` 等待时间、step 时间、进入 buffer 的 rollout 数和
-消费样本数。报告复用 AstraFlow 的三段式规则：
+消费样本数。报告使用针对 AReaL 按需生成路径调整后的 AstraFlow 风格三段式规则：
 
 ```text
 wait_fraction > 0.10:
     扩容到 ceil(instances / (1 - wait_fraction))
 
-wait_fraction < 0.05 且生产、消费均非零:
-    缩容到 ceil(instances × consumed / entered × 1.10)
+wait_fraction < 0.05，且有效 step 时间、生产、消费均非零:
+    建议减少 1 个实例
 
 其他情况:
     保持
 ```
 
-结果会限制在配置的 min/max 范围内。该建议只生成报告，不会自动修改 desired
-state。
+结果会限制在配置的 min/max 范围内。按需驱动的 `prepare_batch` 即使在容量过剩时
+也常使 `consumed / entered` 接近 1，因此 AReaL 不再使用该比例计算缩容目标。
+该建议只生成报告，不会自动修改 desired state。
 
 示例 autoscaler 会立即消费冷却期或容量未收敛时观察到的报告，不会在条件解除后
 重放。一次扩缩容收敛后，它只接受采样窗口完全开始于收敛版本之后、且报告容量与
-当前稳定容量一致的新报告。
+当前稳定容量一致的新报告。缩容默认还要求连续两个有效低等待窗口
+（`--scale-down-windows`），并且每次收敛周期最多减少 1 个实例。
 
 ## Disk checkpoint 保留和恢复
 

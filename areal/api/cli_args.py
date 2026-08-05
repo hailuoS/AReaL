@@ -2357,7 +2357,7 @@ class ElasticRolloutConfig:
         default=10,
         metadata={
             "help": (
-                "Generate an AstraFlow-compatible scaling report every N "
+                "Generate an AstraFlow-inspired scaling report every N "
                 "training versions. Set to 0 to disable automatic reports."
             )
         },

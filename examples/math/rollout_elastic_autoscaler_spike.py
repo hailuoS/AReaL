@@ -20,6 +20,7 @@ import argparse
 import json
 import logging
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import requests
@@ -29,6 +30,52 @@ logger = logging.getLogger("RolloutElasticAutoscalerSpike")
 
 class AutoscalerError(RuntimeError):
     """Raised when the external elastic control loop cannot make progress."""
+
+
+@dataclass
+class _ScaleDownConfirmation:
+    required_windows: int
+    streak: int = 0
+    last_window_end: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.required_windows <= 0:
+            raise ValueError("required_windows must be positive")
+
+    def reset(self) -> None:
+        self.streak = 0
+        self.last_window_end = None
+
+    def observe(
+        self,
+        report: dict[str, Any],
+        *,
+        desired: int,
+        window_start: int,
+        report_version: int,
+    ) -> tuple[bool, int]:
+        """Return whether consecutive valid windows confirm one scale-down."""
+        if not (
+            report.get("branch") == "scale_down"
+            and report.get("recommended_instances") == desired - 1
+        ):
+            self.reset()
+            return False, 0
+        window_end = report.get("window_end_version", report_version)
+        if isinstance(window_end, bool) or not isinstance(window_end, int):
+            raise AutoscalerError(
+                f"Scale-down report has no integer window_end_version: {report!r}"
+            )
+        if self.last_window_end is None or window_start != self.last_window_end + 1:
+            self.streak = 1
+        else:
+            self.streak += 1
+        self.last_window_end = window_end
+        observed = self.streak
+        confirmed = observed >= self.required_windows
+        if confirmed:
+            self.reset()
+        return confirmed, observed
 
 
 def _request_json(
@@ -221,6 +268,7 @@ def _apply_report(
 
 
 def _run_injected_spike(options: argparse.Namespace) -> None:
+    scale_down_windows = getattr(options, "scale_down_windows", 2)
     _wait_for_convergence(
         options.base_url,
         expected_instances=1,
@@ -254,20 +302,33 @@ def _run_injected_spike(options: argparse.Namespace) -> None:
     if options.dry_run:
         return
 
-    logger.info("Injecting scale-down metrics")
-    _inject_recommendation(
-        options.base_url,
-        options.request_timeout,
-        entered=20,
-        consumed=5,
-        wait_seconds=0.1,
-        step_seconds=10.0,
-    )
-    scale_down_report = _get_recommendation(options.base_url, options.request_timeout)
-    if scale_down_report.get("branch") != "scale_down":
-        raise AutoscalerError(
-            f"Expected a scale_down report, got {scale_down_report!r}"
+    confirmation = _ScaleDownConfirmation(scale_down_windows)
+    scale_down_report = None
+    for _ in range(scale_down_windows):
+        logger.info("Injecting scale-down metrics")
+        scale_down_report = _inject_recommendation(
+            options.base_url,
+            options.request_timeout,
+            entered=20,
+            consumed=5,
+            wait_seconds=0.1,
+            step_seconds=10.0,
         )
+        report_version = int(scale_down_report["report_version"])
+        window_start = int(scale_down_report["window_start_version"])
+        confirmed, observed = confirmation.observe(
+            scale_down_report,
+            desired=2,
+            window_start=window_start,
+            report_version=report_version,
+        )
+        logger.info(
+            "Injected scale-down confirmation window %d/%d",
+            observed,
+            scale_down_windows,
+        )
+    if scale_down_report is None or not confirmed:
+        raise AutoscalerError("Injected scale-down windows did not confirm scaling")
     _apply_report(
         options.base_url,
         scale_down_report,
@@ -281,6 +342,8 @@ def _run_injected_spike(options: argparse.Namespace) -> None:
 
 
 def _run_live_loop(options: argparse.Namespace) -> None:
+    scale_down_windows = getattr(options, "scale_down_windows", 2)
+    scale_down_confirmation = _ScaleDownConfirmation(scale_down_windows)
     last_report_version: int | None = None
     last_action_at = 0.0
     minimum_window_start_version = 0
@@ -328,6 +391,7 @@ def _run_live_loop(options: argparse.Namespace) -> None:
                 )
 
                 if last_desired_instances is None:
+                    scale_down_confirmation.reset()
                     last_desired_instances = desired
                     capacity_was_stable = stable
                     minimum_window_start_version = serving_version
@@ -340,6 +404,7 @@ def _run_live_loop(options: argparse.Namespace) -> None:
                     time.sleep(options.poll_interval)
                     continue
                 if desired != last_desired_instances:
+                    scale_down_confirmation.reset()
                     last_desired_instances = desired
                     capacity_was_stable = stable
                     minimum_window_start_version = serving_version
@@ -352,6 +417,7 @@ def _run_live_loop(options: argparse.Namespace) -> None:
                     time.sleep(options.poll_interval)
                     continue
                 if not stable:
+                    scale_down_confirmation.reset()
                     capacity_was_stable = False
                     minimum_window_start_version = max(
                         minimum_window_start_version, serving_version
@@ -364,6 +430,7 @@ def _run_live_loop(options: argparse.Namespace) -> None:
                     time.sleep(options.poll_interval)
                     continue
                 if not capacity_was_stable:
+                    scale_down_confirmation.reset()
                     capacity_was_stable = True
                     minimum_window_start_version = serving_version
                     logger.info(
@@ -375,12 +442,14 @@ def _run_live_loop(options: argparse.Namespace) -> None:
                     time.sleep(options.poll_interval)
                     continue
                 if now - last_action_at < options.cooldown:
+                    scale_down_confirmation.reset()
                     logger.info(
                         "Discarding report version=%d observed during cooldown",
                         report_version,
                     )
                 else:
                     if report.get("ready_instances") != desired:
+                        scale_down_confirmation.reset()
                         logger.info(
                             "Discarding report version=%d for stale capacity: "
                             "report_ready=%s current_ready=%d",
@@ -391,12 +460,29 @@ def _run_live_loop(options: argparse.Namespace) -> None:
                         time.sleep(options.poll_interval)
                         continue
                     if window_start_version <= minimum_window_start_version:
+                        scale_down_confirmation.reset()
                         logger.info(
                             "Discarding report version=%d whose window started at "
                             "version=%d before the post-convergence watermark=%d",
                             report_version,
                             window_start_version,
                             minimum_window_start_version,
+                        )
+                        time.sleep(options.poll_interval)
+                        continue
+                    confirmed, observed = scale_down_confirmation.observe(
+                        report,
+                        desired=desired,
+                        window_start=window_start_version,
+                        report_version=report_version,
+                    )
+                    if observed and not confirmed:
+                        logger.info(
+                            "Deferring scale-down report version=%d until "
+                            "%d consecutive valid windows; observed=%d",
+                            report_version,
+                            scale_down_windows,
+                            observed,
                         )
                         time.sleep(options.poll_interval)
                         continue
@@ -410,6 +496,7 @@ def _run_live_loop(options: argparse.Namespace) -> None:
                         require_proxy=options.require_proxy,
                     )
                     if changed:
+                        scale_down_confirmation.reset()
                         last_action_at = time.monotonic()
                         converged = _get_status(
                             options.base_url, options.request_timeout
@@ -458,6 +545,15 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--poll-interval", type=float, default=2.0)
     parser.add_argument("--cooldown", type=float, default=30.0)
+    parser.add_argument(
+        "--scale-down-windows",
+        type=int,
+        default=2,
+        help=(
+            "Consecutive valid scale-down windows required before removing "
+            "one instance."
+        ),
+    )
     parser.add_argument("--request-timeout", type=float, default=300.0)
     parser.add_argument("--convergence-timeout", type=float, default=600.0)
     options = parser.parse_args()
@@ -470,6 +566,8 @@ def _parse_args() -> argparse.Namespace:
     ):
         if getattr(options, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    if options.scale_down_windows <= 0:
+        parser.error("--scale-down-windows must be positive")
     return options
 
 

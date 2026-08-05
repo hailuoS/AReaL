@@ -26,7 +26,7 @@
 - 训练 step 使用 disk 模式更新全部 `READY` 实例；
 - 缩容前停止接收新任务，等待任务、直接请求和权重更新租约排空；
 - StalenessManager 容量随 `READY` 实例数动态变化；
-- 生成复用 AstraFlow 规则的扩缩容建议报告；
+- 生成针对 AReaL 按需生成路径调整后的 AstraFlow 风格扩缩容建议报告；
 - 保存 desired state、serving version、checkpoint 和 Scheduler role 恢复状态；
 - `elastic.enabled=false` 时继续走原有 V1 静态路径。
 
@@ -283,7 +283,8 @@ Controller 重启时会校验 checkpoint，清理恢复记录中的旧 role，�
 
 ## 5. 扩缩容建议
 
-建议逻辑复用 AstraFlow 的多 step 窗口和三段式规则。默认
+建议逻辑使用 AstraFlow 风格的多 step 窗口和三段式规则，并针对 AReaL
+按需生成路径调整缩容目标。默认
 `rollout.elastic.report_freq_steps=10`，在 serving version 为
 `10、20、30...` 时关闭当前窗口并生成报告。窗口生成后重置精确计数，下一窗口重新
 累计。
@@ -300,17 +301,17 @@ wait_fraction = sum(prepare_batch_wait_seconds) / sum(step_seconds)
 wait_fraction > 0.10:
     scale_up = ceil(ready_instances / (1 - wait_fraction))
 
-wait_fraction < 0.05 且 entered > 0 且 consumed > 0:
-    scale_down = min(
-        ready_instances,
-        ceil(ready_instances × sum(consumed) / sum(entered) × 1.10),
-    )
+wait_fraction < 0.05 且有效 step 时间、entered、consumed 均大于 0:
+    scale_down = ready_instances - 1
 
 其他情况:
     hold
 ```
 
-最终建议限制在 `min_instances` 和 `max_instances` 之间。
+最终建议限制在 `min_instances` 和 `max_instances` 之间。由于按需驱动的
+`prepare_batch` 即使在容量过剩时也常使 `consumed / entered` 接近 1，缩容不再
+使用该比例直接计算目标。示例 autoscaler 默认要求连续两个有效低等待窗口，且窗口
+必须首尾连续，确认后每次只减少 1 个实例。
 
 采集信息包括：
 
@@ -533,8 +534,8 @@ python examples/math/rollout_elastic_autoscaler_spike.py \
 2. 读取生成的 `scale_up` 报告；
 3. 将报告中的 `recommended_instances=2` 写入 desired state；
 4. 等待 2 个实例全部 `READY` 且权重版本一致；
-5. 注入低等待、低消费比的模拟窗口；
-6. 读取生成的 `scale_down` 报告；
+5. 连续注入两个低等待模拟窗口；
+6. 读取生成的 `scale_down` 报告并完成连续窗口确认；
 7. 将 `recommended_instances=1` 写入 desired state；
 8. 等待 drain 和缩容完成。
 
@@ -667,7 +668,8 @@ rollout.elastic.enabled=false
 - Ray 删除 worker 时部分 vLLM 子进程可能需要强制清理；
 - 单实例容量校验基于单节点约束，不覆盖跨节点放置；
 - drain 超时不会强删实例，持续不归零时需要通过状态接口和日志排查；
-- 扩缩容建议使用当前可获得指标近似 AstraFlow 语义，需要结合真实训练负载校准。
+- 扩缩容建议使用当前可获得指标，并通过逐实例缩容和连续窗口确认降低抖动风险，
+  阈值仍需结合真实训练负载校准。
 
 ### 后续工作
 

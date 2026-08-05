@@ -211,6 +211,98 @@ def test_live_autoscaler_discards_report_for_previous_capacity(monkeypatch):
     assert applied_versions == []
 
 
+def test_live_autoscaler_requires_consecutive_scale_down_windows(monkeypatch):
+    reports = iter(
+        [
+            {
+                "report_version": 10,
+                "window_start_version": 1,
+                "branch": "hold",
+                "ready_instances": 4,
+                "recommended_instances": 4,
+            },
+            {
+                "report_version": 20,
+                "window_start_version": 11,
+                "branch": "scale_down",
+                "ready_instances": 4,
+                "recommended_instances": 3,
+            },
+            {
+                "report_version": 30,
+                "window_start_version": 21,
+                "branch": "scale_down",
+                "ready_instances": 4,
+                "recommended_instances": 3,
+            },
+        ]
+    )
+    applied_versions = []
+
+    def get_recommendation(*_args):
+        try:
+            return next(reports)
+        except StopIteration:
+            raise KeyboardInterrupt from None
+
+    monkeypatch.setattr(autoscaler, "_get_recommendation", get_recommendation)
+    monkeypatch.setattr(
+        autoscaler, "_get_status", lambda *_args: _stable_status(4, 10)
+    )
+    monkeypatch.setattr(
+        autoscaler,
+        "_apply_report",
+        lambda _base_url, report, **_kwargs: applied_versions.append(
+            report["report_version"]
+        ),
+    )
+    monkeypatch.setattr(autoscaler.time, "sleep", lambda _seconds: None)
+    options = SimpleNamespace(
+        base_url="http://127.0.0.1:18080",
+        request_timeout=1.0,
+        cooldown=0.0,
+        convergence_timeout=1.0,
+        poll_interval=0.1,
+        dry_run=False,
+        require_proxy=False,
+        scale_down_windows=2,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        autoscaler._run_live_loop(options)
+
+    assert applied_versions == [30]
+
+
+def test_scale_down_confirmation_resets_on_hold_and_window_gap():
+    confirmation = autoscaler._ScaleDownConfirmation(required_windows=2)
+    down = {"branch": "scale_down", "recommended_instances": 3}
+
+    assert confirmation.observe(
+        down, desired=4, window_start=11, report_version=20
+    ) == (False, 1)
+    assert confirmation.observe(
+        {"branch": "hold", "recommended_instances": 4},
+        desired=4,
+        window_start=21,
+        report_version=30,
+    ) == (False, 0)
+    assert confirmation.observe(
+        down, desired=4, window_start=31, report_version=40
+    ) == (False, 1)
+    assert confirmation.observe(
+        down, desired=4, window_start=51, report_version=60
+    ) == (False, 1)
+    assert confirmation.observe(
+        down, desired=4, window_start=61, report_version=70
+    ) == (True, 2)
+
+
+def test_scale_down_confirmation_requires_positive_window_count():
+    with pytest.raises(ValueError, match="must be positive"):
+        autoscaler._ScaleDownConfirmation(required_windows=0)
+
+
 def test_live_autoscaler_rejects_report_without_version(monkeypatch):
     monkeypatch.setattr(
         autoscaler,

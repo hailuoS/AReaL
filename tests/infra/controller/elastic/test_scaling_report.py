@@ -137,7 +137,7 @@ def test_reporter_can_disable_automatic_reports():
     assert report is None
 
 
-def test_low_wait_branch_never_recommends_scale_up():
+def test_low_wait_branch_recommends_one_instance_step_down():
     reporter = _reporter(frequency=1)
 
     report = reporter.record(
@@ -151,6 +151,57 @@ def test_low_wait_branch_never_recommends_scale_up():
 
     assert report is not None
     assert report["branch"] == "scale_down"
+    assert report["recommended_instances"] == 1
+
+
+def test_low_wait_branch_respects_minimum_instances():
+    reporter = _reporter(frequency=1)
+
+    report = reporter.record(
+        report_version=1,
+        ready_instances=1,
+        entered=10,
+        consumed=10,
+        wait_seconds=0.0,
+        step_seconds=10.0,
+    )
+
+    assert report is not None
+    assert report["branch"] == "scale_down"
+    assert report["recommended_instances"] == 1
+
+
+def test_low_wait_without_timing_evidence_holds_capacity():
+    reporter = _reporter(frequency=1)
+
+    report = reporter.record(
+        report_version=1,
+        ready_instances=2,
+        entered=10,
+        consumed=10,
+        wait_seconds=0.0,
+        step_seconds=0.0,
+    )
+
+    assert report is not None
+    assert report["branch"] == "hold"
+    assert report["recommended_instances"] == 2
+
+
+def test_wait_fraction_at_lower_dead_band_boundary_holds_capacity():
+    reporter = _reporter(frequency=1)
+
+    report = reporter.record(
+        report_version=1,
+        ready_instances=2,
+        entered=10,
+        consumed=10,
+        wait_seconds=0.5,
+        step_seconds=10.0,
+    )
+
+    assert report is not None
+    assert report["branch"] == "hold"
     assert report["recommended_instances"] == 2
 
 

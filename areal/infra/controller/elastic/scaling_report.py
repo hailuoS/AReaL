@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""AstraFlow-compatible, report-only rollout scaling recommendation."""
+"""AstraFlow-inspired, report-only rollout scaling recommendation."""
 
 from __future__ import annotations
 
@@ -142,7 +142,7 @@ class ElasticScalingReporter:
 def recommend_instances(
     window: ElasticScalingWindow, *, min_instances: int, max_instances: int
 ) -> ElasticScalingRecommendation:
-    """Apply AstraFlow's 0.05/0.10 dead-band to complete instances."""
+    """Apply a 0.05/0.10 dead-band to complete rollout instances."""
     if window.ready_instances < 1:
         raise ValueError("ready_instances must be at least 1")
     wait_fraction = (
@@ -153,12 +153,17 @@ def recommend_instances(
     if wait_fraction > 0.10:
         branch = "scale_up"
         target = math.ceil(window.ready_instances / (1.0 - wait_fraction))
-    elif wait_fraction < 0.05 and window.entered > 0 and window.consumed > 0:
+    elif (
+        window.step_seconds > 0
+        and wait_fraction < 0.05
+        and window.entered > 0
+        and window.consumed > 0
+    ):
         branch = "scale_down"
-        target = min(
-            window.ready_instances,
-            math.ceil(window.ready_instances * window.consumed / window.entered * 1.10),
-        )
+        # AReaL drives rollout production from prepare_batch, so entered and
+        # consumed commonly stay close even when capacity is over-provisioned.
+        # Probe one smaller capacity instead of using their ratio as a target.
+        target = window.ready_instances - 1
     else:
         branch = "hold"
         target = window.ready_instances

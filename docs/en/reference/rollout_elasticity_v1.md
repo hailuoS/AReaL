@@ -83,26 +83,32 @@ that still owns work.
 ## Scaling recommendation
 
 Training records the time blocked in `prepare_batch`, step duration, accepted rollouts,
-and consumed samples. The report reuses AstraFlow's three-zone rule:
+and consumed samples. The report uses an AstraFlow-inspired three-zone rule adapted
+to AReaL's demand-driven rollout path:
 
 ```text
 wait_fraction > 0.10:
     scale up to ceil(instances / (1 - wait_fraction))
 
-wait_fraction < 0.05 and production and consumption are nonzero:
-    scale down to ceil(instances × consumed / entered × 1.10)
+wait_fraction < 0.05, measured step time is nonzero, and production and consumption are nonzero:
+    recommend one fewer instance
 
 otherwise:
     hold
 ```
 
-The result is clamped to configured min/max instances. It is report-only and never
-changes desired state automatically.
+The result is clamped to configured min/max instances. AReaL does not use the
+`consumed / entered` ratio as the scale-down target because demand-driven
+`prepare_batch` commonly keeps those counters close even when rollout capacity is
+over-provisioned. The recommendation is report-only and never changes desired state
+automatically.
 
 The example autoscaler consumes reports observed during cooldown or unstable capacity
 instead of replaying them later. After convergence it accepts only a report whose
 complete window starts after the convergence version and whose reported capacity
-matches the current stable capacity.
+matches the current stable capacity. Scale-down additionally requires two consecutive
+valid low-wait windows by default (`--scale-down-windows`) and removes at most one
+instance per convergence cycle.
 
 ## Disk checkpoint retention and recovery
 
