@@ -279,3 +279,33 @@ def test_controller_persists_completed_report_in_experiment_directory(tmp_path):
     assert report is not None
     assert path.is_file()
     assert json.loads(path.read_text(encoding="utf-8")) == report
+
+
+def test_active_rollout_gpu_count_includes_only_ready_elastic_instances():
+    config = InferenceEngineConfig(
+        backend="vllm:t2",
+        consumer_batch_size=1,
+        scheduling_spec=(SchedulingSpec(cpu=1, gpu=1, mem=1),),
+        elastic=ElasticRolloutConfig(
+            enabled=True,
+            initial_instances=1,
+            max_instances=2,
+        ),
+    )
+    controller = RolloutController(inf_engine=object, config=config, scheduler=object())
+    ready = controller._instance_pool.create(
+        instance_id="ri-ready",
+        worker_role="rollout-elastic-ready",
+        worker_id="rollout-elastic-ready/0",
+        engine_name="rollout/ri-ready",
+    )
+    ready.transition_to(RolloutInstanceState.STARTING)
+    ready.transition_to(RolloutInstanceState.READY)
+    controller._instance_pool.create(
+        instance_id="ri-pending",
+        worker_role="rollout-elastic-pending",
+        worker_id="rollout-elastic-pending/0",
+        engine_name="rollout/ri-pending",
+    )
+
+    assert controller.get_active_rollout_gpu_count() == 2

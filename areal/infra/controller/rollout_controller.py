@@ -2000,6 +2000,15 @@ class RolloutController:
         with self._version_lock:
             return self._version
 
+    def get_active_rollout_gpu_count(self) -> int:
+        """Return GPUs backing the rollout instances currently serving traffic."""
+        if self._instance_pool is None:
+            return self.rollout_alloc.parallel.world_size
+        instance_size = (
+            self.rollout_alloc.parallel.tp_size * self.rollout_alloc.parallel.pp_size
+        )
+        return len(self._instance_pool.ready_snapshot()) * instance_size
+
     def pause(self):
         self.dispatcher.pause()
         self._collective_rpc("pause", http_timeout=60.0)
