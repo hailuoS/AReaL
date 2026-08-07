@@ -25,6 +25,12 @@ from .models import (
 )
 from .reconciler import ReconcileResult, RolloutInstanceReconciler
 from .recovery_state import ElasticRecoveryState, ElasticRecoveryStore
+from .scaling_report import (
+    ElasticScalingRecommendation,
+    ElasticScalingReporter,
+    ElasticScalingWindow,
+    recommend_instances,
+)
 
 __all__ = [
     "DuplicateInstanceError",
@@ -48,6 +54,10 @@ __all__ = [
     "ReconcileResult",
     "ElasticRecoveryState",
     "ElasticRecoveryStore",
+    "ElasticScalingRecommendation",
+    "ElasticScalingReporter",
+    "ElasticScalingWindow",
+    "recommend_instances",
     "SingleNodeInstanceError",
     "TaskBindingError",
 ]
