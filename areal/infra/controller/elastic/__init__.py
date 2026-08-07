@@ -12,15 +12,18 @@ from .errors import (
     InstanceNotRemovableError,
     InvalidDesiredCountError,
     InvalidStateTransitionError,
+    SingleNodeInstanceError,
     TaskBindingError,
 )
 from .instance_pool import RolloutInstancePool
+from .launcher import RolloutInstanceLauncher, RolloutLaunchResult
 from .models import (
     InstanceDesiredState,
     RolloutInstance,
     RolloutInstanceState,
     RolloutRPCTarget,
 )
+from .reconciler import ReconcileResult, RolloutInstanceReconciler
 from .recovery_state import ElasticRecoveryState, ElasticRecoveryStore
 
 __all__ = [
@@ -36,10 +39,15 @@ __all__ = [
     "InvalidDesiredCountError",
     "InvalidStateTransitionError",
     "RolloutInstance",
+    "RolloutInstanceLauncher",
+    "RolloutLaunchResult",
     "RolloutInstancePool",
+    "RolloutInstanceReconciler",
     "RolloutInstanceState",
     "RolloutRPCTarget",
+    "ReconcileResult",
     "ElasticRecoveryState",
     "ElasticRecoveryStore",
+    "SingleNodeInstanceError",
     "TaskBindingError",
 ]
