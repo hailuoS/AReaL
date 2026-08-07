@@ -666,6 +666,11 @@ class PPOTrainer:
                 and global_step >= config.total_train_steps
             ):
                 break
+            step_started_at = time.perf_counter()
+            # Snapshot the capacity available when this step starts. Elastic
+            # instances that are still STARTING/CATCHING_UP cannot serve this
+            # step and therefore are intentionally excluded.
+            rollout_gpu_count = self._active_rollout_gpu_count()
             epoch = global_step // steps_per_epoch
             step = global_step % steps_per_epoch
 
@@ -993,6 +998,7 @@ class PPOTrainer:
                 category=Category.INSTR,
                 args={"global_step": global_step},
             ):
+                self._record_step_metrics(step_started_at, rollout_gpu_count)
                 self._export_and_commit_stats(
                     epoch=epoch, epoch_step=step, global_step=global_step
                 )
@@ -1427,6 +1433,20 @@ class PPOTrainer:
         if not is_single_controller():
             dist.barrier(group=self.actor.cpu_group)
             current_platform.synchronize()
+
+    def _active_rollout_gpu_count(self) -> int:
+        if isinstance(self.rollout, RolloutController):
+            return self.rollout.get_active_rollout_gpu_count()
+        return self.rollout_alloc.parallel.world_size
+
+    @staticmethod
+    def _record_step_metrics(step_started_at: float, rollout_gpu_count: int) -> None:
+        stats_tracker.scalar(
+            **{
+                "timeperf/step": time.perf_counter() - step_started_at,
+                "rollout/total_gpus": rollout_gpu_count,
+            }
+        )
 
     def _validate_cfg(self):
         """validate config for incompatible settings before weight initialization, to avoid wasted resources on spawning workers and loading models."""
