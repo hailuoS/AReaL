@@ -36,6 +36,10 @@ validation rollout 会跳过并输出 warning。
 READY 实例数 × max_concurrent_rollouts
 ```
 
+`startup_concurrency` 默认值为 `2`，用于限制同时初始化推理引擎、server 和 proxy
+的实例数。实例获得启动并发槽位后才单独开始计算 `startup_timeout_seconds`，排队
+等待并发槽位的时间不计入启动超时。
+
 ## HTTP 控制和状态
 
 V1 callback server 提供：

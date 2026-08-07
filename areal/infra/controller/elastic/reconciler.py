@@ -69,6 +69,7 @@ class RolloutInstanceReconciler:
         current_version: Callable[[], int],
         drain_timeout_seconds: float = 300.0,
         startup_timeout_seconds: float = 300.0,
+        startup_concurrency: int = 2,
         catch_up_concurrency: int = 4,
         begin_catch_up: Callable[[], None] | None = None,
         end_catch_up: Callable[[], None] | None = None,
@@ -86,9 +87,12 @@ class RolloutInstanceReconciler:
         self._drain_timeout_seconds = drain_timeout_seconds
         if startup_timeout_seconds <= 0:
             raise ValueError("startup_timeout_seconds must be positive")
+        if startup_concurrency <= 0:
+            raise ValueError("startup_concurrency must be positive")
         if catch_up_concurrency <= 0:
             raise ValueError("catch_up_concurrency must be positive")
         self._startup_timeout_seconds = startup_timeout_seconds
+        self._startup_concurrency = startup_concurrency
         self._catch_up_concurrency = catch_up_concurrency
         self._begin_catch_up = begin_catch_up or (lambda: None)
         self._end_catch_up = end_catch_up or (lambda: None)
@@ -129,6 +133,15 @@ class RolloutInstanceReconciler:
             raise RuntimeError("launcher replaced the registered elastic instance")
         await self._ensure_proxy(instance)
         return instance
+
+    async def _start_instance_bounded(
+        self, instance: RolloutInstance, semaphore: asyncio.Semaphore
+    ) -> RolloutInstance:
+        async with semaphore:
+            return await asyncio.wait_for(
+                self._start_instance(instance),
+                timeout=self._startup_timeout_seconds,
+            )
 
     async def _catch_up_instance(
         self,
@@ -239,15 +252,13 @@ class RolloutInstanceReconciler:
 
         started: list[RolloutInstance] = []
         if provisioned:
+            startup_semaphore = asyncio.Semaphore(self._startup_concurrency)
             start_tasks = [
-                asyncio.create_task(self._start_instance(instance))
+                asyncio.create_task(
+                    self._start_instance_bounded(instance, startup_semaphore)
+                )
                 for instance in provisioned
             ]
-            _done, pending = await asyncio.wait(
-                start_tasks, timeout=self._startup_timeout_seconds
-            )
-            for task in pending:
-                task.cancel()
             outcomes = await asyncio.gather(*start_tasks, return_exceptions=True)
             for instance, outcome in zip(provisioned, outcomes, strict=True):
                 if isinstance(outcome, BaseException):
@@ -261,13 +272,6 @@ class RolloutInstanceReconciler:
                     )
                 else:
                     started.append(instance)
-            if pending:
-                logger.warning(
-                    "Elastic startup batch timed out after %.1fs; cancelled %d "
-                    "unfinished instances",
-                    self._startup_timeout_seconds,
-                    len(pending),
-                )
 
         current_instances = [
             self._pool.get(instance_id) for instance_id in self._pool.instance_ids()

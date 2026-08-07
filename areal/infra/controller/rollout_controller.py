@@ -7,10 +7,11 @@ import json
 import os
 import shutil
 import threading
+import time
 import traceback
 from collections import defaultdict
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -80,6 +81,8 @@ class _RemoteRolloutTaskInput:
     is_eval: bool = False
     group_size: int = 1
     proxy_addr: str | None = None
+    enqueued_at: float = field(default_factory=time.monotonic)
+    enqueued_version: int | None = None
 
 
 @dataclass
@@ -325,6 +328,7 @@ class RolloutController:
             current_version=self.get_version,
             drain_timeout_seconds=self.config.elastic.drain_timeout_seconds,
             startup_timeout_seconds=self.config.elastic.startup_timeout_seconds,
+            startup_concurrency=self.config.elastic.startup_concurrency,
             catch_up_concurrency=self.config.elastic.catch_up_concurrency,
             begin_catch_up=self._begin_elastic_catch_up,
             end_catch_up=self._end_elastic_catch_up,
@@ -1461,6 +1465,9 @@ class RolloutController:
             # `on_rollout_submitted` will be called upon dispatching
             task_id = pending_task.task_id
             bound_instance_id: str | None = None
+            target: RolloutRPCTarget | None = None
+            dispatch_started_at = time.monotonic()
+            timeout_phase = "route"
 
             manager = self.staleness_manager
 
@@ -1482,6 +1489,7 @@ class RolloutController:
                 proxy_addr = self._proxy_addr_for_target(
                     target, pending_task.proxy_addr
                 )
+                timeout_phase = "submit_rpc"
                 engine_task_id = await self.scheduler.async_call_engine(
                     target.worker_id,
                     "submit",
@@ -1501,9 +1509,11 @@ class RolloutController:
                 assert task_id == engine_task_id, (task_id, engine_task_id)
 
                 # Wait for callback to resolve the future
+                timeout_phase = "wait_callback"
                 await asyncio.wait_for(future, timeout=self.config.request_timeout)
 
                 # Fetch the result
+                timeout_phase = "fetch_result"
                 result = await self.scheduler.async_call_engine(
                     target.worker_id,
                     "wait_for_task",
@@ -1535,12 +1545,46 @@ class RolloutController:
                     logger.info(f"Finish but reject rollout. {self._rollout_stats()}")
                 return None
 
-            except TimeoutError:
+            except TimeoutError as exc:
                 if task_id is not None:
                     with self._futures_lock:
                         self._pending_futures.pop(task_id, None)
                 manager.on_rollout_rejected()
-                logger.error(f"Rollout timed out after {self.config.request_timeout}s")
+                now = time.monotonic()
+                instance_state = "static"
+                loaded_version = None
+                if self._instance_pool is not None:
+                    instance_state = "not_registered"
+                    if bound_instance_id is not None:
+                        instance = next(
+                            (
+                                item
+                                for item in self._instance_pool.instances_snapshot()
+                                if item.instance_id == bound_instance_id
+                            ),
+                            None,
+                        )
+                        if instance is not None:
+                            instance_state = instance.state.value
+                            loaded_version = instance.loaded_version
+                logger.error(
+                    "Rollout timed out task_id=%s phase=%s instance_id=%s "
+                    "worker_id=%s instance_state=%s loaded_version=%s "
+                    "enqueued_version=%s current_version=%s elapsed_seconds=%.2f "
+                    "queue_age_seconds=%.2f configured_timeout_seconds=%.1f error=%r",
+                    task_id,
+                    timeout_phase,
+                    bound_instance_id or (target.instance_id if target else None),
+                    target.worker_id if target else None,
+                    instance_state,
+                    loaded_version,
+                    pending_task.enqueued_version,
+                    self.get_version(),
+                    now - dispatch_started_at,
+                    now - pending_task.enqueued_at,
+                    self.config.request_timeout,
+                    exc,
+                )
                 return None
             except Exception as exc:
                 if task_id is not None:
@@ -1658,6 +1702,7 @@ class RolloutController:
             is_eval=is_eval,
             group_size=group_size,
             proxy_addr=proxy_addr,
+            enqueued_version=self.get_version(),
         )
 
         # Delegate to dispatcher
@@ -1733,6 +1778,7 @@ class RolloutController:
                         should_accept_fn=should_accept_fn,
                         task_id=self._task_id_generator.next(),
                         group_size=group_size,
+                        enqueued_version=self.get_version(),
                     )
 
         if not hasattr(self, "data_generator"):

@@ -21,6 +21,7 @@ from areal.api.cli_args import (
     SGLangConfig,
 )
 from areal.infra import RolloutController
+from areal.infra.controller import rollout_controller as rollout_controller_module
 from areal.infra.controller.elastic import (
     DiskCheckpointCatalogError,
     ElasticRecoveryStore,
@@ -1609,6 +1610,59 @@ def test_elastic_proxy_collective_rpc_uses_instance_proxy_target():
         version=4,
     )
     assert instance.direct_inflight == 0
+
+
+def test_elastic_rollout_timeout_logs_bound_instance_context(monkeypatch):
+    config = create_test_config(
+        backend="vllm:d1",
+        request_timeout=0.01,
+        elastic=ElasticRolloutConfig(enabled=True, max_instances=2),
+    )
+    scheduler = MockScheduler()
+    scheduler.async_call_engine = AsyncMock(return_value=17)
+    controller = RolloutController(
+        inf_engine=MockInferenceEngine,
+        config=config,
+        scheduler=scheduler,
+    )
+    instance = controller._instance_pool.create(
+        instance_id="ri-timeout",
+        worker_role="rollout-elastic-ri-timeout",
+        worker_id="rollout-elastic-ri-timeout/0",
+        engine_name="rollout/ri-timeout",
+    )
+    instance.loaded_version = 9
+    instance.transition_to(RolloutInstanceState.STARTING)
+    instance.transition_to(RolloutInstanceState.READY)
+    controller._version = 12
+    controller._callback_host = "127.0.0.1"
+    controller._callback_port = 18080
+    controller._staleness_manager = Mock()
+    error_log = Mock()
+    monkeypatch.setattr(rollout_controller_module.logger, "error", error_log)
+    pending_task = rollout_controller_module._RemoteRolloutTaskInput(
+        task_id=17,
+        data={},
+        workflow="tests.fake.Workflow",
+        workflow_kwargs={},
+        should_accept_fn=None,
+        enqueued_version=8,
+    )
+
+    result = asyncio.run(controller._create_submit_callback(pending_task)())
+
+    assert result is None
+    message = error_log.call_args.args[0] % error_log.call_args.args[1:]
+    assert "task_id=17" in message
+    assert "phase=wait_callback" in message
+    assert "instance_id=ri-timeout" in message
+    assert "worker_id=rollout-elastic-ri-timeout/0" in message
+    assert "instance_state=ready" in message
+    assert "loaded_version=9" in message
+    assert "enqueued_version=8 current_version=12" in message
+    assert "elapsed_seconds=" in message
+    assert "queue_age_seconds=" in message
+    assert instance.workflow_task_ids == set()
 
 
 if __name__ == "__main__":

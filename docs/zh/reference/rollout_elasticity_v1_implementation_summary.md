@@ -22,6 +22,7 @@
 - 每个实例使用独立 Scheduler role、稳定 instance ID 和稳定 engine name；
 - offline AgentWorkflow 为每个实例创建独立的 V1 ProxyRolloutServer；
 - 新实例完成启动、健康检查及 disk 权重追平后才进入 `READY`；
+- 推理引擎、server 和 proxy 初始化默认最多并发 2 个，启动超时按实例独立计时；
 - 推理任务只路由到 `READY` 实例；
 - 训练 step 使用 disk 模式更新全部 `READY` 实例；
 - 缩容前停止接收新任务，等待任务、直接请求和权重更新租约排空；

@@ -127,6 +127,18 @@ class _HangingStartLauncher(_FakeLauncher):
         await asyncio.Event().wait()
 
 
+class _FirstStartHangsLauncher(_FakeLauncher):
+    def __init__(self):
+        super().__init__()
+        self.start_attempts = 0
+
+    async def start(self, *, instance, **kwargs):
+        self.start_attempts += 1
+        if self.start_attempts == 1:
+            await asyncio.Event().wait()
+        return await super().start(instance=instance, **kwargs)
+
+
 @pytest.mark.asyncio
 async def test_reconciler_launches_each_instance_in_its_own_role(tmp_path):
     pool = RolloutInstancePool(min_instances=1, initial_instances=2, max_instances=2)
@@ -194,9 +206,9 @@ async def test_reconciler_registers_pending_instance_before_launch_completes():
 
 
 @pytest.mark.asyncio
-async def test_reconciler_starts_in_parallel_and_uses_one_checkpoint(tmp_path):
+async def test_reconciler_bounds_parallel_startup_and_uses_one_checkpoint(tmp_path):
     pool = RolloutInstancePool(min_instances=1, initial_instances=3, max_instances=3)
-    launcher = _ParallelLauncher(expected_starts=3)
+    launcher = _ParallelLauncher(expected_starts=2)
     checkpoint_dir = tmp_path / "weight_update_v7"
     checkpoint_dir.mkdir()
     checkpoint_reads = 0
@@ -215,6 +227,7 @@ async def test_reconciler_starts_in_parallel_and_uses_one_checkpoint(tmp_path):
         latest_checkpoint=latest_checkpoint,
         current_version=lambda: 0,
         startup_timeout_seconds=1,
+        startup_concurrency=2,
         catch_up_concurrency=2,
         begin_catch_up=lambda: catch_up_guards.append("begin"),
         end_catch_up=lambda: catch_up_guards.append("end"),
@@ -224,7 +237,7 @@ async def test_reconciler_starts_in_parallel_and_uses_one_checkpoint(tmp_path):
 
     assert len(result.created_instance_ids) == 3
     assert result.failed_instance_ids == ()
-    assert launcher.max_active_starts == 3
+    assert launcher.max_active_starts == 2
     assert launcher.max_active_catchups == 2
     assert checkpoint_reads == 1
     assert {version for _, version in launcher.caught_up} == {7}
@@ -232,7 +245,7 @@ async def test_reconciler_starts_in_parallel_and_uses_one_checkpoint(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_reconciler_cancels_startup_batch_at_shared_deadline():
+async def test_reconciler_times_out_each_started_instance():
     pool = RolloutInstancePool(min_instances=1, initial_instances=1, max_instances=1)
     launcher = _HangingStartLauncher()
     catch_up_guards = []
@@ -255,6 +268,30 @@ async def test_reconciler_cancels_startup_batch_at_shared_deadline():
     assert pool.instance_ids() == ()
     assert len(launcher.destroyed) == 1
     assert catch_up_guards == []
+
+
+@pytest.mark.asyncio
+async def test_reconciler_does_not_charge_queued_time_to_startup_timeout():
+    pool = RolloutInstancePool(min_instances=1, initial_instances=2, max_instances=2)
+    launcher = _FirstStartHangsLauncher()
+    reconciler = RolloutInstanceReconciler(
+        pool=pool,
+        launcher=launcher,
+        role_prefix="rollout-elastic",
+        server_args={},
+        latest_checkpoint=lambda: None,
+        current_version=lambda: 0,
+        startup_timeout_seconds=0.01,
+        startup_concurrency=1,
+    )
+
+    result = await reconciler.reconcile_once()
+
+    assert len(result.failed_instance_ids) == 1
+    assert len(result.created_instance_ids) == 1
+    assert len(pool.instance_ids()) == 1
+    remaining = pool.get(pool.instance_ids()[0])
+    assert remaining.state is RolloutInstanceState.READY
 
 
 @pytest.mark.asyncio

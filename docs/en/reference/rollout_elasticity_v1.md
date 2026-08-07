@@ -40,6 +40,11 @@ Controller capacity is recalculated as:
 READY instances × max_concurrent_rollouts
 ```
 
+`startup_concurrency` defaults to `2` and limits concurrent inference-engine, server,
+and proxy initialization. `startup_timeout_seconds` is applied independently after an
+instance acquires a startup slot; time spent queued behind the concurrency limit does
+not consume its startup timeout.
+
 ## HTTP control and status
 
 The V1 callback server exposes:

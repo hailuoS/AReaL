@@ -2329,8 +2329,17 @@ class ElasticRolloutConfig:
         default=300.0,
         metadata={
             "help": (
-                "Shared deadline for parallel elastic engine/server startup after "
+                "Per-instance deadline for elastic engine/server startup after "
                 "Scheduler worker provisioning, in seconds."
+            )
+        },
+    )
+    startup_concurrency: int = field(
+        default=2,
+        metadata={
+            "help": (
+                "Maximum number of provisioned elastic instances that may initialize "
+                "their inference engine, server, and proxy concurrently."
             )
         },
     )
@@ -2387,6 +2396,8 @@ class ElasticRolloutConfig:
             raise ValueError("elastic.drain_timeout_seconds must be non-negative")
         if self.startup_timeout_seconds <= 0:
             raise ValueError("elastic.startup_timeout_seconds must be positive")
+        if self.startup_concurrency <= 0:
+            raise ValueError("elastic.startup_concurrency must be positive")
         if self.catch_up_concurrency <= 0:
             raise ValueError("elastic.catch_up_concurrency must be positive")
         if self.checkpoint_retention < 2:
