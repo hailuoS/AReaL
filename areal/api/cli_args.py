@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import re
 import warnings
 from dataclasses import MISSING as dataclass_missing
 from dataclasses import asdict, dataclass, field, fields
@@ -2284,6 +2285,132 @@ class AgentConfig:
 
 
 @dataclass
+class ElasticRolloutConfig:
+    """Opt-in contract for RolloutController V1 elasticity.
+
+    The default keeps the existing static rollout lifecycle unchanged.  When
+    enabled, the implementation supports only disk-based weight synchronization;
+    the controller enforces that training contract when it wires elasticity in.
+    """
+
+    enabled: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable the opt-in RolloutController V1 elasticity lifecycle."
+        },
+    )
+    min_instances: int = field(
+        default=1,
+        metadata={"help": "Minimum number of complete TP × PP rollout instances."},
+    )
+    initial_instances: int = field(
+        default=1,
+        metadata={"help": "Initial number of complete TP × PP rollout instances."},
+    )
+    max_instances: int = field(
+        default=1,
+        metadata={"help": "Maximum number of complete TP × PP rollout instances."},
+    )
+    role_prefix: str = field(
+        default="rollout-elastic",
+        metadata={
+            "help": "Scheduler role prefix for elastic instances; not an instance identity."
+        },
+    )
+    reconcile_interval_seconds: float = field(
+        default=5.0,
+        metadata={"help": "Desired-state reconciliation interval in seconds."},
+    )
+    drain_timeout_seconds: float = field(
+        default=300.0,
+        metadata={"help": "Maximum time to wait for an instance drain in seconds."},
+    )
+    startup_timeout_seconds: float = field(
+        default=300.0,
+        metadata={
+            "help": (
+                "Per-instance deadline for elastic engine/server startup after "
+                "Scheduler worker provisioning, in seconds."
+            )
+        },
+    )
+    startup_concurrency: int = field(
+        default=2,
+        metadata={
+            "help": (
+                "Maximum number of provisioned elastic instances that may initialize "
+                "their inference engine, server, and proxy concurrently."
+            )
+        },
+    )
+    catch_up_concurrency: int = field(
+        default=4,
+        metadata={
+            "help": (
+                "Maximum number of new elastic instances that may load the shared "
+                "checkpoint concurrently."
+            )
+        },
+    )
+    checkpoint_retention: int = field(
+        default=3,
+        metadata={
+            "help": "Minimum retained committed disk checkpoint versions in elastic mode."
+        },
+    )
+    recovery_schema_version: int = field(
+        default=1,
+        metadata={"help": "Persisted elastic controller state schema version."},
+    )
+    report_freq_steps: int = field(
+        default=10,
+        metadata={
+            "help": (
+                "Generate an AstraFlow-inspired scaling report every N "
+                "training versions. Set to 0 to disable automatic reports."
+            )
+        },
+    )
+
+    def __post_init__(self):
+        if self.min_instances < 1:
+            raise ValueError("elastic.min_instances must be at least 1")
+        if self.initial_instances < self.min_instances:
+            raise ValueError(
+                "elastic.initial_instances must be greater than or equal to "
+                "elastic.min_instances"
+            )
+        if self.max_instances < self.initial_instances:
+            raise ValueError(
+                "elastic.max_instances must be greater than or equal to "
+                "elastic.initial_instances"
+            )
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", self.role_prefix):
+            raise ValueError(
+                "elastic.role_prefix must contain only lowercase letters, digits, "
+                "and hyphens, and must start with a letter or digit"
+            )
+        if self.reconcile_interval_seconds <= 0:
+            raise ValueError("elastic.reconcile_interval_seconds must be positive")
+        if self.drain_timeout_seconds < 0:
+            raise ValueError("elastic.drain_timeout_seconds must be non-negative")
+        if self.startup_timeout_seconds <= 0:
+            raise ValueError("elastic.startup_timeout_seconds must be positive")
+        if self.startup_concurrency <= 0:
+            raise ValueError("elastic.startup_concurrency must be positive")
+        if self.catch_up_concurrency <= 0:
+            raise ValueError("elastic.catch_up_concurrency must be positive")
+        if self.checkpoint_retention < 2:
+            raise ValueError(
+                "elastic.checkpoint_retention must be at least 2 for disk catch-up"
+            )
+        if self.recovery_schema_version != 1:
+            raise ValueError("elastic.recovery_schema_version must be 1")
+        if self.report_freq_steps < 0:
+            raise ValueError("elastic.report_freq_steps must be non-negative")
+
+
+@dataclass
 class InferenceEngineConfig:
     """Configuration for inference servers, including offpolicyness control."""
 
@@ -2411,6 +2538,14 @@ class InferenceEngineConfig:
         default=False,
         metadata={
             "help": "Return routed expert indices for MoE models. Effective only when using SGLang engine with MoE models."
+        },
+    )
+
+    elastic: ElasticRolloutConfig = field(
+        default_factory=ElasticRolloutConfig,
+        metadata={
+            "help": "Opt-in RolloutController V1 elasticity configuration. "
+            "Disabled by default to preserve static behavior."
         },
     )
 
