@@ -1,5 +1,5 @@
 import asyncio
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import requests
@@ -14,12 +14,19 @@ from areal.api import (
     Worker,
 )
 from areal.api.cli_args import (
+    ElasticRolloutConfig,
     GenerationHyperparameters,
     InferenceEngineConfig,
     SchedulingSpec,
     SGLangConfig,
 )
 from areal.infra import RolloutController
+from areal.infra.controller.elastic import (
+    DiskCheckpointCatalogError,
+    ElasticRecoveryStore,
+    RolloutInstanceState,
+    RolloutRPCTarget,
+)
 from areal.infra.scheduler.local import LocalScheduler
 from areal.utils.hf_utils import load_hf_tokenizer
 
@@ -1337,6 +1344,64 @@ class TestRolloutControllerQueueSize:
 class TestRolloutControllerCollectiveRPC:
     """Tests for collective RPC methods."""
 
+    def test_build_rollout_job_preserves_static_worker_resources(self):
+        """The extracted job builder keeps the original DP worker layout."""
+        config = create_test_config(backend="sglang:d2", consumer_batch_size=16)
+        scheduler = MockScheduler()
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=config,
+            scheduler=scheduler,
+        )
+
+        job = controller._build_rollout_job("rollout")
+
+        assert job.role == "rollout"
+        assert job.replicas == 2
+        assert len(job.tasks) == 2
+        assert job.tasks[0].gpu == 1
+
+    def test_rollout_target_snapshot_preserves_static_engine_names(self):
+        """Static targets retain existing role/rank names for every worker."""
+        config = create_test_config(backend="sglang:d2", consumer_batch_size=16)
+        scheduler = MockScheduler()
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=config,
+            scheduler=scheduler,
+        )
+        controller.initialize(role="rollout", server_args={})
+
+        targets = controller._rollout_rpc_targets()
+
+        assert [target.worker_id for target in targets] == ["rollout/0", "rollout/1"]
+        assert [target.engine_name for target in targets] == ["rollout/0", "rollout/1"]
+        controller.destroy()
+
+    def test_collective_rpc_uses_snapshot_after_worker_list_changes(self):
+        """A collective RPC dispatches to targets captured at invocation time."""
+        config = create_test_config(backend="sglang:d2", consumer_batch_size=16)
+        scheduler = MockScheduler()
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=config,
+            scheduler=scheduler,
+        )
+        controller.initialize(role="rollout", server_args={})
+        targets = controller._rollout_rpc_targets()
+        workers = controller.workers
+        scheduler.engine_calls = []
+        controller.workers = []
+
+        asyncio.run(controller._collective_rpc_on_targets_async("snapshot", targets))
+
+        snapshot_calls = [
+            call for call in scheduler.engine_calls if call[1] == "snapshot"
+        ]
+        assert [call[0] for call in snapshot_calls] == ["rollout/0", "rollout/1"]
+        controller.workers = workers
+        controller.destroy()
+
     def test_collective_rpc_calls_all_workers(self):
         """Test _collective_rpc calls all workers."""
         config = create_test_config(backend="sglang:d3", consumer_batch_size=16)
@@ -1361,6 +1426,189 @@ class TestRolloutControllerCollectiveRPC:
         assert len(test_calls) == 3
 
         controller.destroy()
+
+
+class TestElasticDiskCheckpointCatalog:
+    def _controller(self, tmp_path):
+        config = create_test_config(
+            elastic=ElasticRolloutConfig(enabled=True, max_instances=2)
+        )
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=config,
+            scheduler=MockScheduler(),
+        )
+        instance = controller._instance_pool.create(
+            instance_id="ri-ready",
+            worker_role="rollout-elastic-ri-ready",
+            worker_id="rollout-elastic-ri-ready/0",
+            engine_name="rollout/ri-ready",
+        )
+        instance.transition_to(RolloutInstanceState.STARTING)
+        instance.transition_to(RolloutInstanceState.READY)
+        controller._collective_rpc_on_targets_async = AsyncMock()
+        return controller, instance
+
+    def test_recovery_state_is_namespaced_by_experiment_and_trial(self, tmp_path):
+        config = create_test_config(
+            experiment_name="experiment-a",
+            trial_name="trial-b",
+            fileroot=str(tmp_path),
+            elastic=ElasticRolloutConfig(enabled=True, max_instances=2),
+        )
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=config,
+            scheduler=MockScheduler(),
+        )
+
+        assert controller._elastic_recovery_path("rollout") == (
+            tmp_path
+            / "experiment-a"
+            / "trial-b"
+            / "elastic_rollout_recovery_rollout.json"
+        )
+
+    def test_recovery_state_tracks_instance_proxy_role(self, tmp_path):
+        controller, instance = self._controller(tmp_path)
+        instance.attach_proxy(
+            role="proxy-rollout-elastic-ri-ready",
+            worker_id="proxy-rollout-elastic-ri-ready/0",
+            engine_name="proxy/ri-ready",
+            addr="http://127.0.0.1:31000",
+        )
+        recovery_path = tmp_path / "elastic-recovery.json"
+        controller._elastic_recovery_store = ElasticRecoveryStore(recovery_path)
+
+        controller._save_elastic_recovery_state()
+
+        recovered = controller._elastic_recovery_store.load()
+        assert recovered is not None
+        assert set(recovered.worker_roles) == {
+            "rollout-elastic-ri-ready",
+            "proxy-rollout-elastic-ri-ready",
+        }
+
+    def test_elastic_disk_update_keeps_and_records_loaded_checkpoint(self, tmp_path):
+        controller, instance = self._controller(tmp_path)
+        checkpoint = tmp_path / "weight_update_v7"
+        checkpoint.mkdir()
+        meta = WeightUpdateMeta(type="disk", path=str(checkpoint), version=7)
+
+        asyncio.run(controller.update_weights_from_disk(meta))
+
+        assert checkpoint.is_dir()
+        assert controller._disk_checkpoint_catalog is not None
+        assert controller._disk_checkpoint_catalog.latest().version == 7
+        assert instance.loaded_version == 7
+        targets = (instance.rpc_target,)
+        controller._collective_rpc_on_targets_async.assert_awaited_once_with(
+            "update_weights_from_disk", targets, meta=meta
+        )
+        assert controller._elastic_pending_update_version == 7
+
+        controller._collective_rpc_on_targets_async.reset_mock()
+        with pytest.raises(RuntimeError, match="does not match pending disk"):
+            controller.set_version(6)
+        assert controller.get_version() == 0
+        assert controller._elastic_pending_update_version == 7
+        controller._collective_rpc_on_targets_async.assert_not_awaited()
+
+        controller.set_version(7)
+
+        assert controller.get_version() == 7
+        assert controller._elastic_pending_update_version is None
+        controller._collective_rpc_on_targets_async.assert_awaited_once_with(
+            "set_version", targets, version=7, http_timeout=60.0
+        )
+
+    def test_elastic_disk_update_requires_a_versioned_checkpoint(self, tmp_path):
+        controller, _ = self._controller(tmp_path)
+        checkpoint = tmp_path / "weight_update"
+        checkpoint.mkdir()
+        meta = WeightUpdateMeta(type="disk", path=str(checkpoint))
+
+        with pytest.raises(
+            DiskCheckpointCatalogError, match="require a checkpoint version"
+        ):
+            asyncio.run(controller.update_weights_from_disk(meta))
+
+
+def test_elastic_proxy_routing_uses_selected_instance_proxy():
+    config = create_test_config(
+        elastic=ElasticRolloutConfig(enabled=True, max_instances=2)
+    )
+    controller = RolloutController(
+        inf_engine=MockInferenceEngine,
+        config=config,
+        scheduler=MockScheduler(),
+    )
+    instance = controller._instance_pool.create(
+        instance_id="ri-ready",
+        worker_role="rollout-elastic-ri-ready",
+        worker_id="rollout-elastic-ri-ready/0",
+        engine_name="rollout/ri-ready",
+    )
+    instance.attach_proxy(
+        role="proxy-rollout-elastic-ri-ready",
+        worker_id="proxy-rollout-elastic-ri-ready/0",
+        engine_name="proxy/ri-ready",
+        addr="http://127.0.0.1:31000",
+    )
+    controller._proxy_started = True
+
+    assert (
+        controller._proxy_addr_for_target(instance.rpc_target, None)
+        == "http://127.0.0.1:31000"
+    )
+    assert (
+        controller._proxy_addr_for_target(instance.rpc_target, "http://explicit:32000")
+        == "http://explicit:32000"
+    )
+    with pytest.raises(NotImplementedError, match="Proxy Gateway online"):
+        controller.start_proxy_gateway()
+
+
+def test_elastic_proxy_collective_rpc_uses_instance_proxy_target():
+    config = create_test_config(
+        elastic=ElasticRolloutConfig(enabled=True, max_instances=2)
+    )
+    controller = RolloutController(
+        inf_engine=MockInferenceEngine,
+        config=config,
+        scheduler=MockScheduler(),
+    )
+    instance = controller._instance_pool.create(
+        instance_id="ri-ready",
+        worker_role="rollout-elastic-ri-ready",
+        worker_id="rollout-elastic-ri-ready/0",
+        engine_name="rollout/ri-ready",
+    )
+    instance.attach_proxy(
+        role="proxy-rollout-elastic-ri-ready",
+        worker_id="proxy-rollout-elastic-ri-ready/0",
+        engine_name="proxy/ri-ready",
+        addr="http://127.0.0.1:31000",
+    )
+    instance.transition_to(RolloutInstanceState.STARTING)
+    instance.transition_to(RolloutInstanceState.READY)
+    controller._collective_rpc_on_targets_async = AsyncMock(return_value=[])
+
+    asyncio.run(controller._proxy_collective_rpc_async("set_version", version=4))
+
+    controller._collective_rpc_on_targets_async.assert_awaited_once_with(
+        "set_version",
+        (
+            RolloutRPCTarget(
+                instance_id="ri-ready",
+                worker_id="proxy-rollout-elastic-ri-ready/0",
+                engine_name="proxy/ri-ready",
+                proxy_addr="http://127.0.0.1:31000",
+            ),
+        ),
+        version=4,
+    )
+    assert instance.direct_inflight == 0
 
 
 if __name__ == "__main__":

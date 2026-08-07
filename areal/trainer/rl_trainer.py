@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import functools
 import os
+import time
 from collections.abc import Callable
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, cast
@@ -76,6 +76,26 @@ if TYPE_CHECKING:
 logger = logging.getLogger("RLTrainer")
 
 
+def _validate_elastic_rollout_contract(config: PPOConfig) -> None:
+    if not config.rollout.elastic.enabled:
+        return
+    if not is_single_controller():
+        raise ValueError("rollout.elastic.enabled requires single-controller mode")
+    if config.rollout._version != "v1":
+        raise ValueError(
+            "rollout.elastic.enabled is supported only by RolloutController V1"
+        )
+    if config.actor.weight_update_mode != "disk":
+        raise ValueError(
+            "rollout.elastic.enabled requires actor.weight_update_mode=disk"
+        )
+    agent = config.rollout.agent
+    if agent is not None and agent.mode == "online":
+        raise ValueError(
+            "rollout.elastic.enabled does not yet support Proxy online mode"
+        )
+
+
 class _EmptyDataLoader:
     """Minimal dataloader for online mode that yields empty dicts.
 
@@ -116,6 +136,7 @@ class PPOTrainer:
             logging.setup_file_logging(StatsLogger.get_log_path(config.stats_logger))
 
         self.config = config
+        _validate_elastic_rollout_contract(config)
         self._awex_runtime = prepare_awex_runtime(config)
         self.processor, self.tokenizer = load_hf_processor_and_tokenizer(
             config.tokenizer_path
@@ -312,9 +333,14 @@ class PPOTrainer:
         )
 
         self.eval_rollout = None
-        if not self._online_mode:
+        if not self._online_mode and not config.rollout.elastic.enabled:
             self.eval_rollout = self._init_rollout(
                 config.rollout, is_eval=True, lora_path=initial_lora_path
+            )
+        elif config.rollout.elastic.enabled and not self._online_mode:
+            logger.warning(
+                "Elastic RolloutController V1 does not yet support the shared "
+                "eval-rollout worker. Validation rollout is disabled for this run."
             )
         if (
             self.config.teacher is not None
@@ -645,6 +671,16 @@ class PPOTrainer:
 
             if self._should_offload_rollout:
                 self._onload_rollout()
+            elastic_scaling_observation: dict[str, int | float] | None = None
+            elastic_accepted_before: int | None = None
+            if (
+                isinstance(self.rollout, RolloutController)
+                and self.rollout.config.elastic.enabled
+            ):
+                elastic_accepted_before = (
+                    self.rollout.staleness_manager.get_stats().accepted
+                )
+            rollout_started_at = time.monotonic()
             with (
                 stats_tracker.record_timing("rollout"),
                 perf_tracer.trace_scope(
@@ -664,6 +700,27 @@ class PPOTrainer:
                     group_size=config.gconfig.n_samples,
                     dynamic_bs=self.config.dynamic_bs,
                 )
+            rollout_completed_at = time.monotonic()
+            if (
+                isinstance(self.rollout, RolloutController)
+                and self.rollout.config.elastic.enabled
+            ):
+                assert elastic_accepted_before is not None
+                accepted = self.rollout.staleness_manager.get_stats().accepted
+                previous_rollout_completed = getattr(
+                    self, "_elastic_previous_rollout_completed", None
+                )
+                elastic_scaling_observation = {
+                    "entered": max(0, accepted - elastic_accepted_before),
+                    "consumed": len(rollout_batch),
+                    "wait_seconds": rollout_completed_at - rollout_started_at,
+                    "step_seconds": (
+                        0.0
+                        if previous_rollout_completed is None
+                        else rollout_completed_at - previous_rollout_completed
+                    ),
+                }
+                self._elastic_previous_rollout_completed = rollout_completed_at
             if self._should_offload_rollout:
                 self._offload_rollout()
 
@@ -828,6 +885,14 @@ class PPOTrainer:
                 if self.critic is not None:
                     self.critic.set_version(new_version)
                 self.rollout.set_version(new_version)
+                if elastic_scaling_observation is not None:
+                    self.rollout.record_elastic_scaling_window(
+                        report_version=new_version,
+                        entered=int(elastic_scaling_observation["entered"]),
+                        consumed=int(elastic_scaling_observation["consumed"]),
+                        wait_seconds=float(elastic_scaling_observation["wait_seconds"]),
+                        step_seconds=float(elastic_scaling_observation["step_seconds"]),
+                    )
                 if self.eval_rollout is not None:
                     self.eval_rollout.set_version(new_version)
 
@@ -867,13 +932,22 @@ class PPOTrainer:
                     args={"global_step": global_step},
                 ),
             ):
-                self._evaluate(
+                evaluation_ran = self._evaluate(
                     eval_workflow=eval_workflow,
                     eval_workflow_kwargs=eval_workflow_kwargs,
                     epoch=epoch,
                     epoch_step=step,
                     global_step=global_step,
                 )
+                if (
+                    evaluation_ran
+                    and isinstance(self.rollout, RolloutController)
+                    and self.rollout.config.elastic.enabled
+                ):
+                    # Match AstraFlow: do not pair the next batch completion
+                    # with a pre-eval completion because that step time would
+                    # incorrectly include the evaluation gap.
+                    self._elastic_previous_rollout_completed = None
             if self._should_offload_rollout:
                 self._offload_rollout(is_eval=True)
 
@@ -908,6 +982,11 @@ class PPOTrainer:
                         self.critic.clear_all_local_rtensors()
                     if self.ref is not None:
                         self.ref.clear_all_local_rtensors()
+                    if (
+                        isinstance(self.rollout, RolloutController)
+                        and self.rollout.config.elastic.enabled
+                    ):
+                        self.rollout.release_batch(rollout_batch)
 
             with perf_tracer.trace_scope(
                 "train.log_stats",
@@ -1309,19 +1388,25 @@ class PPOTrainer:
         epoch: int,
         epoch_step: int,
         global_step: int,
-    ):
+    ) -> bool:
         if (
             self.eval_rollout is None
             or self.valid_dataloader is None
             or eval_workflow is None
         ):
-            return
-        self.evaluator.evaluate(
-            functools.partial(
-                self._evaluate_fn,
+            return False
+        evaluation_ran = False
+
+        def evaluate_once() -> None:
+            nonlocal evaluation_ran
+            evaluation_ran = True
+            self._evaluate_fn(
                 eval_workflow=eval_workflow,
                 eval_workflow_kwargs=eval_workflow_kwargs,
-            ),
+            )
+
+        self.evaluator.evaluate(
+            evaluate_once,
             epoch,
             epoch_step,
             global_step,
@@ -1329,6 +1414,7 @@ class PPOTrainer:
         if not is_single_controller():
             dist.barrier(group=self.actor.cpu_group)
             current_platform.synchronize()
+        return evaluation_ran
 
     def _export_and_commit_stats(self, epoch: int, epoch_step: int, global_step: int):
         # Upload statistics to the logger (e.g., wandb)
@@ -1370,6 +1456,8 @@ class PPOTrainer:
                 "weight_update_mode must be 'disk' when colocation scheduling is enabled. "
                 "Please set actor.weight_update_mode=disk."
             )
+
+        _validate_elastic_rollout_contract(self.config)
 
         if rollout_backend == "vllm" and self.config.rollout.return_routed_experts:
             raise ValueError(

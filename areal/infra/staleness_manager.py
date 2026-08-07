@@ -76,6 +76,13 @@ class StalenessManager:
         """
         return (self.max_staleness + 1) * self.consumer_batch_size
 
+    def set_max_concurrent_rollouts(self, max_concurrent_rollouts: int) -> None:
+        """Atomically update the concurrency limit without resetting statistics."""
+        if max_concurrent_rollouts < 1:
+            raise ValueError("max_concurrent_rollouts must be at least 1")
+        with self.lock:
+            self.max_concurrent_rollouts = max_concurrent_rollouts
+
     def get_capacity(self) -> int:
         """Calculate available capacity for new rollouts.
 
