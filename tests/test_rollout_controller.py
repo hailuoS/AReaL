@@ -1570,6 +1570,52 @@ def test_elastic_proxy_routing_uses_selected_instance_proxy():
         controller.start_proxy_gateway()
 
 
+def test_elastic_capacity_is_bounded_and_wakes_dispatcher():
+    config = create_test_config(
+        max_concurrent_rollouts=256,
+        elastic=ElasticRolloutConfig(
+            enabled=True,
+            max_instances=4,
+            max_concurrent_rollouts_per_instance=64,
+            max_total_concurrent_rollouts=192,
+        ),
+    )
+    controller = RolloutController(
+        inf_engine=MockInferenceEngine,
+        config=config,
+        scheduler=MockScheduler(),
+    )
+    for instance_id in ("ri-first", "ri-second"):
+        instance = controller._instance_pool.create(
+            instance_id=instance_id,
+            worker_role=f"rollout-elastic-{instance_id}",
+            worker_id=f"rollout-elastic-{instance_id}/0",
+            engine_name=f"rollout/{instance_id}",
+        )
+        instance.transition_to(RolloutInstanceState.STARTING)
+        instance.transition_to(RolloutInstanceState.READY)
+
+    controller._elastic_capacity_per_instance = 64
+    controller._elastic_total_capacity_limit = 192
+    controller._staleness_manager = Mock()
+    controller._dispatcher = Mock()
+
+    controller._refresh_elastic_capacity()
+
+    controller._staleness_manager.set_max_concurrent_rollouts.assert_called_once_with(
+        128
+    )
+    controller._dispatcher.notify_capacity_changed.assert_called_once_with()
+
+    for target in controller._instance_pool.ready_snapshot():
+        controller._instance_pool.request_drain(target.instance_id)
+    controller._refresh_elastic_capacity()
+
+    assert controller._staleness_manager.set_max_concurrent_rollouts.call_args.args == (
+        0,
+    )
+
+
 def test_elastic_proxy_collective_rpc_uses_instance_proxy_target():
     config = create_test_config(
         elastic=ElasticRolloutConfig(enabled=True, max_instances=2)

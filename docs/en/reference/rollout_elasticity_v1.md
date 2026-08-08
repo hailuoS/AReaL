@@ -33,12 +33,27 @@ The instance bounds must satisfy:
 1 <= min_instances <= initial_instances <= max_instances
 ```
 
-`max_concurrent_rollouts` is the capacity of one complete instance in elastic mode.
-Controller capacity is recalculated as:
+Elastic mode preserves AReaL's original global `max_concurrent_rollouts` semantics by
+default. `max_concurrent_rollouts_per_instance` adds a hard per-instance ceiling, and
+`max_total_concurrent_rollouts` can explicitly raise the elastic global ceiling. The
+effective capacity is:
 
 ```text
-READY instances × max_concurrent_rollouts
+min(
+    max_total_concurrent_rollouts,
+    READY instances × max_concurrent_rollouts_per_instance,
+)
 ```
+
+Both elastic limits fall back to `max_concurrent_rollouts` when omitted. Scale-out
+therefore redistributes the original global concurrency by default instead of silently
+multiplying it by the instance count. Set a larger `max_total_concurrent_rollouts`
+explicitly when scale-out should increase the total number of in-flight workflows.
+
+Under the InstancePool lock, the Controller selects the least-loaded `READY` instance
+that still has a per-instance slot and accounts for the reservation immediately. A new
+instance preferentially receives subsequent requests until loads converge; existing
+bindings are not migrated. Round-robin breaks equal-load ties.
 
 `startup_concurrency` defaults to `2` and limits concurrent inference-engine, server,
 and proxy initialization. `startup_timeout_seconds` is applied independently after an
@@ -59,7 +74,9 @@ POST /elastic/scaling-recommendation
 
 `GET /elastic/instances` reports both `serving_version` and
 `pending_update_version`, plus each instance's `loaded_version`, `proxy_role`,
-`proxy_addr`, and `proxy_ready`. The top-level `proxy_enabled` field distinguishes an
+`proxy_addr`, `proxy_ready`, `inflight_requests`, and
+`available_request_capacity`. Top-level fields report the effective global limit, the
+per-instance limit, and the elastic total ceiling. The `proxy_enabled` field distinguishes an
 AgentWorkflow controller from a RolloutWorkflow controller that needs no proxy.
 
 Set desired capacity with:

@@ -29,12 +29,24 @@ validation rollout 会跳过并输出 warning。
 1 <= min_instances <= initial_instances <= max_instances
 ```
 
-弹性模式下，`max_concurrent_rollouts` 表示单个完整实例的容量。Controller
-总容量动态计算为：
+弹性模式默认保留 AReaL 原有的全局 `max_concurrent_rollouts` 语义。可通过
+`max_concurrent_rollouts_per_instance` 设置单实例硬上限，并通过
+`max_total_concurrent_rollouts` 显式提高弹性模式的全局上限。有效容量为：
 
 ```text
-READY 实例数 × max_concurrent_rollouts
+min(
+    max_total_concurrent_rollouts,
+    READY 实例数 × max_concurrent_rollouts_per_instance,
+)
 ```
+
+两个弹性参数未配置时都回退到 `max_concurrent_rollouts`；因此扩容默认只重新分摊
+原有全局并发，不会隐式把它乘以实例数。希望扩容提高总在途量时，必须显式配置更大
+的 `max_total_concurrent_rollouts`。
+
+Controller 在同一个 InstancePool 锁内选择 Controller 可见在途请求最少、且尚未达到
+单实例上限的 `READY` 实例并立即记账。新实例加入后会优先承接后续请求，已绑定到老
+实例的请求不会迁移。相同负载使用轮询打破平局。
 
 `startup_concurrency` 默认值为 `2`，用于限制同时初始化推理引擎、server 和 proxy
 的实例数。实例获得启动并发槽位后才单独开始计算 `startup_timeout_seconds`，排队
@@ -68,7 +80,9 @@ Scheduler role。新实例完成 server 初始化并加载准确的已提交 dis
 
 `GET /elastic/instances` 会返回 `serving_version`、
 `pending_update_version` 以及每个实例的 `loaded_version`、`proxy_role`、
-`proxy_addr` 和 `proxy_ready`。顶层 `proxy_enabled` 用于区分需要 Proxy 的
+`proxy_addr`、`proxy_ready`、`inflight_requests` 和
+`available_request_capacity`。顶层返回有效全局并发、单实例上限和弹性总上限；
+`proxy_enabled` 用于区分需要 Proxy 的
 AgentWorkflow Controller 和不需要 Proxy 的 RolloutWorkflow Controller。
 
 缩容时实例先进入 `DRAINING`，不再接收新请求；只有 workflow task、direct

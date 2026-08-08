@@ -41,6 +41,7 @@ class RolloutInstancePool:
         self._desired_count = initial_instances
         self._instances: dict[str, RolloutInstance] = {}
         self._task_to_instance: dict[str, str] = {}
+        self._selection_index = 0
         self._lock = threading.RLock()
 
     @property
@@ -121,34 +122,36 @@ class RolloutInstancePool:
         """Snapshot instances currently eligible for new inference work."""
         with self._lock:
             return tuple(
-                instance.rpc_target
-                for instance in self._routable_instances_unlocked()
+                instance.rpc_target for instance in self._routable_instances_unlocked()
             )
 
-    def reserve_task(self, task_id: str, selection_index: int) -> RolloutRPCTarget:
-        """Atomically choose a READY instance and bind one workflow task."""
+    def reserve_task(
+        self,
+        task_id: str,
+        max_inflight_per_instance: int | None = None,
+    ) -> RolloutRPCTarget:
+        """Atomically bind a workflow task to the least-loaded READY instance."""
         if not task_id:
             raise ValueError("task_id must not be empty")
         with self._lock:
-            instances = self._routable_instances_unlocked()
-            if not instances:
-                raise InstanceNotReadyError(
-                    "no READY elastic rollout instance can accept a task"
-                )
-            instance = instances[selection_index % len(instances)]
+            instance = self._select_least_loaded_unlocked(
+                max_inflight_per_instance=max_inflight_per_instance,
+            )
             self.bind_task(task_id, instance.instance_id)
+            self._selection_index += 1
             return instance.rpc_target
 
-    def reserve_direct_request(self, selection_index: int) -> RolloutRPCTarget:
-        """Atomically choose a READY instance and acquire a direct-request lease."""
+    def reserve_direct_request(
+        self,
+        max_inflight_per_instance: int | None = None,
+    ) -> RolloutRPCTarget:
+        """Atomically lease the least-loaded READY instance for a direct request."""
         with self._lock:
-            instances = self._routable_instances_unlocked()
-            if not instances:
-                raise InstanceNotReadyError(
-                    "no READY elastic rollout instance can accept a direct request"
-                )
-            instance = instances[selection_index % len(instances)]
+            instance = self._select_least_loaded_unlocked(
+                max_inflight_per_instance=max_inflight_per_instance,
+            )
             instance.direct_inflight += 1
+            self._selection_index += 1
             return instance.rpc_target
 
     def acquire_direct_snapshot(self) -> tuple[RolloutRPCTarget, ...]:
@@ -275,10 +278,37 @@ class RolloutInstancePool:
     def _routable_instances_unlocked(self) -> list[RolloutInstance]:
         """Return routable instances while the caller holds ``_lock``."""
         return [
-            instance
-            for instance in self._instances.values()
-            if instance.is_routable
+            instance for instance in self._instances.values() if instance.is_routable
         ]
+
+    def _select_least_loaded_unlocked(
+        self,
+        *,
+        max_inflight_per_instance: int | None,
+    ) -> RolloutInstance:
+        """Choose a capacity-eligible instance while the caller holds ``_lock``."""
+        if max_inflight_per_instance is not None and max_inflight_per_instance <= 0:
+            raise ValueError("max_inflight_per_instance must be positive")
+
+        instances = self._routable_instances_unlocked()
+        if max_inflight_per_instance is not None:
+            instances = [
+                instance
+                for instance in instances
+                if instance.inflight_requests < max_inflight_per_instance
+            ]
+        if not instances:
+            raise InstanceNotReadyError(
+                "no READY elastic rollout instance has request capacity"
+            )
+
+        minimum_load = min(instance.inflight_requests for instance in instances)
+        least_loaded = [
+            instance
+            for instance in instances
+            if instance.inflight_requests == minimum_load
+        ]
+        return least_loaded[self._selection_index % len(least_loaded)]
 
     @staticmethod
     def _decrement(instance: RolloutInstance, field_name: str) -> None:

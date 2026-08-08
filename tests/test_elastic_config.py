@@ -24,6 +24,10 @@ def test_elastic_rollout_config_is_disabled_by_default():
         ({"min_instances": 0}, "at least 1"),
         ({"min_instances": 2, "initial_instances": 1}, "min_instances"),
         ({"initial_instances": 2, "max_instances": 1}, "max_instances"),
+        ({"max_concurrent_rollouts_per_instance": 0}, "per_instance"),
+        ({"max_concurrent_rollouts_per_instance": True}, "per_instance"),
+        ({"max_total_concurrent_rollouts": 0}, "max_total"),
+        ({"max_total_concurrent_rollouts": True}, "max_total"),
         ({"role_prefix": "Rollout"}, "role_prefix"),
         ({"reconcile_interval_seconds": 0}, "positive"),
         ({"drain_timeout_seconds": -1}, "non-negative"),
@@ -52,6 +56,8 @@ def test_elastic_rollout_config_accepts_scale_out_contract():
         startup_timeout_seconds=120,
         startup_concurrency=2,
         catch_up_concurrency=2,
+        max_concurrent_rollouts_per_instance=64,
+        max_total_concurrent_rollouts=256,
     )
 
     assert config.enabled
@@ -60,6 +66,8 @@ def test_elastic_rollout_config_accepts_scale_out_contract():
     assert config.startup_timeout_seconds == 120
     assert config.startup_concurrency == 2
     assert config.catch_up_concurrency == 2
+    assert config.max_concurrent_rollouts_per_instance == 64
+    assert config.max_total_concurrent_rollouts == 256
 
 
 def _trainer_for_elastic_validation(weight_update_mode: str) -> PPOTrainer:

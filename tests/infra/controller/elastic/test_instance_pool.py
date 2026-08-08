@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 from areal.infra.controller.elastic import (
     DuplicateInstanceError,
+    InstanceNotReadyError,
     InstanceNotRemovableError,
     InvalidDesiredCountError,
     RolloutInstancePool,
@@ -102,7 +106,7 @@ def test_task_reservation_is_atomic_with_drain():
     pool = _pool()
     instance = _add_ready(pool, "ri-first")
 
-    target = pool.reserve_task("task-a", selection_index=0)
+    target = pool.reserve_task("task-a")
     pool.request_drain(instance.instance_id)
 
     assert target.instance_id == instance.instance_id
@@ -146,12 +150,76 @@ def test_direct_request_reservation_blocks_stop_until_released():
     """A direct request keeps its selected instance alive until completion."""
     pool = _pool()
     instance = _add_ready(pool, "ri-first")
-    target = pool.reserve_direct_request(selection_index=0)
+    target = pool.reserve_direct_request()
     instance.request_drain()
 
     assert not instance.can_stop
     pool.release_direct_request(target.instance_id)
     assert instance.can_stop
+
+
+def test_task_reservation_prefers_new_least_loaded_instance():
+    """A newly READY instance absorbs new work until loads converge."""
+    pool = _pool()
+    _add_ready(pool, "ri-existing")
+    _add_ready(pool, "ri-new")
+    pool.bind_task("old-a", "ri-existing")
+    pool.bind_task("old-b", "ri-existing")
+
+    first = pool.reserve_task("new-a")
+    second = pool.reserve_task("new-b")
+    third = pool.reserve_task("new-c")
+
+    assert first.instance_id == "ri-new"
+    assert second.instance_id == "ri-new"
+    assert third.instance_id == "ri-existing"
+
+
+def test_per_instance_capacity_is_a_hard_routing_limit():
+    pool = _pool()
+    first = _add_ready(pool, "ri-first")
+    second = _add_ready(pool, "ri-second")
+
+    targets = [
+        pool.reserve_task(f"task-{idx}", max_inflight_per_instance=2)
+        for idx in range(4)
+    ]
+
+    assert [target.instance_id for target in targets].count(first.instance_id) == 2
+    assert [target.instance_id for target in targets].count(second.instance_id) == 2
+    with pytest.raises(InstanceNotReadyError, match="request capacity"):
+        pool.reserve_task("task-full", max_inflight_per_instance=2)
+
+
+def test_direct_requests_participate_in_least_loaded_capacity():
+    pool = _pool()
+    _add_ready(pool, "ri-first")
+    _add_ready(pool, "ri-second")
+    pool.bind_task("task-a", "ri-first")
+
+    target = pool.reserve_direct_request(max_inflight_per_instance=1)
+
+    assert target.instance_id == "ri-second"
+    with pytest.raises(InstanceNotReadyError, match="request capacity"):
+        pool.reserve_direct_request(max_inflight_per_instance=1)
+
+
+def test_concurrent_reservations_remain_balanced_and_within_capacity():
+    pool = _pool()
+    _add_ready(pool, "ri-first")
+    _add_ready(pool, "ri-second")
+
+    def reserve(idx: int) -> str:
+        return pool.reserve_task(
+            f"task-{idx}", max_inflight_per_instance=50
+        ).instance_id
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        instance_ids = list(executor.map(reserve, range(100)))
+
+    assert Counter(instance_ids) == {"ri-first": 50, "ri-second": 50}
+    with pytest.raises(InstanceNotReadyError, match="request capacity"):
+        pool.reserve_task("task-over-capacity", max_inflight_per_instance=50)
 
 
 def test_instance_cannot_be_removed_before_stopped_and_drained():

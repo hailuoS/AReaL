@@ -150,9 +150,7 @@ class RolloutInstance:
     def rpc_target(self) -> RolloutRPCTarget:
         """Return an immutable RPC target detached from mutable instance state."""
         if self.worker_id is None:
-            raise ValueError(
-                f"instance {self.instance_id} has no assigned worker yet"
-            )
+            raise ValueError(f"instance {self.instance_id} has no assigned worker yet")
         return RolloutRPCTarget(
             instance_id=self.instance_id,
             worker_id=self.worker_id,
@@ -207,6 +205,11 @@ class RolloutInstance:
             self.state is RolloutInstanceState.READY
             and self.desired_state is InstanceDesiredState.RUNNING
         )
+
+    @property
+    def inflight_requests(self) -> int:
+        """Controller-visible requests currently owned by this instance."""
+        return len(self.workflow_task_ids) + self.direct_inflight
 
     @property
     def is_drained(self) -> bool:

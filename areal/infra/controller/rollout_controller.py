@@ -117,6 +117,7 @@ class RolloutController:
         self._version_lock = Lock()
         self._version = 0
         self._elastic_capacity_per_instance: int | None = None
+        self._elastic_total_capacity_limit: int | None = None
         self._disk_checkpoint_catalog: DiskCheckpointCatalog | None = None
         self._instance_pool: RolloutInstancePool | None = None
         self._elastic_reconciler: RolloutInstanceReconciler | None = None
@@ -246,7 +247,14 @@ class RolloutController:
             max_staleness=self.config.max_head_offpolicyness,
         )
         if self._instance_pool is not None:
-            self._elastic_capacity_per_instance = max_concurrent_rollouts
+            self._elastic_capacity_per_instance = (
+                self.config.elastic.max_concurrent_rollouts_per_instance
+                or max_concurrent_rollouts
+            )
+            self._elastic_total_capacity_limit = (
+                self.config.elastic.max_total_concurrent_rollouts
+                or max_concurrent_rollouts
+            )
             self._refresh_elastic_capacity()
 
         # Create and initialize the dispatcher
@@ -461,10 +469,15 @@ class RolloutController:
         if self._instance_pool is None or self._staleness_manager is None:
             return
         assert self._elastic_capacity_per_instance is not None
+        assert self._elastic_total_capacity_limit is not None
         ready_instances = len(self._instance_pool.ready_snapshot())
-        self._staleness_manager.set_max_concurrent_rollouts(
-            max(1, ready_instances * self._elastic_capacity_per_instance)
+        effective_capacity = min(
+            self._elastic_total_capacity_limit,
+            ready_instances * self._elastic_capacity_per_instance,
         )
+        self._staleness_manager.set_max_concurrent_rollouts(effective_capacity)
+        if self._dispatcher is not None:
+            self._dispatcher.notify_capacity_changed()
 
     def _save_elastic_recovery_state(self) -> None:
         if self._elastic_recovery_store is not None and self._instance_pool is not None:
@@ -1093,6 +1106,17 @@ class RolloutController:
                         "desired_state": instance.desired_state.value,
                         "loaded_version": instance.loaded_version,
                         "active_tasks": len(instance.workflow_task_ids),
+                        "inflight_requests": instance.inflight_requests,
+                        "request_capacity": self._elastic_capacity_per_instance,
+                        "available_request_capacity": (
+                            max(
+                                0,
+                                self._elastic_capacity_per_instance
+                                - instance.inflight_requests,
+                            )
+                            if self._elastic_capacity_per_instance is not None
+                            else None
+                        ),
                         "result_leases": len(instance.result_lease_ids),
                         "direct_inflight": instance.direct_inflight,
                         "update_leases": instance.update_leases,
@@ -1109,6 +1133,12 @@ class RolloutController:
                         self._staleness_manager.max_concurrent_rollouts
                         if self._staleness_manager is not None
                         else None
+                    ),
+                    "max_concurrent_rollouts_per_instance": (
+                        self._elastic_capacity_per_instance
+                    ),
+                    "max_total_concurrent_rollouts": (
+                        self._elastic_total_capacity_limit
                     ),
                     "last_reconcile_error": self._elastic_last_reconcile_error,
                     "report_freq_steps": self.config.elastic.report_freq_steps,
@@ -1473,9 +1503,9 @@ class RolloutController:
             try:
                 if self._instance_pool is not None:
                     target = self._instance_pool.reserve_task(
-                        str(task_id), self._current_worker_idx
+                        str(task_id),
+                        max_inflight_per_instance=(self._elastic_capacity_per_instance),
                     )
-                    self._current_worker_idx += 1
                     bound_instance_id = target.instance_id
                 else:
                     target = self._choose_rollout_target()
@@ -1860,9 +1890,8 @@ class RolloutController:
         """
         if self._instance_pool is not None:
             target = self._instance_pool.reserve_direct_request(
-                self._current_worker_idx
+                max_inflight_per_instance=self._elastic_capacity_per_instance
             )
-            self._current_worker_idx += 1
         else:
             target = self._choose_rollout_target()
         try:

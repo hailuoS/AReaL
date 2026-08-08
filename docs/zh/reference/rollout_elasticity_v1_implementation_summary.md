@@ -198,7 +198,8 @@ workflow task 的路径为：
 提交 rollout task
   -> BatchTaskDispatcher
   -> InstancePool.reserve_task
-  -> 原子选择 READY 实例并绑定 task_id
+  -> 过滤达到单实例上限的目标
+  -> 原子选择 Controller 可见在途请求最少的 READY 实例并绑定 task_id
   -> AgentWorkflow 使用同一实例的 proxy_addr
   -> scheduler.async_call_engine
   -> callback server 收到结果
@@ -208,6 +209,20 @@ workflow task 的路径为：
 ```
 
 `agenerate`、`compute_logp`、collective RPC 和 perf tracer 也会持有 direct request lease，防止执行过程中实例被缩容删除。
+
+`max_concurrent_rollouts` 默认继续表示 AReaL 原有的全局并发上限。弹性容量按以下
+公式刷新：
+
+```text
+effective = min(
+    elastic.max_total_concurrent_rollouts,
+    ready_instances * elastic.max_concurrent_rollouts_per_instance,
+)
+```
+
+两个弹性参数未配置时均回退到原全局值。InstancePool 使用 workflow task 和 direct
+request 的 Controller 可见在途数进行 least-loaded 路由；新实例会优先吸收新请求，
+但不会迁移老实例已经拥有的任务。
 
 ### 4.3 Disk 权重同步
 
