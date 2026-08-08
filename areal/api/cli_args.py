@@ -2311,6 +2311,26 @@ class ElasticRolloutConfig:
         default=1,
         metadata={"help": "Maximum number of complete TP × PP rollout instances."},
     )
+    max_concurrent_rollouts_per_instance: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Maximum concurrent workflow/agenerate requests routed to one READY "
+                "elastic instance. Defaults to rollout.max_concurrent_rollouts (or "
+                "consumer_batch_size when that value is unset)."
+            )
+        },
+    )
+    max_total_concurrent_rollouts: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Elastic-mode global concurrency ceiling. Defaults to "
+                "rollout.max_concurrent_rollouts, preserving the static AReaL "
+                "concurrency semantics unless explicitly increased."
+            )
+        },
+    )
     role_prefix: str = field(
         default="rollout-elastic",
         metadata={
@@ -2385,6 +2405,20 @@ class ElasticRolloutConfig:
                 "elastic.max_instances must be greater than or equal to "
                 "elastic.initial_instances"
             )
+        if (
+            isinstance(self.max_concurrent_rollouts_per_instance, bool)
+            or self.max_concurrent_rollouts_per_instance is not None
+            and self.max_concurrent_rollouts_per_instance <= 0
+        ):
+            raise ValueError(
+                "elastic.max_concurrent_rollouts_per_instance must be positive"
+            )
+        if (
+            isinstance(self.max_total_concurrent_rollouts, bool)
+            or self.max_total_concurrent_rollouts is not None
+            and self.max_total_concurrent_rollouts <= 0
+        ):
+            raise ValueError("elastic.max_total_concurrent_rollouts must be positive")
         if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", self.role_prefix):
             raise ValueError(
                 "elastic.role_prefix must contain only lowercase letters, digits, "

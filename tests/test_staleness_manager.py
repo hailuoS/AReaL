@@ -228,21 +228,22 @@ class TestCapacityCalculations:
         capacity = manager.get_capacity()
         assert capacity < 0
 
-    def test_min_values_are_enforced(self):
-        """Test that minimum values of 1 are enforced."""
+    def test_zero_dynamic_concurrency_blocks_submission_capacity(self):
+        """A temporarily empty elastic pool can expose zero capacity."""
         version_provider = MockVersionProvider(0)
 
         manager = StalenessManager(
             version_provider=version_provider,
-            max_concurrent_rollouts=0,  # Should become 1
+            max_concurrent_rollouts=0,
             consumer_batch_size=0,  # Should become 1
             max_staleness=0,
         )
 
-        # With max(1, 0) = 1 for both params:
-        # Capacity should still work correctly
-        capacity = manager.get_capacity()
-        assert capacity >= 0  # Should not crash
+        assert manager.get_capacity() == 0
+
+        manager.set_max_concurrent_rollouts(3)
+
+        assert manager.get_capacity() == 1
 
 
 class TestRolloutLifecycle:

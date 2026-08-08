@@ -507,6 +507,11 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         with self._input_cv:
             self._input_cv.notify()
 
+    def notify_capacity_changed(self) -> None:
+        """Wake the producer after an external concurrency-limit update."""
+        with self._input_cv:
+            self._input_cv.notify()
+
     def is_paused(self) -> bool:
         """Check if the dispatcher is currently paused.
 
