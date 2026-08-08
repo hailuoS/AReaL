@@ -65,9 +65,7 @@ def test_live_autoscaler_processes_each_report_version_once(monkeypatch):
         return False
 
     monkeypatch.setattr(autoscaler, "_get_recommendation", get_recommendation)
-    monkeypatch.setattr(
-        autoscaler, "_get_status", lambda *_args: _stable_status(1, 10)
-    )
+    monkeypatch.setattr(autoscaler, "_get_status", lambda *_args: _stable_status(1, 10))
     monkeypatch.setattr(autoscaler, "_apply_report", apply_report)
     monkeypatch.setattr(autoscaler.time, "sleep", lambda _seconds: None)
     options = SimpleNamespace(
@@ -158,6 +156,109 @@ def test_live_autoscaler_discards_cooldown_report_without_replaying(monkeypatch)
     assert applied_versions == [20]
 
 
+def test_live_autoscaler_allows_consecutive_scale_up_without_cooldown(monkeypatch):
+    reports = iter(
+        [
+            {
+                "report_version": 10,
+                "window_start_version": 1,
+                "ready_instances": 1,
+                "recommended_instances": 1,
+            },
+            {
+                "report_version": 20,
+                "window_start_version": 11,
+                "ready_instances": 1,
+                "recommended_instances": 2,
+            },
+            {
+                "report_version": 30,
+                "window_start_version": 21,
+                "ready_instances": 2,
+                "recommended_instances": 3,
+            },
+        ]
+    )
+    statuses = iter(
+        [
+            _stable_status(1, 10),
+            _stable_status(1, 10),
+            _stable_status(2, 20),
+            _stable_status(2, 20),
+            _stable_status(3, 30),
+        ]
+    )
+    applied_versions = []
+
+    def get_recommendation(*_args):
+        try:
+            return next(reports)
+        except StopIteration:
+            raise KeyboardInterrupt from None
+
+    def apply_report(_base_url, report, **_kwargs):
+        applied_versions.append(report["report_version"])
+        return True
+
+    monotonic_values = iter([100.0, 100.0, 110.0, 115.0, 120.0])
+    monkeypatch.setattr(autoscaler, "_get_recommendation", get_recommendation)
+    monkeypatch.setattr(autoscaler, "_get_status", lambda *_args: next(statuses))
+    monkeypatch.setattr(autoscaler, "_apply_report", apply_report)
+    monkeypatch.setattr(autoscaler.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(autoscaler.time, "sleep", lambda _seconds: None)
+    options = SimpleNamespace(
+        base_url="http://127.0.0.1:18080",
+        request_timeout=1.0,
+        cooldown=None,
+        scale_up_cooldown=0.0,
+        scale_down_cooldown=30.0,
+        direction_change_cooldown=30.0,
+        convergence_timeout=1.0,
+        poll_interval=0.1,
+        dry_run=False,
+        require_proxy=False,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        autoscaler._run_live_loop(options)
+
+    assert applied_versions == [20, 30]
+
+
+def test_direction_aware_cooldown_distinguishes_growth_and_reversal():
+    options = SimpleNamespace(
+        cooldown=None,
+        scale_up_cooldown=0.0,
+        scale_down_cooldown=30.0,
+        direction_change_cooldown=45.0,
+    )
+
+    assert (
+        autoscaler._cooldown_for_action(
+            options,
+            action_direction="scale_up",
+            last_action_direction="scale_up",
+        )
+        == 0.0
+    )
+    assert (
+        autoscaler._cooldown_for_action(
+            options,
+            action_direction="scale_down",
+            last_action_direction="scale_down",
+        )
+        == 30.0
+    )
+    assert (
+        autoscaler._cooldown_for_action(
+            options,
+            action_direction="scale_down",
+            last_action_direction="scale_up",
+        )
+        == 45.0
+    )
+
+
 def test_live_autoscaler_discards_report_for_previous_capacity(monkeypatch):
     reports = iter(
         [
@@ -184,9 +285,7 @@ def test_live_autoscaler_discards_report_for_previous_capacity(monkeypatch):
             raise KeyboardInterrupt from None
 
     monkeypatch.setattr(autoscaler, "_get_recommendation", get_recommendation)
-    monkeypatch.setattr(
-        autoscaler, "_get_status", lambda *_args: _stable_status(4, 10)
-    )
+    monkeypatch.setattr(autoscaler, "_get_status", lambda *_args: _stable_status(4, 10))
     monkeypatch.setattr(
         autoscaler,
         "_apply_report",
@@ -246,9 +345,7 @@ def test_live_autoscaler_requires_consecutive_scale_down_windows(monkeypatch):
             raise KeyboardInterrupt from None
 
     monkeypatch.setattr(autoscaler, "_get_recommendation", get_recommendation)
-    monkeypatch.setattr(
-        autoscaler, "_get_status", lambda *_args: _stable_status(4, 10)
-    )
+    monkeypatch.setattr(autoscaler, "_get_status", lambda *_args: _stable_status(4, 10))
     monkeypatch.setattr(
         autoscaler,
         "_apply_report",

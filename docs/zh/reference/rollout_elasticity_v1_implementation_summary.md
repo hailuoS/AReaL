@@ -576,14 +576,18 @@ python examples/math/rollout_elastic_autoscaler_spike.py \
 python examples/math/rollout_elastic_autoscaler_spike.py \
   --base-url http://127.0.0.1:PORT \
   --poll-interval 5 \
-  --cooldown 30 \
+  --scale-up-cooldown 0 \
+  --scale-down-cooldown 30 \
+  --direction-change-cooldown 30 \
   --require-proxy
 ```
 
 真实报告模式持续运行，使用 `Ctrl-C` 停止。脚本按照 `report_version` 去重，并立即
 消费冷却期、容量未收敛或容量快照不匹配的报告，避免稍后重放旧建议。扩缩容收敛后，
 只有采样窗口完全开始于收敛版本之后的新报告才可执行；仅在建议目标与当前 desired
-state 不同时发送 PUT，并在每次动作后验证实例数量、状态和权重版本是否收敛。
+state 不同时发送 PUT，并在每次动作后验证实例数量、状态和权重版本是否收敛。连续
+扩容默认不额外冷却，连续缩容和方向反转默认冷却 30 秒；旧的 `--cooldown` 可用于
+恢复所有方向统一冷却的兼容行为。
 
 ### 9.5 端到端训练
 

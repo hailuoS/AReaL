@@ -128,9 +128,11 @@ automatically.
 The example autoscaler consumes reports observed during cooldown or unstable capacity
 instead of replaying them later. After convergence it accepts only a report whose
 complete window starts after the convergence version and whose reported capacity
-matches the current stable capacity. Scale-down additionally requires two consecutive
-valid low-wait windows by default (`--scale-down-windows`) and removes at most one
-instance per convergence cycle.
+matches the current stable capacity. Consecutive scale-up has no extra cooldown by
+default (`--scale-up-cooldown=0`); consecutive scale-down and direction reversals
+default to 30 seconds. Scale-down additionally requires two consecutive valid low-wait
+windows (`--scale-down-windows`) and removes at most one instance per convergence
+cycle. The legacy `--cooldown` option can still override every direction uniformly.
 
 ## Disk checkpoint retention and recovery
 

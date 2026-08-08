@@ -78,6 +78,35 @@ class _ScaleDownConfirmation:
         return confirmed, observed
 
 
+def _action_direction(report: dict[str, Any], desired: int) -> str | None:
+    """Return the capacity-change direction represented by one report."""
+    recommended = report.get("recommended_instances")
+    if isinstance(recommended, bool) or not isinstance(recommended, int):
+        raise AutoscalerError(f"Malformed scaling report: {report!r}")
+    if recommended > desired:
+        return "scale_up"
+    if recommended < desired:
+        return "scale_down"
+    return None
+
+
+def _cooldown_for_action(
+    options: argparse.Namespace,
+    *,
+    action_direction: str,
+    last_action_direction: str | None,
+) -> float:
+    """Resolve legacy or direction-aware cooldown for one capacity change."""
+    legacy_cooldown = getattr(options, "cooldown", None)
+    if legacy_cooldown is not None:
+        return legacy_cooldown
+    if last_action_direction is not None and action_direction != last_action_direction:
+        return options.direction_change_cooldown
+    if action_direction == "scale_up":
+        return options.scale_up_cooldown
+    return options.scale_down_cooldown
+
+
 def _request_json(
     method: str,
     url: str,
@@ -346,6 +375,7 @@ def _run_live_loop(options: argparse.Namespace) -> None:
     scale_down_confirmation = _ScaleDownConfirmation(scale_down_windows)
     last_report_version: int | None = None
     last_action_at = 0.0
+    last_action_direction: str | None = None
     minimum_window_start_version = 0
     last_desired_instances: int | None = None
     capacity_was_stable = False
@@ -368,9 +398,8 @@ def _run_live_loop(options: argparse.Namespace) -> None:
                 # topology and must never be replayed after the condition clears.
                 last_report_version = report_version
                 window_start_version = report.get("window_start_version")
-                if (
-                    isinstance(window_start_version, bool)
-                    or not isinstance(window_start_version, int)
+                if isinstance(window_start_version, bool) or not isinstance(
+                    window_start_version, int
                 ):
                     raise AutoscalerError(
                         "Scaling report has no integer window_start_version: "
@@ -405,6 +434,8 @@ def _run_live_loop(options: argparse.Namespace) -> None:
                     continue
                 if desired != last_desired_instances:
                     scale_down_confirmation.reset()
+                    last_action_at = 0.0
+                    last_action_direction = None
                     last_desired_instances = desired
                     capacity_was_stable = stable
                     minimum_window_start_version = serving_version
@@ -441,80 +472,91 @@ def _run_live_loop(options: argparse.Namespace) -> None:
                     )
                     time.sleep(options.poll_interval)
                     continue
-                if now - last_action_at < options.cooldown:
+                if report.get("ready_instances") != desired:
                     scale_down_confirmation.reset()
                     logger.info(
-                        "Discarding report version=%d observed during cooldown",
+                        "Discarding report version=%d for stale capacity: "
+                        "report_ready=%s current_ready=%d",
                         report_version,
+                        report.get("ready_instances"),
+                        desired,
                     )
-                else:
-                    if report.get("ready_instances") != desired:
+                    time.sleep(options.poll_interval)
+                    continue
+                if window_start_version <= minimum_window_start_version:
+                    scale_down_confirmation.reset()
+                    logger.info(
+                        "Discarding report version=%d whose window started at "
+                        "version=%d before the post-convergence watermark=%d",
+                        report_version,
+                        window_start_version,
+                        minimum_window_start_version,
+                    )
+                    time.sleep(options.poll_interval)
+                    continue
+                action_direction = _action_direction(report, desired)
+                if action_direction is not None:
+                    cooldown = _cooldown_for_action(
+                        options,
+                        action_direction=action_direction,
+                        last_action_direction=last_action_direction,
+                    )
+                    if now - last_action_at < cooldown:
                         scale_down_confirmation.reset()
                         logger.info(
-                            "Discarding report version=%d for stale capacity: "
-                            "report_ready=%s current_ready=%d",
+                            "Discarding report version=%d during %s cooldown: "
+                            "last_direction=%s cooldown_seconds=%.1f",
                             report_version,
-                            report.get("ready_instances"),
-                            desired,
+                            action_direction,
+                            last_action_direction,
+                            cooldown,
                         )
                         time.sleep(options.poll_interval)
                         continue
-                    if window_start_version <= minimum_window_start_version:
-                        scale_down_confirmation.reset()
-                        logger.info(
-                            "Discarding report version=%d whose window started at "
-                            "version=%d before the post-convergence watermark=%d",
-                            report_version,
-                            window_start_version,
-                            minimum_window_start_version,
-                        )
-                        time.sleep(options.poll_interval)
-                        continue
-                    confirmed, observed = scale_down_confirmation.observe(
-                        report,
-                        desired=desired,
-                        window_start=window_start_version,
-                        report_version=report_version,
+                confirmed, observed = scale_down_confirmation.observe(
+                    report,
+                    desired=desired,
+                    window_start=window_start_version,
+                    report_version=report_version,
+                )
+                if observed and not confirmed:
+                    logger.info(
+                        "Deferring scale-down report version=%d until "
+                        "%d consecutive valid windows; observed=%d",
+                        report_version,
+                        scale_down_windows,
+                        observed,
                     )
-                    if observed and not confirmed:
-                        logger.info(
-                            "Deferring scale-down report version=%d until "
-                            "%d consecutive valid windows; observed=%d",
-                            report_version,
-                            scale_down_windows,
-                            observed,
+                    time.sleep(options.poll_interval)
+                    continue
+                changed = _apply_report(
+                    options.base_url,
+                    report,
+                    request_timeout=options.request_timeout,
+                    convergence_timeout=options.convergence_timeout,
+                    poll_interval=options.poll_interval,
+                    dry_run=options.dry_run,
+                    require_proxy=options.require_proxy,
+                )
+                if changed:
+                    scale_down_confirmation.reset()
+                    last_action_at = time.monotonic()
+                    last_action_direction = action_direction
+                    converged = _get_status(options.base_url, options.request_timeout)
+                    serving_version = converged.get("serving_version")
+                    converged_desired = converged.get("desired_instances")
+                    if (
+                        isinstance(serving_version, bool)
+                        or not isinstance(serving_version, int)
+                        or isinstance(converged_desired, bool)
+                        or not isinstance(converged_desired, int)
+                    ):
+                        raise AutoscalerError(
+                            f"Malformed converged instance status: {converged!r}"
                         )
-                        time.sleep(options.poll_interval)
-                        continue
-                    changed = _apply_report(
-                        options.base_url,
-                        report,
-                        request_timeout=options.request_timeout,
-                        convergence_timeout=options.convergence_timeout,
-                        poll_interval=options.poll_interval,
-                        dry_run=options.dry_run,
-                        require_proxy=options.require_proxy,
-                    )
-                    if changed:
-                        scale_down_confirmation.reset()
-                        last_action_at = time.monotonic()
-                        converged = _get_status(
-                            options.base_url, options.request_timeout
-                        )
-                        serving_version = converged.get("serving_version")
-                        converged_desired = converged.get("desired_instances")
-                        if (
-                            isinstance(serving_version, bool)
-                            or not isinstance(serving_version, int)
-                            or isinstance(converged_desired, bool)
-                            or not isinstance(converged_desired, int)
-                        ):
-                            raise AutoscalerError(
-                                f"Malformed converged instance status: {converged!r}"
-                            )
-                        minimum_window_start_version = serving_version
-                        last_desired_instances = converged_desired
-                        capacity_was_stable = True
+                    minimum_window_start_version = serving_version
+                    last_desired_instances = converged_desired
+                    capacity_was_stable = True
             time.sleep(options.poll_interval)
         except requests.RequestException as exc:
             logger.warning("HTTP request failed: %s", exc)
@@ -544,7 +586,33 @@ def _parse_args() -> argparse.Namespace:
         help="Require every converged READY instance to own an initialized V1 proxy.",
     )
     parser.add_argument("--poll-interval", type=float, default=2.0)
-    parser.add_argument("--cooldown", type=float, default=30.0)
+    parser.add_argument(
+        "--cooldown",
+        type=float,
+        default=None,
+        help=(
+            "Legacy cooldown applied to every capacity-change direction. When set, "
+            "it overrides the direction-aware cooldown options."
+        ),
+    )
+    parser.add_argument(
+        "--scale-up-cooldown",
+        type=float,
+        default=0.0,
+        help="Cooldown between consecutive scale-up actions (default: 0).",
+    )
+    parser.add_argument(
+        "--scale-down-cooldown",
+        type=float,
+        default=30.0,
+        help="Cooldown between consecutive scale-down actions (default: 30).",
+    )
+    parser.add_argument(
+        "--direction-change-cooldown",
+        type=float,
+        default=30.0,
+        help="Cooldown before reversing the previous scaling direction (default: 30).",
+    )
     parser.add_argument(
         "--scale-down-windows",
         type=int,
@@ -560,12 +628,20 @@ def _parse_args() -> argparse.Namespace:
     options.base_url = options.base_url.rstrip("/")
     for name in (
         "poll_interval",
-        "cooldown",
         "request_timeout",
         "convergence_timeout",
     ):
         if getattr(options, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    if options.cooldown is not None and options.cooldown < 0:
+        parser.error("--cooldown must be non-negative")
+    for name in (
+        "scale_up_cooldown",
+        "scale_down_cooldown",
+        "direction_change_cooldown",
+    ):
+        if getattr(options, name) < 0:
+            parser.error(f"--{name.replace('_', '-')} must be non-negative")
     if options.scale_down_windows <= 0:
         parser.error("--scale-down-windows must be positive")
     return options
