@@ -44,6 +44,7 @@ LOGGER_COLORS_EXACT = {
     "LocalLauncher": "blue",
     "RayLauncher": "blue",
     "SlurmLauncher": "blue",
+    "RolloutInstanceLauncher": "blue",
     # Workflows - purple
     "RLVRWorkflow": "light_purple",
     "VisionRLVRWorkflow": "light_purple",

@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import logging
 import time
 from typing import Any
 
@@ -29,6 +28,7 @@ from areal.infra.controller.elastic.autoscaler import (
     ElasticAutoscalerPolicy,
     ScaleDownConfirmation,
 )
+from areal.utils import logging
 
 logger = logging.getLogger("RolloutElasticAutoscalerSpike")
 
@@ -449,10 +449,6 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s: %(message)s",
-    )
     options = _parse_args()
     if options.inject_spike:
         _run_injected_spike(options)

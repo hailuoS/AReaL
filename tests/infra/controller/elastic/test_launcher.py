@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import areal.infra.controller.elastic.launcher as launcher_module
 from areal.api import LocalInfServerInfo, Worker
 from areal.api.cli_args import SchedulingSpec
 from areal.infra.controller.elastic import (
@@ -92,8 +93,14 @@ def _pending_instance() -> RolloutInstance:
 
 
 @pytest.mark.asyncio
-async def test_launch_creates_one_complete_instance_in_catching_up():
+async def test_launch_creates_one_complete_instance_in_catching_up(monkeypatch):
     """A role owns one logical Worker and a stable non-rank engine name."""
+    timing_logs = []
+    monkeypatch.setattr(
+        launcher_module.logger,
+        "info",
+        lambda message, *args: timing_logs.append(message % args),
+    )
     launcher, scheduler = _launcher()
     instance = _pending_instance()
     original_create_workers = scheduler.create_workers
@@ -128,6 +135,13 @@ async def test_launch_creates_one_complete_instance_in_catching_up():
         call for call in scheduler.engine_calls if call[0] == "initialize"
     )
     assert initialize_call[3]["train_data_parallel_size"] == 1
+    assert any("event=provision_completed" in log for log in timing_logs)
+    assert any("event=worker_ready" in log for log in timing_logs)
+    assert any("event=engine_created" in log for log in timing_logs)
+    assert any("event=server_launched" in log for log in timing_logs)
+    assert any("event=engine_initialized" in log for log in timing_logs)
+    assert any("event=startup_completed" in log for log in timing_logs)
+    assert all("instance_id=ri-a" in log for log in timing_logs)
 
 
 @pytest.mark.asyncio
@@ -248,8 +262,14 @@ async def test_launch_rejects_cross_node_instance_before_creating_workers():
 
 
 @pytest.mark.asyncio
-async def test_catch_up_loads_committed_checkpoint_before_ready(tmp_path):
+async def test_catch_up_loads_committed_checkpoint_before_ready(tmp_path, monkeypatch):
     """A launched instance cannot route before disk loading and versioning finish."""
+    timing_logs = []
+    monkeypatch.setattr(
+        launcher_module.logger,
+        "info",
+        lambda message, *args: timing_logs.append(message % args),
+    )
     launcher, scheduler = _launcher()
     instance = _pending_instance()
     result = await launcher.launch(
@@ -272,6 +292,10 @@ async def test_catch_up_loads_committed_checkpoint_before_ready(tmp_path):
     assert update_call[3]["meta"].path == str(checkpoint)
     assert update_call[3]["meta"].version == 7
     assert any(call[0] == "set_version" for call in scheduler.engine_calls)
+    assert any("event=disk_weights_loaded" in log for log in timing_logs)
+    assert any("event=engine_version_set" in log for log in timing_logs)
+    assert any("event=catch_up_completed" in log for log in timing_logs)
+    assert any("version=7" in log for log in timing_logs)
 
 
 @pytest.mark.asyncio
