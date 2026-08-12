@@ -65,9 +65,7 @@ def test_live_autoscaler_processes_each_report_version_once(monkeypatch):
         return False
 
     monkeypatch.setattr(autoscaler, "_get_recommendation", get_recommendation)
-    monkeypatch.setattr(
-        autoscaler, "_get_status", lambda *_args: _stable_status(1, 10)
-    )
+    monkeypatch.setattr(autoscaler, "_get_status", lambda *_args: _stable_status(1, 10))
     monkeypatch.setattr(autoscaler, "_apply_report", apply_report)
     monkeypatch.setattr(autoscaler.time, "sleep", lambda _seconds: None)
     options = SimpleNamespace(
@@ -158,6 +156,122 @@ def test_live_autoscaler_discards_cooldown_report_without_replaying(monkeypatch)
     assert applied_versions == [20]
 
 
+def test_policy_allows_consecutive_scale_up_without_cooldown():
+    policy = autoscaler.ElasticAutoscalerPolicy(
+        cooldown_seconds=None,
+        scale_up_cooldown_seconds=0.0,
+        scale_down_cooldown_seconds=30.0,
+        direction_change_cooldown_seconds=45.0,
+        scale_down_windows=2,
+    )
+
+    baseline = {
+        "report_version": 10,
+        "window_start_version": 1,
+        "ready_instances": 1,
+        "recommended_instances": 1,
+    }
+    assert (
+        policy.evaluate(
+            baseline,
+            _stable_status(1, 10),
+            capacity_stable=True,
+            stability_detail="stable",
+            now=100.0,
+        ).action
+        == "discard"
+    )
+
+    first = policy.evaluate(
+        {
+            "report_version": 20,
+            "window_start_version": 11,
+            "ready_instances": 1,
+            "recommended_instances": 2,
+        },
+        _stable_status(1, 10),
+        capacity_stable=True,
+        stability_detail="stable",
+        now=100.0,
+    )
+    assert first.should_apply
+    assert first.direction == "scale_up"
+    policy.record_convergence(
+        _stable_status(2, 20),
+        now=100.0,
+        action_direction=first.direction,
+    )
+
+    second = policy.evaluate(
+        {
+            "report_version": 30,
+            "window_start_version": 21,
+            "ready_instances": 2,
+            "recommended_instances": 3,
+        },
+        _stable_status(2, 20),
+        capacity_stable=True,
+        stability_detail="stable",
+        now=100.0,
+    )
+    assert second.should_apply
+    assert second.direction == "scale_up"
+
+
+def test_policy_applies_direction_change_cooldown_after_scale_up():
+    policy = autoscaler.ElasticAutoscalerPolicy(
+        cooldown_seconds=None,
+        scale_up_cooldown_seconds=0.0,
+        scale_down_cooldown_seconds=30.0,
+        direction_change_cooldown_seconds=45.0,
+        scale_down_windows=1,
+    )
+    policy.evaluate(
+        {
+            "report_version": 10,
+            "window_start_version": 1,
+            "ready_instances": 1,
+            "recommended_instances": 1,
+        },
+        _stable_status(1, 10),
+        capacity_stable=True,
+        stability_detail="stable",
+        now=100.0,
+    )
+    up = policy.evaluate(
+        {
+            "report_version": 20,
+            "window_start_version": 11,
+            "ready_instances": 1,
+            "recommended_instances": 2,
+        },
+        _stable_status(1, 10),
+        capacity_stable=True,
+        stability_detail="stable",
+        now=100.0,
+    )
+    policy.record_convergence(
+        _stable_status(2, 20), now=100.0, action_direction=up.direction
+    )
+
+    reversal = policy.evaluate(
+        {
+            "report_version": 30,
+            "window_start_version": 21,
+            "branch": "scale_down",
+            "ready_instances": 2,
+            "recommended_instances": 1,
+        },
+        _stable_status(2, 20),
+        capacity_stable=True,
+        stability_detail="stable",
+        now=120.0,
+    )
+    assert reversal.action == "discard"
+    assert reversal.direction == "scale_down"
+    assert "cooldown_seconds=45.0" in reversal.message
+
+
 def test_live_autoscaler_discards_report_for_previous_capacity(monkeypatch):
     reports = iter(
         [
@@ -184,9 +298,7 @@ def test_live_autoscaler_discards_report_for_previous_capacity(monkeypatch):
             raise KeyboardInterrupt from None
 
     monkeypatch.setattr(autoscaler, "_get_recommendation", get_recommendation)
-    monkeypatch.setattr(
-        autoscaler, "_get_status", lambda *_args: _stable_status(4, 10)
-    )
+    monkeypatch.setattr(autoscaler, "_get_status", lambda *_args: _stable_status(4, 10))
     monkeypatch.setattr(
         autoscaler,
         "_apply_report",
@@ -246,9 +358,7 @@ def test_live_autoscaler_requires_consecutive_scale_down_windows(monkeypatch):
             raise KeyboardInterrupt from None
 
     monkeypatch.setattr(autoscaler, "_get_recommendation", get_recommendation)
-    monkeypatch.setattr(
-        autoscaler, "_get_status", lambda *_args: _stable_status(4, 10)
-    )
+    monkeypatch.setattr(autoscaler, "_get_status", lambda *_args: _stable_status(4, 10))
     monkeypatch.setattr(
         autoscaler,
         "_apply_report",

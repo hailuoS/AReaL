@@ -2,11 +2,9 @@
 
 ## 1. 项目结论
 
-本次开发基于 AReaL `ascend-v1.0.4` NPU 分支，在
-`RolloutController` V1 上完成了单节点 Rollout 弹性扩缩容的主体功能。
+本次开发基于 AReaL `ascend-v1.0.4` NPU 分支，在 `RolloutController` V1 上完成了单节点 Rollout 弹性扩缩容的主体功能。
 
-当前分支（含本总结更新）相对 `upstream/ascend-v1.0.4` 共包含 34 个提交，维护在
-以下个人仓分支：
+当前分支（含本总结更新）相对 `upstream/ascend-v1.0.4` 共包含 34 个提交，维护在 以下个人仓分支：
 
 ```text
 仓库：https://github.com/hailuoS/AReaL
@@ -53,7 +51,8 @@
 - 自动发现集群空闲 NPU 并主动修改 desired state；
 - 弹性模式下独立的共享 validation rollout。
 
-启用弹性模式时，训练入口会提前拒绝 V2、AWEX、online 等不受支持的组合。offline 训练可以继续执行，但独立 validation rollout 会跳过并输出 warning。
+启用弹性模式时，训练入口会提前拒绝 V2、AWEX、online 等不受支持的组合。offline 训练可以继续执行，但独立 validation rollout 会跳过并输出
+warning。
 
 ## 3. 最终架构
 
@@ -119,10 +118,9 @@ Launcher 复用当前 NPU 分支已有的 worker 启动、server 初始化、设
 
 启动前会检查单个完整实例能够放入一个节点。当前不会将一个实例拆到多个节点。
 
-当训练使用 AgentWorkflow 时，Controller 会为每个实例从其独立 rollout role
-fork 一个稳定的 proxy role。Proxy 初始化到该实例的 server 地址后，实例才能进入
-`READY`。缩容时先删除 proxy role，再删除 rollout role。RolloutWorkflow 不会创建
-这些 Proxy 资源。
+当训练使用 AgentWorkflow 时，Controller 会为每个实例从其独立 rollout role fork 一个稳定的 proxy role。Proxy
+初始化到该实例的 server 地址后，实例才能进入 `READY`。缩容时先删除 proxy role，再删除 rollout role。RolloutWorkflow
+不会创建 这些 Proxy 资源。
 
 ### 3.4 Desired-state Reconciler
 
@@ -208,10 +206,10 @@ workflow task 的路径为：
   -> active task 计数减一
 ```
 
-`agenerate`、`compute_logp`、collective RPC 和 perf tracer 也会持有 direct request lease，防止执行过程中实例被缩容删除。
+`agenerate`、`compute_logp`、collective RPC 和 perf tracer 也会持有 direct request
+lease，防止执行过程中实例被缩容删除。
 
-`max_concurrent_rollouts` 默认继续表示 AReaL 原有的全局并发上限。弹性容量按以下
-公式刷新：
+`max_concurrent_rollouts` 默认继续表示 AReaL 原有的全局并发上限。弹性容量按以下 公式刷新：
 
 ```text
 effective = min(
@@ -220,9 +218,8 @@ effective = min(
 )
 ```
 
-两个弹性参数未配置时均回退到原全局值。InstancePool 使用 workflow task 和 direct
-request 的 Controller 可见在途数进行 least-loaded 路由；新实例会优先吸收新请求，
-但不会迁移老实例已经拥有的任务。
+两个弹性参数未配置时均回退到原全局值。InstancePool 使用 workflow task 和 direct request 的 Controller 可见在途数进行
+least-loaded 路由；新实例会优先吸收新请求， 但不会迁移老实例已经拥有的任务。
 
 ### 4.3 Disk 权重同步
 
@@ -299,11 +296,9 @@ Controller 重启时会校验 checkpoint，清理恢复记录中的旧 role，�
 
 ## 5. 扩缩容建议
 
-建议逻辑使用 AstraFlow 风格的多 step 窗口和三段式规则，并针对 AReaL
-按需生成路径调整缩容目标。默认
-`rollout.elastic.report_freq_steps=10`，在 serving version 为
-`10、20、30...` 时关闭当前窗口并生成报告。窗口生成后重置精确计数，下一窗口重新
-累计。
+建议逻辑使用 AstraFlow 风格的多 step 窗口和三段式规则，并针对 AReaL 按需生成路径调整缩容目标。默认
+`rollout.elastic.report_freq_steps=10`，在 serving version 为 `10、20、30...`
+时关闭当前窗口并生成报告。窗口生成后重置精确计数，下一窗口重新 累计。
 
 设：
 
@@ -324,9 +319,8 @@ wait_fraction < 0.05 且有效 step 时间、entered、consumed 均大于 0:
     hold
 ```
 
-最终建议限制在 `min_instances` 和 `max_instances` 之间。由于按需驱动的
-`prepare_batch` 即使在容量过剩时也常使 `consumed / entered` 接近 1，缩容不再
-使用该比例直接计算目标。示例 autoscaler 默认要求连续两个有效低等待窗口，且窗口
+最终建议限制在 `min_instances` 和 `max_instances` 之间。由于按需驱动的 `prepare_batch` 即使在容量过剩时也常使
+`consumed / entered` 接近 1，缩容不再 使用该比例直接计算目标。示例 autoscaler 默认要求连续两个有效低等待窗口，且窗口
 必须首尾连续，确认后每次只减少 1 个实例。
 
 采集信息包括：
@@ -337,8 +331,8 @@ wait_fraction < 0.05 且有效 step 时间、entered、consumed 均大于 0:
 - 训练消费的样本数量；
 - 当前 `READY` 实例数。
 
-和 AstraFlow 一致，启动后或 eval 后第一个无法与上一次 batch 完成时间配对的样本
-不会进入 wait/step 时间求和。每 step 的 `entered` 和 `consumed` 仍会进入窗口累计。
+和 AstraFlow 一致，启动后或 eval 后第一个无法与上一次 batch 完成时间配对的样本 不会进入 wait/step 时间求和。每 step 的
+`entered` 和 `consumed` 仍会进入窗口累计。
 
 最新报告保存在 Controller 内存中供 HTTP 查询，同时原子写入：
 
@@ -348,59 +342,54 @@ ${rollout.fileroot}/${experiment_name}/${trial_name}/balance_reports/
   rollout_balance_report_v20.json
 ```
 
-报告包含唯一的 `report_version`、窗口起止 version、窗口 step 数、有效 timing 样本
-数、累计 wait/step 时间、累计 entered/consumed 以及最终建议。
+报告包含唯一的 `report_version`、窗口起止 version、窗口 step 数、有效 timing 样本 数、累计 wait/step 时间、累计
+entered/consumed 以及最终建议。
 
-建议只形成报告。外部控制系统可以读取报告后，再调用
-`PUT /elastic/desired-instances`。
+建议只形成报告。外部控制系统可以读取报告后，再调用 `PUT /elastic/desired-instances`。
 
 ## 6. 主要文件
 
-| 模块 | 文件 |
-| --- | --- |
-| 弹性配置 | `areal/api/cli_args.py` |
-| 实例状态模型 | `areal/infra/controller/elastic/models.py` |
-| InstancePool | `areal/infra/controller/elastic/instance_pool.py` |
-| 单实例 Launcher | `areal/infra/controller/elastic/launcher.py` |
-| Desired-state Reconciler | `areal/infra/controller/elastic/reconciler.py` |
-| Disk checkpoint catalog | `areal/infra/controller/elastic/disk_catalog.py` |
-| 恢复状态 | `areal/infra/controller/elastic/recovery_state.py` |
-| 扩缩容建议 | `areal/infra/controller/elastic/scaling_report.py` |
-| 外部 autoscaler 安全策略 | `areal/infra/controller/elastic/autoscaler.py` |
-| V1 Controller 集成 | `areal/infra/controller/rollout_controller.py` |
-| V1 Proxy Server | `areal/experimental/openai/proxy/proxy_rollout_server.py`（复用） |
-| 动态并发容量 | `areal/infra/staleness_manager.py` |
-| 训练入口约束和指标接线 | `areal/trainer/rl_trainer.py` |
-| 单 role 隔离穿刺 | `examples/math/rollout_role_spike.py` |
-| HTTP 扩缩容穿刺 | `examples/math/rollout_elastic_controller_spike.py` |
-| 外部 autoscaler 闭环穿刺 | `examples/math/rollout_elastic_autoscaler_spike.py` |
+| 模块                     | 文件                                                              |
+| ------------------------ | ----------------------------------------------------------------- |
+| 弹性配置                 | `areal/api/cli_args.py`                                           |
+| 实例状态模型             | `areal/infra/controller/elastic/models.py`                        |
+| InstancePool             | `areal/infra/controller/elastic/instance_pool.py`                 |
+| 单实例 Launcher          | `areal/infra/controller/elastic/launcher.py`                      |
+| Desired-state Reconciler | `areal/infra/controller/elastic/reconciler.py`                    |
+| Disk checkpoint catalog  | `areal/infra/controller/elastic/disk_catalog.py`                  |
+| 恢复状态                 | `areal/infra/controller/elastic/recovery_state.py`                |
+| 扩缩容建议               | `areal/infra/controller/elastic/scaling_report.py`                |
+| 外部 autoscaler 安全策略 | `areal/infra/controller/elastic/autoscaler.py`                    |
+| V1 Controller 集成       | `areal/infra/controller/rollout_controller.py`                    |
+| V1 Proxy Server          | `areal/experimental/openai/proxy/proxy_rollout_server.py`（复用） |
+| 动态并发容量             | `areal/infra/staleness_manager.py`                                |
+| 训练入口约束和指标接线   | `areal/trainer/rl_trainer.py`                                     |
+| 单 role 隔离穿刺         | `examples/math/rollout_role_spike.py`                             |
+| HTTP 扩缩容穿刺          | `examples/math/rollout_elastic_controller_spike.py`               |
+| 外部 autoscaler 闭环穿刺 | `examples/math/rollout_elastic_autoscaler_spike.py`               |
 
 ## 7. 推荐阅读顺序与实施提交
 
 新分支按依赖关系重新组织提交，每个提交都对应一个可以单独讲清楚的模块：
 
-1. `feat(config): define elastic rollout contract`
-   定义启用条件、实例上下限、并发限制、超时、checkpoint 保留和报告频率。
-2. `feat(infra): add elastic instance state and leases`
-   定义实例状态机、稳定 RPC 身份、线程安全 registry 和缩容安全租约。
-3. `feat(infra): persist elastic rollout weight state`
-   定义 checkpoint catalog、垃圾回收保护和 controller 恢复快照。
-4. `feat(infra): launch and reconcile elastic instances`
-   将 desired capacity 转换为 provision、start、catch-up、ready、drain 和 destroy。
-5. `feat(infra): report rollout scaling recommendations`
-   聚合 step 窗口并生成带死区的扩缩容建议。
-6. `feat(controller): integrate elastic rollout runtime`
-   接入动态路由、任务/result lease、权重更新屏障、HTTP 状态和恢复逻辑。
-7. `feat(observability): expose elastic rollout diagnostics`
-   暴露 step 总时间、READY rollout 总卡数，并为超时补充 task、instance、phase、
-   版本和实际 elapsed 上下文。
-8. `feat(infra): add guarded rollout autoscaler policy`
-   将 cooldown、水位线、陈旧报告过滤和连续缩容确认从 HTTP 脚本抽成纯策略对象。
-9. `docs(infra): explain elastic rollout architecture`
-    汇总运行边界、验证方法和上述阅读主线。
+1. `feat(config): define elastic rollout contract` 定义启用条件、实例上下限、并发限制、超时、checkpoint
+   保留和报告频率。
+1. `feat(infra): add elastic instance state and leases` 定义实例状态机、稳定 RPC 身份、线程安全 registry
+   和缩容安全租约。
+1. `feat(infra): persist elastic rollout weight state` 定义 checkpoint catalog、垃圾回收保护和
+   controller 恢复快照。
+1. `feat(infra): launch and reconcile elastic instances` 将 desired capacity 转换为
+   provision、start、catch-up、ready、drain 和 destroy。
+1. `feat(infra): report rollout scaling recommendations` 聚合 step 窗口并生成带死区的扩缩容建议。
+1. `feat(controller): integrate elastic rollout runtime` 接入动态路由、任务/result
+   lease、权重更新屏障、HTTP 状态和恢复逻辑。
+1. `feat(observability): expose elastic rollout diagnostics` 暴露 step 总时间、READY rollout
+   总卡数，并为超时补充 task、instance、phase、 版本和实际 elapsed 上下文。
+1. `feat(infra): add guarded rollout autoscaler policy` 将 cooldown、水位线、陈旧报告过滤和连续缩容确认从
+   HTTP 脚本抽成纯策略对象。
+1. `docs(infra): explain elastic rollout architecture` 汇总运行边界、验证方法和上述阅读主线。
 
-建议先顺序阅读 1～5 建立控制面模型，再阅读 6 理解数据面接入，最后阅读
-7～9 理解可观测性、故障定位和外部闭环。实例专属 V1 Proxy 被纳入
+建议先顺序阅读 1～5 建立控制面模型，再阅读 6 理解数据面接入，最后阅读 7～9 理解可观测性、故障定位和外部闭环。实例专属 V1 Proxy 被纳入
 AgentWorkflow task 绑定、扩容 READY、失败回滚、缩容删除和 Controller 恢复。
 
 ## 8. 已完成验证
@@ -420,8 +409,8 @@ Isolation verified: deleted ... without disrupting [...]
 - 缩容后保留实例继续正常运行；
 - 当前穿刺运行未报错。
 
-新增的 AgentWorkflow V1 Proxy 生命周期已完成本地静态检查，但尚待公司 NPU
-环境执行 `--verify-proxy` 穿刺和真实 `MathAgent` 端到端训练验证。
+新增的 AgentWorkflow V1 Proxy 生命周期已完成本地静态检查，但尚待公司 NPU 环境执行 `--verify-proxy` 穿刺和真实
+`MathAgent` 端到端训练验证。
 
 本地完成的静态检查包括：
 
@@ -495,8 +484,7 @@ AREAL_SPMD_MODE=false python \
 
 先保持 Controller 或端到端训练进程运行，从日志中取得 callback server 地址。
 
-确定性验证“注入指标、生成报告、读取报告、设置 desired state、等待收敛”的完整
-`1 -> 2 -> 1` 流程：
+确定性验证“注入指标、生成报告、读取报告、设置 desired state、等待收敛”的完整 `1 -> 2 -> 1` 流程：
 
 ```bash
 python examples/math/rollout_elastic_autoscaler_spike.py \
@@ -508,13 +496,13 @@ python examples/math/rollout_elastic_autoscaler_spike.py \
 脚本要求初始状态为 1 个稳定的 `READY` 实例。它会：
 
 1. 注入 `wait_fraction=0.20` 的模拟窗口；
-2. 读取生成的 `scale_up` 报告；
-3. 将报告中的 `recommended_instances=2` 写入 desired state；
-4. 等待 2 个实例全部 `READY` 且权重版本一致；
-5. 连续注入两个低等待模拟窗口；
-6. 读取生成的 `scale_down` 报告并完成连续窗口确认；
-7. 将 `recommended_instances=1` 写入 desired state；
-8. 等待 drain 和缩容完成。
+1. 读取生成的 `scale_up` 报告；
+1. 将报告中的 `recommended_instances=2` 写入 desired state；
+1. 等待 2 个实例全部 `READY` 且权重版本一致；
+1. 连续注入两个低等待模拟窗口；
+1. 读取生成的 `scale_down` 报告并完成连续窗口确认；
+1. 将 `recommended_instances=1` 写入 desired state；
+1. 等待 drain 和缩容完成。
 
 预期最终输出：
 
@@ -537,19 +525,21 @@ python examples/math/rollout_elastic_autoscaler_spike.py \
 python examples/math/rollout_elastic_autoscaler_spike.py \
   --base-url http://127.0.0.1:PORT \
   --poll-interval 5 \
-  --cooldown 30 \
+  --scale-up-cooldown 0 \
+  --scale-down-cooldown 30 \
+  --direction-change-cooldown 30 \
   --require-proxy
 ```
 
 真实报告模式持续运行，使用 `Ctrl-C` 停止。脚本按照 `report_version` 去重，并立即
-消费冷却期、容量未收敛或容量快照不匹配的报告，避免稍后重放旧建议。扩缩容收敛后，
-只有采样窗口完全开始于收敛版本之后的新报告才可执行；仅在建议目标与当前 desired
-state 不同时发送 PUT，并在每次动作后验证实例数量、状态和权重版本是否收敛。
+消费冷却期、容量未收敛或容量快照不匹配的报告，避免稍后重放旧建议。扩缩容收敛后， 只有采样窗口完全开始于收敛版本之后的新报告才可执行；仅在建议目标与当前 desired
+state 不同时发送 PUT，并在每次动作后验证实例数量、状态和权重版本是否收敛。连续 扩容默认不额外冷却，连续缩容和方向反转默认冷却 30 秒；旧的
+`--cooldown` 可用于 恢复所有方向统一冷却的兼容行为。
 
 ### 9.5 端到端训练
 
-`gsm8k_grpo_npu.yaml` 尚未显式声明 `rollout.elastic`，因此命令行新增字段需要使用
-Hydra 的 `+` 语法。使用新的 experiment/trial 名称启动：
+`gsm8k_grpo_npu.yaml` 尚未显式声明 `rollout.elastic`，因此命令行新增字段需要使用 Hydra 的 `+` 语法。使用新的
+experiment/trial 名称启动：
 
 ```bash
 AREAL_SPMD_MODE=false python examples/math/gsm8k_rl.py \
@@ -566,21 +556,21 @@ AREAL_SPMD_MODE=false python examples/math/gsm8k_rl.py \
   trial_name=trial-e2e-01
 ```
 
-该示例继续使用 `areal.workflow.openai.math_agent.MathAgent`。Trainer 会在训练开始前
-调用 `start_proxy()`，为当前和后续扩容实例创建独立 V1 Proxy。
+该示例继续使用 `areal.workflow.openai.math_agent.MathAgent`。Trainer 会在训练开始前 调用
+`start_proxy()`，为当前和后续扩容实例创建独立 V1 Proxy。
 
 验证步骤：
 
 1. 启动正常端到端训练；
-2. 等待至少完成一个训练 step 和一次 disk 权重更新；
-3. 查询 Controller 日志中的 callback 地址；
-4. 调用 HTTP 将 desired 从 1 调整为 2；
-5. 等待新实例完成 V1 Proxy 初始化和 disk 追平后进入 `READY`；
-6. 确认训练继续推进；
-7. 将 desired 从 2 调整回 1；
-8. 确认被删除实例先进入 `DRAINING`；
-9. 确认在途请求完成后 role 被删除；
-10. 确认剩余实例和训练均继续正常运行。
+1. 等待至少完成一个训练 step 和一次 disk 权重更新；
+1. 查询 Controller 日志中的 callback 地址；
+1. 调用 HTTP 将 desired 从 1 调整为 2；
+1. 等待新实例完成 V1 Proxy 初始化和 disk 追平后进入 `READY`；
+1. 确认训练继续推进；
+1. 将 desired 从 2 调整回 1；
+1. 确认被删除实例先进入 `DRAINING`；
+1. 确认在途请求完成后 role 被删除；
+1. 确认剩余实例和训练均继续正常运行。
 
 HTTP 示例：
 
@@ -645,18 +635,17 @@ rollout.elastic.enabled=false
 - Ray 删除 worker 时部分 vLLM 子进程可能需要强制清理；
 - 单实例容量校验基于单节点约束，不覆盖跨节点放置；
 - drain 超时不会强删实例，持续不归零时需要通过状态接口和日志排查；
-- 扩缩容建议使用当前可获得指标，并通过逐实例缩容和连续窗口确认降低抖动风险，
-  阈值仍需结合真实训练负载校准。
+- 扩缩容建议使用当前可获得指标，并通过逐实例缩容和连续窗口确认降低抖动风险， 阈值仍需结合真实训练负载校准。
 
 ### 后续工作
 
 当前主体开发完成后，可按需要继续：
 
 1. 完成公司 NPU 端到端验收和故障注入；
-2. 补充真实 Ray/NPU 集成测试；
-3. 根据真实 workload 校准建议阈值；
-4. 增加外部 autoscaler，由其读取建议并设置 desired state；
-5. 单独设计 Proxy online backend registry、session affinity 和 session drain；
-6. 如未来需要，再设计跨节点完整实例的整体调度和删除协议。
+1. 补充真实 Ray/NPU 集成测试；
+1. 根据真实 workload 校准建议阈值；
+1. 增加外部 autoscaler，由其读取建议并设置 desired state；
+1. 单独设计 Proxy online backend registry、session affinity 和 session drain；
+1. 如未来需要，再设计跨节点完整实例的整体调度和删除协议。
 
 Proxy online 和跨节点实例不应直接叠加到当前实现中，应作为独立设计和验证阶段推进。

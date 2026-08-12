@@ -72,12 +72,12 @@ GET /elastic/scaling-recommendation
 POST /elastic/scaling-recommendation
 ```
 
-`GET /elastic/instances` reports both `serving_version` and
-`pending_update_version`, plus each instance's `loaded_version`, `proxy_role`,
-`proxy_addr`, `proxy_ready`, `inflight_requests`, and
-`available_request_capacity`. Top-level fields report the effective global limit, the
-per-instance limit, and the elastic total ceiling. The `proxy_enabled` field distinguishes an
-AgentWorkflow controller from a RolloutWorkflow controller that needs no proxy.
+`GET /elastic/instances` reports both `serving_version` and `pending_update_version`,
+plus each instance's `loaded_version`, `proxy_role`, `proxy_addr`, `proxy_ready`,
+`inflight_requests`, and `available_request_capacity`. Top-level fields report the
+effective global limit, the per-instance limit, and the elastic total ceiling. The
+`proxy_enabled` field distinguishes an AgentWorkflow controller from a RolloutWorkflow
+controller that needs no proxy.
 
 Set desired capacity with:
 
@@ -92,8 +92,8 @@ initialization and loading the exact committed disk version.
 During scale-out, the reconciler first registers stable identities for the entire
 capacity deficit. An instance is `PENDING` while waiting for Scheduler worker
 allocation, `STARTING` while initializing its server, and `CATCHING_UP` while loading
-the latest committed weights. These non-routable states appear immediately in the
-status endpoint.
+the latest committed weights. These non-routable states appear immediately in the status
+endpoint.
 
 Scale-in first changes an instance to `DRAINING`. It receives no new work and is deleted
 only after workflow tasks, direct requests, and weight-update leases are empty. An
@@ -105,8 +105,8 @@ that still owns work.
 ## Scaling recommendation
 
 Training records the time blocked in `prepare_batch`, step duration, accepted rollouts,
-and consumed samples. The report uses an AstraFlow-inspired three-zone rule adapted
-to AReaL's demand-driven rollout path:
+and consumed samples. The report uses an AstraFlow-inspired three-zone rule adapted to
+AReaL's demand-driven rollout path:
 
 ```text
 wait_fraction > 0.10:
@@ -127,10 +127,12 @@ automatically.
 
 The example autoscaler consumes reports observed during cooldown or unstable capacity
 instead of replaying them later. After convergence it accepts only a report whose
-complete window starts after the convergence version and whose reported capacity
-matches the current stable capacity. Scale-down additionally requires two consecutive
-valid low-wait windows by default (`--scale-down-windows`) and removes at most one
-instance per convergence cycle.
+complete window starts after the convergence version and whose reported capacity matches
+the current stable capacity. Consecutive scale-up has no extra cooldown by default
+(`--scale-up-cooldown=0`); consecutive scale-down and direction reversals default to 30
+seconds. Scale-down additionally requires two consecutive valid low-wait windows
+(`--scale-down-windows`) and removes at most one instance per convergence cycle. The
+legacy `--cooldown` option can still override every direction uniformly.
 
 ## Disk checkpoint retention and recovery
 

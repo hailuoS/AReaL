@@ -18,6 +18,7 @@ class AutoscalerDecision:
 
     action: Literal["ignore", "discard", "defer", "apply"]
     message: str
+    direction: Literal["scale_up", "scale_down"] | None = None
 
     @property
     def should_apply(self) -> bool:
@@ -83,13 +84,31 @@ class ElasticAutoscalerPolicy:
     and conservative scale-down confirmation.
     """
 
-    def __init__(self, *, cooldown_seconds: float, scale_down_windows: int) -> None:
-        if cooldown_seconds < 0:
-            raise ValueError("cooldown_seconds must be non-negative")
+    def __init__(
+        self,
+        *,
+        cooldown_seconds: float | None = None,
+        scale_up_cooldown_seconds: float = 0.0,
+        scale_down_cooldown_seconds: float = 30.0,
+        direction_change_cooldown_seconds: float = 30.0,
+        scale_down_windows: int,
+    ) -> None:
+        cooldowns = {
+            "cooldown_seconds": cooldown_seconds,
+            "scale_up_cooldown_seconds": scale_up_cooldown_seconds,
+            "scale_down_cooldown_seconds": scale_down_cooldown_seconds,
+            "direction_change_cooldown_seconds": direction_change_cooldown_seconds,
+        }
+        if any(value is not None and value < 0 for value in cooldowns.values()):
+            raise ValueError("cooldown seconds must be non-negative")
         self._cooldown_seconds = cooldown_seconds
+        self._scale_up_cooldown_seconds = scale_up_cooldown_seconds
+        self._scale_down_cooldown_seconds = scale_down_cooldown_seconds
+        self._direction_change_cooldown_seconds = direction_change_cooldown_seconds
         self._scale_down = ScaleDownConfirmation(scale_down_windows)
         self._last_report_version: int | None = None
         self._last_action_at = 0.0
+        self._last_action_direction: Literal["scale_up", "scale_down"] | None = None
         self._minimum_window_start_version = 0
         self._last_desired_instances: int | None = None
         self._capacity_was_stable = False
@@ -135,6 +154,8 @@ class ElasticAutoscalerPolicy:
             )
         if desired != self._last_desired_instances:
             self._reset_scale_down()
+            self._last_action_at = 0.0
+            self._last_action_direction = None
             self._last_desired_instances = desired
             self._capacity_was_stable = capacity_stable
             self._minimum_window_start_version = serving_version
@@ -159,9 +180,6 @@ class ElasticAutoscalerPolicy:
                 "discard",
                 f"establishing post-convergence watermark={serving_version}",
             )
-        if now - self._last_action_at < self._cooldown_seconds:
-            self._reset_scale_down()
-            return AutoscalerDecision("discard", "observed during cooldown")
         if report.get("ready_instances") != desired:
             self._reset_scale_down()
             return AutoscalerDecision(
@@ -177,6 +195,19 @@ class ElasticAutoscalerPolicy:
                 f"watermark={self._minimum_window_start_version}",
             )
 
+        direction = _action_direction(report, desired)
+        if direction is not None:
+            cooldown = self._cooldown_for(direction)
+            if now - self._last_action_at < cooldown:
+                self._reset_scale_down()
+                return AutoscalerDecision(
+                    "discard",
+                    f"observed during {direction} cooldown: "
+                    f"last_direction={self._last_action_direction} "
+                    f"cooldown_seconds={cooldown:.1f}",
+                    direction,
+                )
+
         confirmed, observed = self._scale_down.observe(
             report,
             desired=desired,
@@ -189,12 +220,21 @@ class ElasticAutoscalerPolicy:
                 f"scale-down confirmation {observed}/"
                 f"{self._scale_down.required_windows}",
             )
-        return AutoscalerDecision("apply", "report is valid for current topology")
+        return AutoscalerDecision(
+            "apply", "report is valid for current topology", direction
+        )
 
-    def record_convergence(self, status: dict[str, Any], *, now: float) -> None:
+    def record_convergence(
+        self,
+        status: dict[str, Any],
+        *,
+        now: float,
+        action_direction: Literal["scale_up", "scale_down"] | None = None,
+    ) -> None:
         """Advance the watermark after a desired-state change has converged."""
         self._reset_scale_down()
         self._last_action_at = now
+        self._last_action_direction = action_direction
         self._minimum_window_start_version = _required_int(
             status, "serving_version", subject="Converged instance status"
         )
@@ -205,6 +245,31 @@ class ElasticAutoscalerPolicy:
 
     def _reset_scale_down(self) -> None:
         self._scale_down.reset()
+
+    def _cooldown_for(self, direction: Literal["scale_up", "scale_down"]) -> float:
+        if self._cooldown_seconds is not None:
+            return self._cooldown_seconds
+        if (
+            self._last_action_direction is not None
+            and direction != self._last_action_direction
+        ):
+            return self._direction_change_cooldown_seconds
+        if direction == "scale_up":
+            return self._scale_up_cooldown_seconds
+        return self._scale_down_cooldown_seconds
+
+
+def _action_direction(
+    report: dict[str, Any], desired: int
+) -> Literal["scale_up", "scale_down"] | None:
+    recommended = _required_int(
+        report, "recommended_instances", subject="Scaling report"
+    )
+    if recommended > desired:
+        return "scale_up"
+    if recommended < desired:
+        return "scale_down"
+    return None
 
 
 def _required_int(

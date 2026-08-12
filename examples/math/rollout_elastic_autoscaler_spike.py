@@ -303,6 +303,11 @@ def _run_live_loop(options: argparse.Namespace) -> None:
     scale_down_windows = getattr(options, "scale_down_windows", 2)
     policy = ElasticAutoscalerPolicy(
         cooldown_seconds=options.cooldown,
+        scale_up_cooldown_seconds=getattr(options, "scale_up_cooldown", 0.0),
+        scale_down_cooldown_seconds=getattr(options, "scale_down_cooldown", 30.0),
+        direction_change_cooldown_seconds=getattr(
+            options, "direction_change_cooldown", 30.0
+        ),
         scale_down_windows=scale_down_windows,
     )
     logger.info("Polling real training reports; press Ctrl-C to stop")
@@ -348,7 +353,11 @@ def _run_live_loop(options: argparse.Namespace) -> None:
                 )
                 if changed:
                     converged = _get_status(options.base_url, options.request_timeout)
-                    policy.record_convergence(converged, now=time.monotonic())
+                    policy.record_convergence(
+                        converged,
+                        now=time.monotonic(),
+                        action_direction=decision.direction,
+                    )
             time.sleep(options.poll_interval)
         except requests.RequestException as exc:
             logger.warning("HTTP request failed: %s", exc)
@@ -378,7 +387,33 @@ def _parse_args() -> argparse.Namespace:
         help="Require every converged READY instance to own an initialized V1 proxy.",
     )
     parser.add_argument("--poll-interval", type=float, default=2.0)
-    parser.add_argument("--cooldown", type=float, default=30.0)
+    parser.add_argument(
+        "--cooldown",
+        type=float,
+        default=None,
+        help=(
+            "Legacy cooldown applied to every capacity-change direction. When set, "
+            "it overrides the direction-aware cooldown options."
+        ),
+    )
+    parser.add_argument(
+        "--scale-up-cooldown",
+        type=float,
+        default=0.0,
+        help="Cooldown between consecutive scale-up actions (default: 0).",
+    )
+    parser.add_argument(
+        "--scale-down-cooldown",
+        type=float,
+        default=30.0,
+        help="Cooldown between consecutive scale-down actions (default: 30).",
+    )
+    parser.add_argument(
+        "--direction-change-cooldown",
+        type=float,
+        default=30.0,
+        help="Cooldown before reversing the previous scaling direction (default: 30).",
+    )
     parser.add_argument(
         "--scale-down-windows",
         type=int,
@@ -394,12 +429,20 @@ def _parse_args() -> argparse.Namespace:
     options.base_url = options.base_url.rstrip("/")
     for name in (
         "poll_interval",
-        "cooldown",
         "request_timeout",
         "convergence_timeout",
     ):
         if getattr(options, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    if options.cooldown is not None and options.cooldown < 0:
+        parser.error("--cooldown must be non-negative")
+    for name in (
+        "scale_up_cooldown",
+        "scale_down_cooldown",
+        "direction_change_cooldown",
+    ):
+        if getattr(options, name) < 0:
+            parser.error(f"--{name.replace('_', '-')} must be non-negative")
     if options.scale_down_windows <= 0:
         parser.error("--scale-down-windows must be positive")
     return options
