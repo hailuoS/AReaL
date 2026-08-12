@@ -133,6 +133,7 @@ class RolloutController:
         self._elastic_pending_update_version: int | None = None
         self._elastic_catchups_inflight = 0
         self._elastic_pending_worker_roles: set[str] = set()
+        self._elastic_desired_change: tuple[int, float] | None = None
         self._elastic_proxy_enabled = False
         self._elastic_result_lease_lock = threading.Lock()
         self._elastic_result_lease_instance: dict[str, str] = {}
@@ -389,10 +390,91 @@ class RolloutController:
 
     async def _reconcile_elastic_once(self) -> None:
         assert self._elastic_reconciler is not None
+        reconcile_started_at = time.monotonic()
         with self._elastic_reconcile_lock:
-            await self._elastic_reconciler.reconcile_once()
+            reconcile_lock_wait = time.monotonic() - reconcile_started_at
+            desired_count = (
+                self._instance_pool.desired_count
+                if self._instance_pool is not None
+                else 0
+            )
+            desired_change_started_at = None
+            with self._elastic_update_condition:
+                desired_change = self._elastic_desired_change
+                if desired_change is not None and desired_change[0] == desired_count:
+                    desired_change_started_at = desired_change[1]
+                    self._elastic_desired_change = None
+            if desired_change_started_at is not None:
+                logger.info(
+                    "Elastic scale-up timing event=reconcile_started instance_id=- "
+                    "elapsed_seconds=%.3f desired_instances=%d",
+                    time.monotonic() - desired_change_started_at,
+                    desired_count,
+                )
+
+            reconcile_call_started_at = time.monotonic()
+            result = await self._elastic_reconciler.reconcile_once()
+            reconcile_elapsed = time.monotonic() - reconcile_call_started_at
+            should_log_timing = desired_change_started_at is not None or any(
+                (
+                    result.created_instance_ids,
+                    result.removed_instance_ids,
+                    result.draining_instance_ids,
+                    result.failed_instance_ids,
+                )
+            )
+            capacity_started_at = time.monotonic()
             self._refresh_elastic_capacity()
+            capacity_elapsed = time.monotonic() - capacity_started_at
+            ready_instances = (
+                len(self._instance_pool.ready_snapshot())
+                if self._instance_pool is not None
+                else 0
+            )
+            effective_capacity = 0
+            if (
+                self._elastic_capacity_per_instance is not None
+                and self._elastic_total_capacity_limit is not None
+            ):
+                effective_capacity = min(
+                    self._elastic_total_capacity_limit,
+                    ready_instances * self._elastic_capacity_per_instance,
+                )
+            if should_log_timing:
+                logger.info(
+                    "Elastic scale-up timing event=capacity_refreshed instance_id=- "
+                    "elapsed_seconds=%.3f reconcile_lock_wait_seconds=%.3f "
+                    "reconcile_seconds=%.3f capacity_refresh_seconds=%.3f "
+                    "desired_instances=%d ready_instances=%d effective_capacity=%d",
+                    time.monotonic() - reconcile_started_at,
+                    reconcile_lock_wait,
+                    reconcile_elapsed,
+                    capacity_elapsed,
+                    desired_count,
+                    ready_instances,
+                    effective_capacity,
+                )
+            recovery_started_at = time.monotonic()
             self._save_elastic_recovery_state()
+            recovery_elapsed = time.monotonic() - recovery_started_at
+            if should_log_timing:
+                logger.info(
+                    "Elastic scale-up timing event=reconcile_completed instance_id=- "
+                    "elapsed_seconds=%.3f reconcile_lock_wait_seconds=%.3f "
+                    "reconcile_seconds=%.3f "
+                    "capacity_refresh_seconds=%.3f recovery_save_seconds=%.3f "
+                    "desired_instances=%d ready_instances=%d created_instances=%d "
+                    "failed_instances=%d",
+                    time.monotonic() - reconcile_started_at,
+                    reconcile_lock_wait,
+                    reconcile_elapsed,
+                    capacity_elapsed,
+                    recovery_elapsed,
+                    desired_count,
+                    ready_instances,
+                    len(result.created_instance_ids),
+                    len(result.failed_instance_ids),
+                )
 
     def _begin_elastic_catch_up(self) -> None:
         with self._elastic_update_condition:
@@ -1060,15 +1142,34 @@ class RolloutController:
                     }
                 )
 
+            request_started_at = time.monotonic()
             payload = request.get_json(silent=True) or {}
             desired_count = payload.get("desired_instances")
             if isinstance(desired_count, bool) or not isinstance(desired_count, int):
                 return jsonify({"error": "desired_instances must be an integer"}), 400
+            previous_desired_count = self._instance_pool.desired_count
             try:
                 self._instance_pool.set_desired_count(desired_count)
             except InvalidDesiredCountError as exc:
                 return jsonify({"error": str(exc)}), 400
+            if desired_count != previous_desired_count:
+                with self._elastic_update_condition:
+                    self._elastic_desired_change = (
+                        desired_count,
+                        time.monotonic(),
+                    )
+            recovery_started_at = time.monotonic()
             self._save_elastic_recovery_state()
+            logger.info(
+                "Elastic scale-up timing event=desired_instances_accepted "
+                "instance_id=- elapsed_seconds=%.3f recovery_save_seconds=%.3f "
+                "previous_desired_instances=%d desired_instances=%d changed=%s",
+                time.monotonic() - request_started_at,
+                time.monotonic() - recovery_started_at,
+                previous_desired_count,
+                desired_count,
+                desired_count != previous_desired_count,
+            )
             return jsonify(
                 {
                     "desired_instances": self._instance_pool.desired_count,

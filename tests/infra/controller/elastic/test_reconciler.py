@@ -4,9 +4,9 @@ import asyncio
 
 import pytest
 
+import areal.infra.controller.elastic.reconciler as reconciler_module
 from areal.infra.controller.elastic import (
     DiskCheckpointManifest,
-    RolloutInstance,
     RolloutInstancePool,
     RolloutInstanceReconciler,
     RolloutInstanceState,
@@ -112,9 +112,7 @@ class _ParallelLauncher(_FakeLauncher):
 
     async def catch_up_from_disk(self, instance, checkpoint):
         self.active_catchups += 1
-        self.max_active_catchups = max(
-            self.max_active_catchups, self.active_catchups
-        )
+        self.max_active_catchups = max(self.max_active_catchups, self.active_catchups)
         try:
             await asyncio.sleep(0.01)
             await super().catch_up_from_disk(instance, checkpoint)
@@ -206,7 +204,15 @@ async def test_reconciler_registers_pending_instance_before_launch_completes():
 
 
 @pytest.mark.asyncio
-async def test_reconciler_bounds_parallel_startup_and_uses_one_checkpoint(tmp_path):
+async def test_reconciler_bounds_parallel_startup_and_uses_one_checkpoint(
+    tmp_path, monkeypatch
+):
+    timing_logs = []
+    monkeypatch.setattr(
+        reconciler_module.logger,
+        "info",
+        lambda message, *args: timing_logs.append(message % args),
+    )
     pool = RolloutInstancePool(min_instances=1, initial_instances=3, max_instances=3)
     launcher = _ParallelLauncher(expected_starts=2)
     checkpoint_dir = tmp_path / "weight_update_v7"
@@ -242,6 +248,17 @@ async def test_reconciler_bounds_parallel_startup_and_uses_one_checkpoint(tmp_pa
     assert checkpoint_reads == 1
     assert {version for _, version in launcher.caught_up} == {7}
     assert catch_up_guards == ["begin", "end"]
+    assert any("event=batch_started" in log for log in timing_logs)
+    assert any("event=provision_started" in log for log in timing_logs)
+    assert any("event=startup_slot_acquired" in log for log in timing_logs)
+    assert any("event=startup_batch_completed" in log for log in timing_logs)
+    assert any("event=catch_up_guard_wait_started" in log for log in timing_logs)
+    assert any("event=catch_up_guard_acquired" in log for log in timing_logs)
+    assert any("event=catch_up_slot_acquired" in log for log in timing_logs)
+    assert any("event=instance_ready" in log for log in timing_logs)
+    assert any("event=catch_up_batch_completed" in log for log in timing_logs)
+    assert any("event=batch_completed" in log for log in timing_logs)
+    assert all("batch_id=" in log for log in timing_logs)
 
 
 @pytest.mark.asyncio

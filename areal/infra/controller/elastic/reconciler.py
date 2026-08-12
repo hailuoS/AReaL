@@ -17,8 +17,27 @@ from .disk_catalog import DiskCheckpointManifest
 from .instance_pool import RolloutInstancePool
 from .models import InstanceDesiredState, RolloutInstance, RolloutInstanceState
 
-
 logger = logging.getLogger("RolloutInstanceReconciler")
+
+
+def _log_timing(
+    *,
+    event: str,
+    started_at: float,
+    batch_id: str,
+    instance: RolloutInstance | None = None,
+    **context: Any,
+) -> None:
+    fields = " ".join(f"{key}={value}" for key, value in context.items())
+    logger.info(
+        "Elastic scale-up timing event=%s batch_id=%s instance_id=%s "
+        "elapsed_seconds=%.3f%s",
+        event,
+        batch_id,
+        instance.instance_id if instance is not None else "-",
+        time.monotonic() - started_at,
+        f" {fields}" if fields else "",
+    )
 
 
 class _InstanceLauncher(Protocol):
@@ -135,13 +154,41 @@ class RolloutInstanceReconciler:
         return instance
 
     async def _start_instance_bounded(
-        self, instance: RolloutInstance, semaphore: asyncio.Semaphore
+        self,
+        instance: RolloutInstance,
+        semaphore: asyncio.Semaphore,
+        batch_id: str,
     ) -> RolloutInstance:
+        queued_at = time.monotonic()
         async with semaphore:
-            return await asyncio.wait_for(
-                self._start_instance(instance),
-                timeout=self._startup_timeout_seconds,
+            _log_timing(
+                event="startup_slot_acquired",
+                started_at=queued_at,
+                batch_id=batch_id,
+                instance=instance,
             )
+            started_at = time.monotonic()
+            try:
+                result = await asyncio.wait_for(
+                    self._start_instance(instance),
+                    timeout=self._startup_timeout_seconds,
+                )
+            except BaseException as error:
+                _log_timing(
+                    event="startup_task_failed",
+                    started_at=started_at,
+                    batch_id=batch_id,
+                    instance=instance,
+                    error_type=type(error).__name__,
+                )
+                raise
+            _log_timing(
+                event="startup_task_completed",
+                started_at=started_at,
+                batch_id=batch_id,
+                instance=instance,
+            )
+            return result
 
     async def _catch_up_instance(
         self,
@@ -149,13 +196,42 @@ class RolloutInstanceReconciler:
         checkpoint: DiskCheckpointManifest | None,
         version: int,
         semaphore: asyncio.Semaphore,
+        batch_id: str,
     ) -> RolloutInstance:
+        queued_at = time.monotonic()
         async with semaphore:
-            if checkpoint is None:
-                instance.loaded_version = version
-                instance.transition_to(RolloutInstanceState.READY)
-            else:
-                await self._launcher.catch_up_from_disk(instance, checkpoint)
+            _log_timing(
+                event="catch_up_slot_acquired",
+                started_at=queued_at,
+                batch_id=batch_id,
+                instance=instance,
+                version=version,
+            )
+            started_at = time.monotonic()
+            try:
+                if checkpoint is None:
+                    instance.loaded_version = version
+                    instance.transition_to(RolloutInstanceState.READY)
+                else:
+                    await self._launcher.catch_up_from_disk(instance, checkpoint)
+            except BaseException as error:
+                _log_timing(
+                    event="catch_up_task_failed",
+                    started_at=started_at,
+                    batch_id=batch_id,
+                    instance=instance,
+                    version=version,
+                    error_type=type(error).__name__,
+                )
+                raise
+            _log_timing(
+                event="instance_ready",
+                started_at=started_at,
+                batch_id=batch_id,
+                instance=instance,
+                version=version,
+                checkpoint_loaded=checkpoint is not None,
+            )
         return instance
 
     async def reconcile_once(self) -> ReconcileResult:
@@ -225,11 +301,32 @@ class RolloutInstanceReconciler:
             pending_launches.append(instance)
             running.append(instance)
 
+        batch_id = uuid.uuid4().hex[:8]
+        batch_started_at = time.monotonic()
+        if pending_launches:
+            logger.info(
+                "Elastic scale-up timing event=batch_started batch_id=%s "
+                "instance_id=- elapsed_seconds=0.000 desired_instances=%d "
+                "existing_running=%d requested_instances=%d",
+                batch_id,
+                self._pool.desired_count,
+                len(running) - len(pending_launches),
+                len(pending_launches),
+            )
+
         provisioned: list[RolloutInstance] = []
+        provision_batch_started_at = time.monotonic()
         for launch_index, instance in enumerate(pending_launches):
             worker_role = instance.worker_role
             launch_intent_recorded = False
             try:
+                logger.info(
+                    "Elastic scale-up timing event=provision_started batch_id=%s "
+                    "instance_id=%s elapsed_seconds=0.000 worker_role=%s",
+                    batch_id,
+                    instance.instance_id,
+                    worker_role,
+                )
                 self._record_launch_intent(worker_role)
                 launch_intent_recorded = True
                 self._launcher.provision(instance=instance)
@@ -249,17 +346,33 @@ class RolloutInstanceReconciler:
             finally:
                 if launch_intent_recorded:
                     self._clear_launch_intent(worker_role)
+        if pending_launches:
+            _log_timing(
+                event="provision_batch_completed",
+                started_at=provision_batch_started_at,
+                batch_id=batch_id,
+                provisioned_instances=len(provisioned),
+                failed_instances=len(failed),
+            )
 
         started: list[RolloutInstance] = []
         if provisioned:
+            startup_batch_started_at = time.monotonic()
             startup_semaphore = asyncio.Semaphore(self._startup_concurrency)
             start_tasks = [
                 asyncio.create_task(
-                    self._start_instance_bounded(instance, startup_semaphore)
+                    self._start_instance_bounded(instance, startup_semaphore, batch_id)
                 )
                 for instance in provisioned
             ]
             outcomes = await asyncio.gather(*start_tasks, return_exceptions=True)
+            _log_timing(
+                event="startup_batch_completed",
+                started_at=startup_batch_started_at,
+                batch_id=batch_id,
+                instances=len(provisioned),
+                startup_concurrency=self._startup_concurrency,
+            )
             for instance, outcome in zip(provisioned, outcomes, strict=True):
                 if isinstance(outcome, BaseException):
                     failed.append(instance.instance_id)
@@ -290,14 +403,35 @@ class RolloutInstanceReconciler:
         started = started[:keep_count]
 
         if started:
+            guard_started_at = time.monotonic()
+            logger.info(
+                "Elastic scale-up timing event=catch_up_guard_wait_started "
+                "batch_id=%s instance_id=- elapsed_seconds=0.000 instances=%d",
+                batch_id,
+                len(started),
+            )
             self._begin_catch_up()
+            _log_timing(
+                event="catch_up_guard_acquired",
+                started_at=guard_started_at,
+                batch_id=batch_id,
+                instances=len(started),
+            )
             try:
                 try:
+                    checkpoint_lookup_started_at = time.monotonic()
                     checkpoint = self._latest_checkpoint()
                     version = (
                         checkpoint.version
                         if checkpoint is not None
                         else self._current_version()
+                    )
+                    _log_timing(
+                        event="checkpoint_resolved",
+                        started_at=checkpoint_lookup_started_at,
+                        batch_id=batch_id,
+                        version=version,
+                        checkpoint_available=checkpoint is not None,
                     )
                     # Pin one target version for the entire batch before any
                     # semaphore waiter starts loading it. Checkpoint GC can then
@@ -305,14 +439,27 @@ class RolloutInstanceReconciler:
                     for instance in started:
                         instance.loaded_version = version
                     semaphore = asyncio.Semaphore(self._catch_up_concurrency)
+                    catch_up_batch_started_at = time.monotonic()
                     outcomes = await asyncio.gather(
                         *(
                             self._catch_up_instance(
-                                instance, checkpoint, version, semaphore
+                                instance,
+                                checkpoint,
+                                version,
+                                semaphore,
+                                batch_id,
                             )
                             for instance in started
                         ),
                         return_exceptions=True,
+                    )
+                    _log_timing(
+                        event="catch_up_batch_completed",
+                        started_at=catch_up_batch_started_at,
+                        batch_id=batch_id,
+                        instances=len(started),
+                        catch_up_concurrency=self._catch_up_concurrency,
+                        version=version,
                     )
                 except Exception as error:
                     outcomes = [error] * len(started)
@@ -330,6 +477,16 @@ class RolloutInstanceReconciler:
                     )
                 else:
                     created.append(instance.instance_id)
+
+        if pending_launches:
+            _log_timing(
+                event="batch_completed",
+                started_at=batch_started_at,
+                batch_id=batch_id,
+                requested_instances=len(pending_launches),
+                ready_instances=len(created),
+                failed_instances=len(failed),
+            )
 
         instances = [
             self._pool.get(instance_id) for instance_id in self._pool.instance_ids()

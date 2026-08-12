@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import time
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -17,11 +18,33 @@ from areal.api import (
 )
 from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import InferenceEngineConfig, SchedulingSpec
+from areal.utils import logging
 from areal.utils.network import format_hostport
 
 from .disk_catalog import DiskCheckpointManifest
 from .errors import SingleNodeInstanceError
 from .models import RolloutInstance, RolloutInstanceState
+
+logger = logging.getLogger("RolloutInstanceLauncher")
+
+
+def _log_timing(
+    instance: RolloutInstance,
+    *,
+    event: str,
+    started_at: float,
+    **context: Any,
+) -> None:
+    fields = " ".join(f"{key}={value}" for key, value in context.items())
+    logger.info(
+        "Elastic scale-up timing event=%s instance_id=%s worker_role=%s "
+        "elapsed_seconds=%.3f%s",
+        event,
+        instance.instance_id,
+        instance.worker_role,
+        time.monotonic() - started_at,
+        f" {fields}" if fields else "",
+    )
 
 
 @dataclass(frozen=True)
@@ -81,6 +104,7 @@ class RolloutInstanceLauncher:
         Scheduler implementations mutate shared resource and worker registries from
         synchronous methods, so callers must serialize this phase.
         """
+        started_at = time.monotonic()
         self._validate_single_node_capacity()
         if instance.state is not RolloutInstanceState.PENDING:
             raise ValueError("instance must be PENDING before provisioning")
@@ -102,7 +126,14 @@ class RolloutInstanceLauncher:
                 )
             instance.worker_id = worker_ids[0]
             instance.transition_to(RolloutInstanceState.STARTING)
-        except BaseException:
+            _log_timing(instance, event="provision_completed", started_at=started_at)
+        except BaseException as error:
+            _log_timing(
+                instance,
+                event="provision_failed",
+                started_at=started_at,
+                error_type=type(error).__name__,
+            )
             if instance.state is not RolloutInstanceState.FAILED:
                 instance.transition_to(RolloutInstanceState.FAILED)
             if workers_created:
@@ -120,7 +151,9 @@ class RolloutInstanceLauncher:
         if instance.state is not RolloutInstanceState.STARTING:
             raise ValueError("instance must be STARTING before start")
 
+        startup_started_at = time.monotonic()
         try:
+            phase_started_at = time.monotonic()
             workers = self._scheduler.get_workers(role=instance.worker_role)
             if len(workers) != 1:
                 raise RuntimeError(
@@ -134,18 +167,25 @@ class RolloutInstanceLauncher:
                     f"Provisioned Worker ID {instance.worker_id} does not match "
                     f"ready Worker ID {worker.id}"
                 )
+            _log_timing(instance, event="worker_ready", started_at=phase_started_at)
+
+            phase_started_at = time.monotonic()
             await self._scheduler.create_engine(
                 worker_id=worker.id,
                 engine=f"{self._inf_engine.__module__}.{self._inf_engine.__name__}",
                 engine_name=instance.engine_name,
                 config=self._config,
             )
+            _log_timing(instance, event="engine_created", started_at=phase_started_at)
+
+            phase_started_at = time.monotonic()
             server_info = await self._scheduler.async_call_engine(
                 worker_id=worker.id,
                 method="launch_server",
                 engine_name=instance.engine_name,
                 server_args=deepcopy(server_args),
             )
+            _log_timing(instance, event="server_launched", started_at=phase_started_at)
             if not isinstance(server_info, LocalInfServerInfo):
                 raise TypeError(
                     "launch_server must return LocalInfServerInfo, got "
@@ -157,6 +197,7 @@ class RolloutInstanceLauncher:
             init_kwargs = dict(initialize_kwargs or {})
             if init_kwargs.get("train_data_parallel_size") is None:
                 init_kwargs["train_data_parallel_size"] = 1
+            phase_started_at = time.monotonic()
             await self._scheduler.async_call_engine(
                 worker_id=worker.id,
                 method="initialize",
@@ -166,9 +207,23 @@ class RolloutInstanceLauncher:
                 num_engines=1,
                 **init_kwargs,
             )
+            _log_timing(
+                instance, event="engine_initialized", started_at=phase_started_at
+            )
             instance.transition_to(RolloutInstanceState.CATCHING_UP)
+            _log_timing(
+                instance,
+                event="startup_completed",
+                started_at=startup_started_at,
+            )
             return RolloutLaunchResult(instance=instance, server_info=server_info)
-        except BaseException:
+        except BaseException as error:
+            _log_timing(
+                instance,
+                event="startup_failed",
+                started_at=startup_started_at,
+                error_type=type(error).__name__,
+            )
             if instance.state is not RolloutInstanceState.FAILED:
                 instance.transition_to(RolloutInstanceState.FAILED)
             raise
@@ -204,35 +259,54 @@ class RolloutInstanceLauncher:
 
         proxy_role = self.proxy_role(instance)
         proxy_created = False
+        proxy_started_at = time.monotonic()
         try:
+            phase_started_at = time.monotonic()
             worker_ids = self._scheduler.fork_workers(
                 role=proxy_role,
                 target_role=instance.worker_role,
                 command="areal.experimental.openai.proxy.proxy_rollout_server",
             )
+            _log_timing(instance, event="proxy_forked", started_at=phase_started_at)
             proxy_created = True
+            phase_started_at = time.monotonic()
             workers = self._scheduler.get_workers(role=proxy_role)
             if len(worker_ids) != 1 or len(workers) != 1:
                 raise RuntimeError(
                     f"Expected one proxy Worker for {instance.instance_id}, got "
                     f"ids={len(worker_ids)} workers={len(workers)}"
                 )
+            _log_timing(
+                instance, event="proxy_worker_ready", started_at=phase_started_at
+            )
 
             worker = workers[0]
             if not worker.worker_ports:
                 raise RuntimeError(f"Proxy worker {worker.id} has no HTTP port")
             engine_name = f"proxy/{instance.instance_id}"
+            phase_started_at = time.monotonic()
             await self._scheduler.create_engine(
                 worker_id=worker.id,
                 engine=f"{self._inf_engine.__module__}.{self._inf_engine.__name__}",
                 engine_name=engine_name,
                 config=self._config,
             )
+            _log_timing(
+                instance,
+                event="proxy_engine_created",
+                started_at=phase_started_at,
+            )
+            phase_started_at = time.monotonic()
             await self._scheduler.async_call_engine(
                 worker_id=worker.id,
                 method="initialize",
                 engine_name=engine_name,
                 addr=format_hostport(instance.server_host, instance.server_port),
+            )
+            _log_timing(
+                instance,
+                event="proxy_initialized",
+                started_at=phase_started_at,
             )
             instance.attach_proxy(
                 role=proxy_role,
@@ -240,7 +314,18 @@ class RolloutInstanceLauncher:
                 engine_name=engine_name,
                 addr=f"http://{format_hostport(worker.ip, int(worker.worker_ports[0]))}",
             )
-        except BaseException:
+            _log_timing(
+                instance,
+                event="proxy_completed",
+                started_at=proxy_started_at,
+            )
+        except BaseException as error:
+            _log_timing(
+                instance,
+                event="proxy_failed",
+                started_at=proxy_started_at,
+                error_type=type(error).__name__,
+            )
             if proxy_created:
                 self._scheduler.delete_workers(role=proxy_role)
             raise
@@ -263,29 +348,64 @@ class RolloutInstanceLauncher:
         # Expose the version being loaded while CATCHING_UP so checkpoint GC
         # protects the directory until this RPC finishes.
         instance.loaded_version = checkpoint.version
+        catch_up_started_at = time.monotonic()
         try:
+            phase_started_at = time.monotonic()
             await self._scheduler.async_call_engine(
                 worker_id=instance.worker_id,
                 method="update_weights_from_disk",
                 engine_name=instance.engine_name,
                 meta=meta,
             )
+            _log_timing(
+                instance,
+                event="disk_weights_loaded",
+                started_at=phase_started_at,
+                version=checkpoint.version,
+            )
+            phase_started_at = time.monotonic()
             await self._scheduler.async_call_engine(
                 worker_id=instance.worker_id,
                 method="set_version",
                 engine_name=instance.engine_name,
                 version=checkpoint.version,
             )
+            _log_timing(
+                instance,
+                event="engine_version_set",
+                started_at=phase_started_at,
+                version=checkpoint.version,
+            )
             if instance.proxy_ready:
+                phase_started_at = time.monotonic()
                 await self._scheduler.async_call_engine(
                     worker_id=instance.proxy_worker_id,
                     method="set_version",
                     engine_name=instance.proxy_engine_name,
                     version=checkpoint.version,
                 )
+                _log_timing(
+                    instance,
+                    event="proxy_version_set",
+                    started_at=phase_started_at,
+                    version=checkpoint.version,
+                )
             instance.loaded_version = checkpoint.version
             instance.transition_to(RolloutInstanceState.READY)
-        except BaseException:
+            _log_timing(
+                instance,
+                event="catch_up_completed",
+                started_at=catch_up_started_at,
+                version=checkpoint.version,
+            )
+        except BaseException as error:
+            _log_timing(
+                instance,
+                event="catch_up_failed",
+                started_at=catch_up_started_at,
+                version=checkpoint.version,
+                error_type=type(error).__name__,
+            )
             instance.transition_to(RolloutInstanceState.FAILED)
             raise
 
