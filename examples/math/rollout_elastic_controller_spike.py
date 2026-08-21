@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Exercise RolloutController V1 elasticity over HTTP on one node.
+"""Exercise RolloutController V1 elasticity over HTTP on Ray.
 
 Example::
 
@@ -31,6 +31,12 @@ _CONTROLLER_ROLE = f"rollout-elastic-http-spike-controller-{uuid4().hex[:8]}"
 def _parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--scale-up-to",
+        type=int,
+        default=2,
+        help="Desired instance count used for the scale-up phase. Defaults to 2.",
+    )
+    parser.add_argument(
         "--verify-recommendation",
         action="store_true",
         help="Check AstraFlow scale-up, hold, and scale-down reports.",
@@ -50,6 +56,8 @@ def _parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         config_args = config_args[1:]
     if not config_args:
         parser.error("Pass the normal GRPO config path and overrides after '--'.")
+    if options.scale_up_to < 2:
+        parser.error("--scale-up-to must be at least 2")
     return options, config_args
 
 
@@ -141,7 +149,7 @@ def _verify_recommendations(base_url: str, ready_instances: int) -> None:
     if ready_instances == 1:
         expected = ("scale_up", 2, 2.0)
     else:
-        expected = ("scale_down", 1, 0.1)
+        expected = ("scale_down", ready_instances - 1, 0.1)
     branch, target, wait = expected
     report = _recommend(
         base_url,
@@ -166,7 +174,7 @@ def main(argv: list[str] | None = None) -> None:
     rollout.elastic.enabled = True
     rollout.elastic.min_instances = 1
     rollout.elastic.initial_instances = 1
-    rollout.elastic.max_instances = 2
+    rollout.elastic.max_instances = options.scale_up_to
     rollout.elastic.role_prefix = "rollout-elastic-http-spike"
     rollout.elastic.reconcile_interval_seconds = 2.0
 
@@ -193,10 +201,17 @@ def main(argv: list[str] | None = None) -> None:
         if options.verify_recommendation:
             _verify_recommendations(base_url, ready_instances=1)
 
-        _set_desired(base_url, 2)
-        _wait_for_instances(base_url, 2, require_proxy=options.verify_proxy)
+        _set_desired(base_url, options.scale_up_to)
+        _wait_for_instances(
+            base_url,
+            options.scale_up_to,
+            require_proxy=options.verify_proxy,
+        )
         if options.verify_recommendation:
-            _verify_recommendations(base_url, ready_instances=2)
+            _verify_recommendations(
+                base_url,
+                ready_instances=options.scale_up_to,
+            )
 
         _set_desired(base_url, 1)
         _wait_for_instances(base_url, 1, require_proxy=options.verify_proxy)
@@ -205,7 +220,10 @@ def main(argv: list[str] | None = None) -> None:
             raise RuntimeError(
                 f"Scale-in removed the original role: {initial_role} -> {final_role}"
             )
-        logger.info("Elastic Controller HTTP 1->2->1 spike passed")
+        logger.info(
+            "Elastic Controller HTTP 1->%d->1 spike passed",
+            options.scale_up_to,
+        )
     finally:
         controller.destroy()
 
