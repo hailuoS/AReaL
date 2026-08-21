@@ -67,11 +67,18 @@ class RolloutInstanceLauncher:
         inf_engine: type[InferenceEngine],
         config: InferenceEngineConfig,
         rollout_alloc: ModelAllocation,
+        resource_provision_timeout_seconds: float | None = None,
     ) -> None:
         self._scheduler = scheduler
         self._inf_engine = inf_engine
         self._config = config
         self._rollout_alloc = rollout_alloc
+        if (
+            resource_provision_timeout_seconds is not None
+            and resource_provision_timeout_seconds <= 0
+        ):
+            raise ValueError("resource_provision_timeout_seconds must be positive")
+        self._resource_provision_timeout_seconds = resource_provision_timeout_seconds
         capacity_provider_factory = getattr(
             scheduler, "create_worker_capacity_provider", None
         )
@@ -196,7 +203,10 @@ class RolloutInstanceLauncher:
             return results
 
         try:
-            outcomes = await self._capacity_provider.provision_many(jobs)
+            outcomes = await self._capacity_provider.provision_many(
+                jobs,
+                timeout=self._resource_provision_timeout_seconds,
+            )
             if len(outcomes) != len(jobs):
                 for outcome in outcomes:
                     if outcome.succeeded:

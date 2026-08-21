@@ -6,6 +6,7 @@ import getpass
 import os
 import shlex
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -72,6 +73,10 @@ DEVICE_CONTROL_ENV_VARS = {
     "GPU": "CUDA_VISIBLE_DEVICES",
     "NPU": "ASCEND_RT_VISIBLE_DEVICES",
 }
+
+
+class _PlacementGroupWaitCancelled(Exception):
+    pass
 
 
 def _read_log_tail(log_file: str, lines: int = 50) -> str:
@@ -425,6 +430,10 @@ class RayWorkerReservation:
     ready: bool = False
     activated: bool = False
     cancelled: bool = False
+    cancel_event: threading.Event = field(
+        default_factory=threading.Event,
+        repr=False,
+    )
 
 
 class RayWorkerCapacityProvider(WorkerCapacityProvider):
@@ -433,70 +442,117 @@ class RayWorkerCapacityProvider(WorkerCapacityProvider):
     def __init__(self, scheduler: "RayScheduler") -> None:
         self._scheduler = scheduler
 
-    async def provision_many(self, jobs: list[Job]) -> list[WorkerProvisionOutcome]:
+    async def provision_many(
+        self,
+        jobs: list[Job],
+        *,
+        timeout: float | None = None,
+    ) -> list[WorkerProvisionOutcome]:
         reservations: list[tuple[int, RayWorkerReservation]] = []
         outcomes: list[WorkerProvisionOutcome | None] = [None] * len(jobs)
+        wait_tasks: list[asyncio.Task[None]] = []
+        activation_task: asyncio.Task[list[str]] | None = None
 
-        # Submit every valid placement group first. This lets Ray autoscaler see
-        # the whole capacity gap instead of discovering roles one at a time.
-        for index, job in enumerate(jobs):
-            try:
-                reservation = self._scheduler.request_worker_job(job)
-            except Exception as error:
-                outcomes[index] = WorkerProvisionOutcome(
-                    role=job.role,
-                    error=error,
-                )
-            else:
-                reservations.append((index, reservation))
+        try:
+            # Submit every valid placement group first. This lets Ray autoscaler
+            # see the whole capacity gap instead of discovering roles one at a time.
+            for index, job in enumerate(jobs):
+                try:
+                    reservation = self._scheduler.request_worker_job(job)
+                except Exception as error:
+                    outcomes[index] = WorkerProvisionOutcome(
+                        role=job.role,
+                        error=error,
+                    )
+                else:
+                    reservations.append((index, reservation))
 
-        wait_results = await asyncio.gather(
-            *(
-                asyncio.to_thread(
-                    self._scheduler.wait_worker_reservation,
-                    reservation,
+            wait_tasks = [
+                asyncio.create_task(
+                    asyncio.to_thread(
+                        self._scheduler.wait_worker_reservation,
+                        reservation,
+                        timeout=timeout,
+                    )
                 )
                 for _, reservation in reservations
-            ),
-            return_exceptions=True,
-        )
-
-        # Activation mutates RayScheduler's role registries, so keep it
-        # serialized after all placement-group waits have completed.
-        for (index, reservation), wait_result in zip(
-            reservations, wait_results, strict=True
-        ):
-            if isinstance(wait_result, Exception):
-                outcomes[index] = WorkerProvisionOutcome(
-                    role=reservation.role,
-                    error=wait_result,
-                )
-                continue
-            try:
-                worker_ids = await asyncio.to_thread(
-                    self._scheduler.activate_worker_reservation,
-                    reservation,
-                )
-            except Exception as error:
-                outcomes[index] = WorkerProvisionOutcome(
-                    role=reservation.role,
-                    error=error,
-                )
-            else:
-                outcomes[index] = WorkerProvisionOutcome(
-                    role=reservation.role,
-                    worker_ids=tuple(worker_ids),
-                )
-
-        return [
-            outcome
-            if outcome is not None
-            else WorkerProvisionOutcome(
-                role=job.role,
-                error=RuntimeError(f"No provisioning outcome for role '{job.role}'"),
+            ]
+            wait_results = await asyncio.gather(
+                *(asyncio.shield(task) for task in wait_tasks),
+                return_exceptions=True,
             )
-            for job, outcome in zip(jobs, outcomes, strict=True)
-        ]
+
+            # Activation mutates RayScheduler's role registries, so keep it
+            # serialized after all placement-group waits have completed.
+            for (index, reservation), wait_result in zip(
+                reservations, wait_results, strict=True
+            ):
+                if isinstance(wait_result, asyncio.CancelledError):
+                    raise wait_result
+                if isinstance(wait_result, Exception):
+                    outcomes[index] = WorkerProvisionOutcome(
+                        role=reservation.role,
+                        error=wait_result,
+                    )
+                    continue
+                try:
+                    activation_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            self._scheduler.activate_worker_reservation,
+                            reservation,
+                        )
+                    )
+                    worker_ids = await asyncio.shield(activation_task)
+                    activation_task = None
+                except Exception as error:
+                    outcomes[index] = WorkerProvisionOutcome(
+                        role=reservation.role,
+                        error=error,
+                    )
+                else:
+                    outcomes[index] = WorkerProvisionOutcome(
+                        role=reservation.role,
+                        worker_ids=tuple(worker_ids),
+                    )
+
+            return [
+                outcome
+                if outcome is not None
+                else WorkerProvisionOutcome(
+                    role=job.role,
+                    error=RuntimeError(
+                        f"No provisioning outcome for role '{job.role}'"
+                    ),
+                )
+                for job, outcome in zip(jobs, outcomes, strict=True)
+            ]
+        except asyncio.CancelledError:
+            # Shielded thread work must settle before deleting an activated role.
+            if activation_task is not None:
+                await asyncio.gather(activation_task, return_exceptions=True)
+            await self._cancel_reservations(reservations)
+            if wait_tasks:
+                await asyncio.gather(*wait_tasks, return_exceptions=True)
+            raise
+
+    async def _cancel_reservations(
+        self, reservations: list[tuple[int, RayWorkerReservation]]
+    ) -> None:
+        for _, reservation in reservations:
+            try:
+                if reservation.activated:
+                    await asyncio.to_thread(
+                        self._scheduler.delete_workers,
+                        role=reservation.role,
+                    )
+                elif not reservation.cancelled:
+                    self._scheduler.cancel_worker_reservation(reservation)
+            except Exception:
+                logger.warning(
+                    "Failed to clean up cancelled Ray capacity reservation role=%s",
+                    reservation.role,
+                    exc_info=True,
+                )
 
 
 class RayMultiNodeRolloutCoordinator:
@@ -1403,12 +1459,15 @@ class RayScheduler(Scheduler):
         pg: Any,
         bundles: list[dict[str, Any]],
         timeout: float,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         """Wait until a submitted placement group has reserved its resources."""
         try:
             ready_ref = pg.ready()
             tik = time.time()
             while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise _PlacementGroupWaitCancelled
                 elapsed = time.time() - tik
                 remaining = timeout - elapsed
                 if remaining <= 0:
@@ -1434,6 +1493,12 @@ class RayScheduler(Scheduler):
                     ray.available_resources(),
                     ray.cluster_resources(),
                 )
+        except _PlacementGroupWaitCancelled as error:
+            raise WorkerCreationError(
+                role,
+                "Ray placement group wait cancelled",
+                f"Placement Group bundles: {bundles}",
+            ) from error
         except TimeoutError as e:
             remove_placement_group(pg)
             logger.error(
@@ -1450,6 +1515,12 @@ class RayScheduler(Scheduler):
                 f"Placement Group bundles: {bundles}",
             ) from e
         except Exception as e:
+            if cancel_event is not None and cancel_event.is_set():
+                raise WorkerCreationError(
+                    role,
+                    "Ray placement group wait cancelled",
+                    f"Placement Group bundles: {bundles}",
+                ) from e
             remove_placement_group(pg)
             raise WorkerCreationError(
                 role,
@@ -1631,6 +1702,7 @@ class RayScheduler(Scheduler):
                 reservation.placement_group,
                 reservation.bundles,
                 self.startup_timeout if timeout is None else timeout,
+                cancel_event=reservation.cancel_event,
             )
         except BaseException:
             self._pending_worker_reservations.pop(reservation.role, None)
@@ -1652,6 +1724,7 @@ class RayScheduler(Scheduler):
                 f"worker reservation for role '{reservation.role}' is not pending"
             )
         self._pending_worker_reservations.pop(reservation.role, None)
+        reservation.cancel_event.set()
         remove_placement_group(reservation.placement_group)
         reservation.cancelled = True
 

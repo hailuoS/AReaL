@@ -2345,6 +2345,16 @@ class ElasticRolloutConfig:
         default=300.0,
         metadata={"help": "Maximum time to wait for an instance drain in seconds."},
     )
+    resource_provision_timeout_seconds: float = field(
+        default=900.0,
+        metadata={
+            "help": (
+                "Deadline for Ray to provision worker resources for an elastic "
+                "scale-up batch, including cluster autoscaler node startup time, "
+                "in seconds."
+            )
+        },
+    )
     startup_timeout_seconds: float = field(
         default=300.0,
         metadata={
@@ -2428,6 +2438,10 @@ class ElasticRolloutConfig:
             raise ValueError("elastic.reconcile_interval_seconds must be positive")
         if self.drain_timeout_seconds < 0:
             raise ValueError("elastic.drain_timeout_seconds must be non-negative")
+        if self.resource_provision_timeout_seconds <= 0:
+            raise ValueError(
+                "elastic.resource_provision_timeout_seconds must be positive"
+            )
         if self.startup_timeout_seconds <= 0:
             raise ValueError("elastic.startup_timeout_seconds must be positive")
         if self.startup_concurrency <= 0:

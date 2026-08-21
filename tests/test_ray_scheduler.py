@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
 import gc
 import sys
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -230,9 +232,11 @@ def test_worker_reservation_wait_and_cancel_are_separate(tmp_path, monkeypatch):
         pg,
         reservation.bundles,
         123.0,
+        cancel_event=reservation.cancel_event,
     )
     assert reservation.ready
     assert reservation.cancelled
+    assert reservation.cancel_event.is_set()
     assert scheduler._pending_worker_reservations == {}
     remove_pg.assert_called_once_with(pg)
 
@@ -278,7 +282,8 @@ async def test_capacity_provider_submits_all_demands_before_waiting():
         events.append(("request", job.role))
         return SimpleNamespace(role=job.role)
 
-    def wait(reservation):
+    def wait(reservation, *, timeout=None):
+        assert timeout == 45.0
         assert [event[0] for event in events[:3]] == ["request"] * 3
         events.append(("wait", reservation.role))
 
@@ -295,7 +300,7 @@ async def test_capacity_provider_submits_all_demands_before_waiting():
         for index in range(3)
     ]
 
-    outcomes = await provider.provision_many(jobs)
+    outcomes = await provider.provision_many(jobs, timeout=45.0)
 
     assert [outcome.role for outcome in outcomes] == [job.role for job in jobs]
     assert [outcome.worker_ids for outcome in outcomes] == [
@@ -314,7 +319,7 @@ async def test_capacity_provider_preserves_partial_success():
         role=job.role
     )
 
-    def wait(reservation):
+    def wait(reservation, *, timeout=None):
         if reservation.role == "rollout-1":
             raise RuntimeError("capacity unavailable")
 
@@ -337,6 +342,48 @@ async def test_capacity_provider_preserves_partial_success():
         call.args[0].role
         for call in scheduler.activate_worker_reservation.call_args_list
     ] == ["rollout-0", "rollout-2"]
+
+
+@pytest.mark.asyncio
+async def test_capacity_provider_cancellation_removes_pending_demands():
+    scheduler = Mock()
+    wait_started = threading.Event()
+    wait_released = threading.Event()
+
+    def request(job):
+        return SimpleNamespace(
+            role=job.role,
+            activated=False,
+            cancelled=False,
+        )
+
+    def wait(_reservation, *, timeout=None):
+        wait_started.set()
+        wait_released.wait(timeout=1.0)
+        raise RuntimeError("reservation cancelled")
+
+    def cancel(reservation):
+        reservation.cancelled = True
+        wait_released.set()
+
+    scheduler.request_worker_job.side_effect = request
+    scheduler.wait_worker_reservation.side_effect = wait
+    scheduler.cancel_worker_reservation.side_effect = cancel
+    provider = RayWorkerCapacityProvider(scheduler)
+    jobs = [
+        Job(role=f"rollout-{index}", replicas=1, tasks=[SchedulingSpec(gpu=1)])
+        for index in range(2)
+    ]
+
+    provision_task = asyncio.create_task(provider.provision_many(jobs, timeout=30.0))
+    assert await asyncio.to_thread(wait_started.wait, 1.0)
+    provision_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await provision_task
+
+    assert scheduler.cancel_worker_reservation.call_count == 2
+    scheduler.activate_worker_reservation.assert_not_called()
 
 
 def test_zero_replicas_fails(tmp_path):

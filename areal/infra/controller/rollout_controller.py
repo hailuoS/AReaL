@@ -331,6 +331,9 @@ class RolloutController:
             inf_engine=self.inf_engine,
             config=self.config,
             rollout_alloc=self.rollout_alloc,
+            resource_provision_timeout_seconds=(
+                self.config.elastic.resource_provision_timeout_seconds
+            ),
         )
         self._elastic_reconciler = RolloutInstanceReconciler(
             pool=self._instance_pool,

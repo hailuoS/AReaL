@@ -42,8 +42,9 @@ min(
 Controller 在同一个 InstancePool 锁内选择 Controller 可见在途请求最少、且尚未达到 单实例上限的 `READY`
 实例并立即记账。新实例加入后会优先承接后续请求，已绑定到老 实例的请求不会迁移。相同负载使用轮询打破平局。
 
-`startup_concurrency` 默认值为 `2`，用于限制同时初始化推理引擎、server 和 proxy 的实例数。实例获得启动并发槽位后才单独开始计算
-`startup_timeout_seconds`，排队 等待并发槽位的时间不计入启动超时。
+`resource_provision_timeout_seconds` 默认值为 `900`，覆盖 Ray placement group 等待时间，包括 KubeRay
+worker Pod 和节点的启动时间。资源就绪后，`startup_concurrency` 默认值为 `2`，用于限制同时初始化推理引擎、server 和 proxy
+的实例数。实例获得启动 并发槽位后才单独开始计算 `startup_timeout_seconds`；资源申请和等待并发槽位的时间都不 计入实例启动超时。
 
 ## HTTP 控制和状态
 

@@ -28,5 +28,8 @@ class WorkerCapacityProvider(Protocol):
     """Submit worker demands as one batch without changing Scheduler's API."""
 
     async def provision_many(
-        self, jobs: Sequence[Job]
+        self,
+        jobs: Sequence[Job],
+        *,
+        timeout: float | None = None,
     ) -> list[WorkerProvisionOutcome]: ...

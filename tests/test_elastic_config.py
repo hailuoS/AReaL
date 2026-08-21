@@ -31,6 +31,7 @@ def test_elastic_rollout_config_is_disabled_by_default():
         ({"role_prefix": "Rollout"}, "role_prefix"),
         ({"reconcile_interval_seconds": 0}, "positive"),
         ({"drain_timeout_seconds": -1}, "non-negative"),
+        ({"resource_provision_timeout_seconds": 0}, "positive"),
         ({"startup_timeout_seconds": 0}, "positive"),
         ({"startup_concurrency": 0}, "positive"),
         ({"catch_up_concurrency": 0}, "positive"),
@@ -53,6 +54,7 @@ def test_elastic_rollout_config_accepts_scale_out_contract():
         role_prefix="rollout-elastic",
         checkpoint_retention=3,
         report_freq_steps=20,
+        resource_provision_timeout_seconds=600,
         startup_timeout_seconds=120,
         startup_concurrency=2,
         catch_up_concurrency=2,
@@ -63,6 +65,7 @@ def test_elastic_rollout_config_accepts_scale_out_contract():
     assert config.enabled
     assert config.max_instances == 4
     assert config.report_freq_steps == 20
+    assert config.resource_provision_timeout_seconds == 600
     assert config.startup_timeout_seconds == 120
     assert config.startup_concurrency == 2
     assert config.catch_up_concurrency == 2

@@ -55,10 +55,12 @@ that still has a per-instance slot and accounts for the reservation immediately.
 instance preferentially receives subsequent requests until loads converge; existing
 bindings are not migrated. Round-robin breaks equal-load ties.
 
+`resource_provision_timeout_seconds` defaults to `900` and covers the Ray placement
+group wait, including KubeRay worker-pod and node startup. After resources are ready,
 `startup_concurrency` defaults to `2` and limits concurrent inference-engine, server,
 and proxy initialization. `startup_timeout_seconds` is applied independently after an
-instance acquires a startup slot; time spent queued behind the concurrency limit does
-not consume its startup timeout.
+instance acquires a startup slot; neither resource provisioning nor time queued behind
+the concurrency limit consumes its startup timeout.
 
 ## HTTP control and status
 

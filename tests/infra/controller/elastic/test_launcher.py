@@ -71,9 +71,11 @@ class _FakeCapacityProvider:
     def __init__(self) -> None:
         self.jobs = []
         self.failed_role = None
+        self.timeout = None
 
-    async def provision_many(self, jobs):
+    async def provision_many(self, jobs, *, timeout=None):
         self.jobs = list(jobs)
+        self.timeout = timeout
         return [
             WorkerProvisionOutcome(
                 role=job.role,
@@ -123,7 +125,7 @@ def _pending_instance() -> RolloutInstance:
     )
 
 
-def _batch_launcher():
+def _batch_launcher(resource_provision_timeout_seconds=123.0):
     scheduler = _BatchFakeScheduler()
     config = _FakeConfig(scheduling_spec=(SchedulingSpec(cpu=2, gpu=1, mem=3),))
     rollout_alloc = SimpleNamespace(
@@ -134,6 +136,7 @@ def _batch_launcher():
         inf_engine=_FakeInferenceEngine,
         config=config,
         rollout_alloc=rollout_alloc,
+        resource_provision_timeout_seconds=resource_provision_timeout_seconds,
     )
     return launcher, scheduler
 
@@ -158,6 +161,7 @@ async def test_provision_many_uses_capacity_provider_batch():
         instance.worker_role for instance in instances
     ]
     assert scheduler.created_job is None
+    assert scheduler.capacity_provider.timeout == 123.0
     assert all(
         instance.state is RolloutInstanceState.STARTING for instance in instances
     )
