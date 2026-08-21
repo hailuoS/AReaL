@@ -62,6 +62,12 @@ and proxy initialization. `startup_timeout_seconds` is applied independently aft
 instance acquires a startup slot; neither resource provisioning nor time queued behind
 the concurrency limit consumes its startup timeout.
 
+For Ray-backed roles, the reconciler also probes the worker process and HTTP health
+endpoint. After `health_check_failure_threshold` consecutive failures, the instance is
+fenced out of routing immediately and a replacement is created from desired state. Its
+old placement group is deleted after Controller-visible workflow, result, direct-RPC,
+and weight-update leases have drained.
+
 ## HTTP control and status
 
 The V1 callback server exposes:

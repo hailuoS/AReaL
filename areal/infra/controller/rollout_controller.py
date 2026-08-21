@@ -367,6 +367,10 @@ class RolloutController:
             startup_timeout_seconds=self.config.elastic.startup_timeout_seconds,
             startup_concurrency=self.config.elastic.startup_concurrency,
             catch_up_concurrency=self.config.elastic.catch_up_concurrency,
+            health_check_concurrency=self.config.elastic.health_check_concurrency,
+            health_check_failure_threshold=(
+                self.config.elastic.health_check_failure_threshold
+            ),
             begin_catch_up=self._begin_elastic_catch_up,
             end_catch_up=self._end_elastic_catch_up,
             record_launch_intent=self._record_elastic_launch_intent,

@@ -46,6 +46,10 @@ Controller 在同一个 InstancePool 锁内选择 Controller 可见在途请求�
 worker Pod 和节点的启动时间。资源就绪后，`startup_concurrency` 默认值为 `2`，用于限制同时初始化推理引擎、server 和 proxy
 的实例数。实例获得启动 并发槽位后才单独开始计算 `startup_timeout_seconds`；资源申请和等待并发槽位的时间都不 计入实例启动超时。
 
+对于 Ray role，reconciler 还会探测 Worker 进程和 HTTP 健康端点。连续失败达到 `health_check_failure_threshold`
+后，实例会立即被摘出路由，并由 desired state 创建替代 实例。旧 placement group 会在 Controller 可见的
+workflow、result、direct RPC 和权重更新 lease 全部排空后删除。
+
 ## HTTP 控制和状态
 
 V1 callback server 提供：

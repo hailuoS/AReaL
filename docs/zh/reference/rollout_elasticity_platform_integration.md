@@ -80,6 +80,7 @@ AReaL 当前已经形成完整的 Rollout 实例控制闭环：
 1. **安全缩容**：缩容实例先停止接收新任务，已有任务和结果全部释放后才删除 Worker。
 1. **容量发布**：根据 READY 实例数量刷新框架实际可用的 Rollout 并发容量。
 1. **持久化恢复**：保存目标容量、模型版本和 checkpoint；Controller 重启后清理旧资源并重新收敛。
+1. **运行时自愈**：连续健康检查失败的 READY 实例先摘出路由，desired state 自动创建替代实例；旧资源在 lease 排空后清理。
 1. **可观测性**：输出资源创建、Worker、推理服务、Proxy、模型追赶和容量生效等阶段的耗时及错误。
 
 部分 Agent 场景还会使用 AReaL 内部的实例专属 Proxy，将 OpenAI 风格请求转发到对应推理服务。这里的 Proxy 是框架组件，不是 Kubernetes

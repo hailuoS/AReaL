@@ -531,6 +531,15 @@ class RolloutInstanceLauncher:
             instance.transition_to(RolloutInstanceState.FAILED)
             raise
 
+    def check_health(self, instance: RolloutInstance) -> None:
+        """Check optional Scheduler health probes for an active instance."""
+        check_role = getattr(self._scheduler, "check_worker_role_health", None)
+        if not callable(check_role):
+            return
+        check_role(instance.worker_role)
+        if instance.proxy_role is not None:
+            check_role(instance.proxy_role)
+
     def destroy(self, instance: RolloutInstance) -> None:
         """Destroy a stopped instance without affecting any other Scheduler role."""
         if instance.state is not RolloutInstanceState.STOPPING:

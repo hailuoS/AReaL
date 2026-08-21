@@ -35,6 +35,8 @@ def test_elastic_rollout_config_is_disabled_by_default():
         ({"startup_timeout_seconds": 0}, "positive"),
         ({"startup_concurrency": 0}, "positive"),
         ({"catch_up_concurrency": 0}, "positive"),
+        ({"health_check_concurrency": 0}, "positive"),
+        ({"health_check_failure_threshold": 0}, "positive"),
         ({"checkpoint_retention": 1}, "at least 2"),
         ({"recovery_schema_version": 2}, "schema_version"),
         ({"report_freq_steps": -1}, "non-negative"),
@@ -67,6 +69,8 @@ def test_elastic_rollout_config_accepts_scale_out_contract():
         startup_timeout_seconds=120,
         startup_concurrency=2,
         catch_up_concurrency=2,
+        health_check_concurrency=4,
+        health_check_failure_threshold=2,
         max_concurrent_rollouts_per_instance=64,
         max_total_concurrent_rollouts=256,
     )
@@ -83,6 +87,8 @@ def test_elastic_rollout_config_accepts_scale_out_contract():
     assert config.startup_timeout_seconds == 120
     assert config.startup_concurrency == 2
     assert config.catch_up_concurrency == 2
+    assert config.health_check_concurrency == 4
+    assert config.health_check_failure_threshold == 2
     assert config.max_concurrent_rollouts_per_instance == 64
     assert config.max_total_concurrent_rollouts == 256
 

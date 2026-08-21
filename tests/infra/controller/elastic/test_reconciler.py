@@ -104,6 +104,16 @@ class _BatchProvisionLauncher(_FakeLauncher):
         return outcomes
 
 
+class _HealthCheckingLauncher(_FakeLauncher):
+    def __init__(self):
+        super().__init__()
+        self.unhealthy_roles = set()
+
+    def check_health(self, instance):
+        if instance.worker_role in self.unhealthy_roles:
+            raise RuntimeError("worker is unreachable")
+
+
 class _ParallelLauncher(_FakeLauncher):
     def __init__(self, expected_starts):
         super().__init__()
@@ -251,6 +261,71 @@ async def test_reconciler_preserves_partial_batch_provision_success():
         pool.get(instance_id).state is RolloutInstanceState.READY
         for instance_id in pool.instance_ids()
     )
+
+
+@pytest.mark.asyncio
+async def test_reconciler_replaces_unhealthy_ready_instance_after_threshold():
+    pool = RolloutInstancePool(min_instances=1, initial_instances=2, max_instances=2)
+    launcher = _HealthCheckingLauncher()
+    reconciler = RolloutInstanceReconciler(
+        pool=pool,
+        launcher=launcher,
+        role_prefix="rollout-elastic",
+        server_args={},
+        latest_checkpoint=lambda: None,
+        current_version=lambda: 0,
+        health_check_failure_threshold=2,
+    )
+    await reconciler.reconcile_once()
+    failed_id = pool.instance_ids()[0]
+    failed_role = pool.get(failed_id).worker_role
+    launcher.unhealthy_roles.add(failed_role)
+
+    first = await reconciler.reconcile_once()
+    second = await reconciler.reconcile_once()
+
+    assert first.failed_instance_ids == ()
+    assert second.failed_instance_ids == (failed_id,)
+    assert second.removed_instance_ids == (failed_id,)
+    assert len(second.created_instance_ids) == 1
+    assert len(pool.instance_ids()) == 2
+    assert failed_id not in pool.instance_ids()
+    assert failed_id in launcher.destroyed
+
+
+@pytest.mark.asyncio
+async def test_unhealthy_instance_is_fenced_before_its_leases_drain():
+    pool = RolloutInstancePool(min_instances=1, initial_instances=1, max_instances=1)
+    launcher = _HealthCheckingLauncher()
+    reconciler = RolloutInstanceReconciler(
+        pool=pool,
+        launcher=launcher,
+        role_prefix="rollout-elastic",
+        server_args={},
+        latest_checkpoint=lambda: None,
+        current_version=lambda: 0,
+        health_check_failure_threshold=1,
+    )
+    await reconciler.reconcile_once()
+    failed_id = pool.instance_ids()[0]
+    failed_role = pool.get(failed_id).worker_role
+    pool.bind_task("task-1", failed_id)
+    launcher.unhealthy_roles.add(failed_role)
+
+    failed_result = await reconciler.reconcile_once()
+
+    assert failed_result.failed_instance_ids == (failed_id,)
+    assert failed_result.removed_instance_ids == ()
+    assert len(failed_result.created_instance_ids) == 1
+    assert pool.get(failed_id).state is RolloutInstanceState.FAILED
+    assert len(pool.ready_snapshot()) == 1
+    assert len(pool.instance_ids()) == 2
+
+    pool.release_task("task-1")
+    cleaned = await reconciler.reconcile_once()
+
+    assert cleaned.removed_instance_ids == (failed_id,)
+    assert failed_id not in pool.instance_ids()
 
 
 @pytest.mark.asyncio

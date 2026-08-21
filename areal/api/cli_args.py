@@ -2382,6 +2382,21 @@ class ElasticRolloutConfig:
             )
         },
     )
+    health_check_concurrency: int = field(
+        default=8,
+        metadata={
+            "help": "Maximum number of concurrent elastic instance health probes."
+        },
+    )
+    health_check_failure_threshold: int = field(
+        default=3,
+        metadata={
+            "help": (
+                "Consecutive failed health probes before fencing a READY instance "
+                "and creating a desired-state replacement."
+            )
+        },
+    )
     checkpoint_retention: int = field(
         default=3,
         metadata={
@@ -2484,6 +2499,10 @@ class ElasticRolloutConfig:
             raise ValueError("elastic.startup_concurrency must be positive")
         if self.catch_up_concurrency <= 0:
             raise ValueError("elastic.catch_up_concurrency must be positive")
+        if self.health_check_concurrency <= 0:
+            raise ValueError("elastic.health_check_concurrency must be positive")
+        if self.health_check_failure_threshold <= 0:
+            raise ValueError("elastic.health_check_failure_threshold must be positive")
         if self.checkpoint_retention < 2:
             raise ValueError(
                 "elastic.checkpoint_retention must be at least 2 for disk catch-up"

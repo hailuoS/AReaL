@@ -2132,6 +2132,23 @@ class RayScheduler(Scheduler):
 
         raise WorkerTimeoutError(role, timeout)
 
+    def check_worker_role_health(self, role: str) -> None:
+        """Perform one non-retrying process and HTTP health check for a role."""
+        workers = self._workers.get(role)
+        if workers is None and role in self._colocated_roles:
+            workers = self._workers.get(self._colocated_roles[role])
+        if not workers:
+            raise WorkerNotFoundError(f"Role '{role}' not found")
+
+        self._check_worker_process_status(role)
+        for worker_info in workers:
+            if not self._is_worker_ready(worker_info):
+                raise WorkerFailedError(
+                    worker_info.worker.id,
+                    -1,
+                    "Worker health endpoint is not responding",
+                )
+
     def _destroy_engines_on_workers(
         self, workers: list[RayWorkerInfo], timeout: float = 30.0
     ) -> None:

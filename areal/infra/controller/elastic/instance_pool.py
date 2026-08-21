@@ -16,7 +16,12 @@ from .errors import (
     InvalidDesiredCountError,
     TaskBindingError,
 )
-from .models import RolloutInstance, RolloutInstanceState, RolloutRPCTarget
+from .models import (
+    InstanceDesiredState,
+    RolloutInstance,
+    RolloutInstanceState,
+    RolloutRPCTarget,
+)
 
 
 class RolloutInstancePool:
@@ -208,11 +213,28 @@ class RolloutInstancePool:
             instance.cancel_drain()
             return instance
 
+    def fence_failed(self, instance_id: str) -> RolloutInstance | None:
+        """Atomically remove a failed READY instance from routing eligibility."""
+        with self._lock:
+            instance = self.get(instance_id)
+            if instance.state is not RolloutInstanceState.READY:
+                return None
+            instance.desired_state = InstanceDesiredState.STOPPED
+            instance.transition_to(RolloutInstanceState.FAILED)
+            return instance
+
     def begin_stop_if_drained(self, instance_id: str) -> RolloutInstance | None:
         """Move a drained instance to STOPPING before resource deletion."""
         with self._lock:
             instance = self.get(instance_id)
             if instance.state is RolloutInstanceState.STOPPING:
+                return instance
+            if (
+                instance.state is RolloutInstanceState.FAILED
+                and instance.desired_state is InstanceDesiredState.STOPPED
+                and instance.is_drained
+            ):
+                instance.transition_to(RolloutInstanceState.STOPPING)
                 return instance
             if not instance.can_stop:
                 return None

@@ -20,6 +20,7 @@ from areal.api.cli_args import (
 )
 from areal.infra.scheduler.exceptions import (
     WorkerCreationError,
+    WorkerFailedError,
     WorkerNotFoundError,
 )
 from areal.infra.scheduler.ray import (
@@ -384,6 +385,19 @@ async def test_capacity_provider_cancellation_removes_pending_demands():
 
     assert scheduler.cancel_worker_reservation.call_count == 2
     scheduler.activate_worker_reservation.assert_not_called()
+
+
+def test_check_worker_role_health_fails_on_unreachable_endpoint(tmp_path, monkeypatch):
+    scheduler = _scheduler(tmp_path)
+    scheduler._workers["rollout"] = [_worker_info("rollout/0", role="rollout")]
+    process_check = Mock()
+    monkeypatch.setattr(scheduler, "_check_worker_process_status", process_check)
+    monkeypatch.setattr(scheduler, "_is_worker_ready", Mock(return_value=False))
+
+    with pytest.raises(WorkerFailedError, match="health endpoint"):
+        scheduler.check_worker_role_health("rollout")
+
+    process_check.assert_called_once_with("rollout")
 
 
 def test_zero_replicas_fails(tmp_path):

@@ -47,6 +47,8 @@ class _InstanceLauncher(Protocol):
         self, instances: list[RolloutInstance]
     ) -> list[Exception | None]: ...
 
+    def check_health(self, instance: RolloutInstance) -> None: ...
+
     async def start(
         self,
         *,
@@ -94,6 +96,8 @@ class RolloutInstanceReconciler:
         startup_timeout_seconds: float = 300.0,
         startup_concurrency: int = 2,
         catch_up_concurrency: int = 4,
+        health_check_concurrency: int = 8,
+        health_check_failure_threshold: int = 3,
         begin_catch_up: Callable[[], None] | None = None,
         end_catch_up: Callable[[], None] | None = None,
         record_launch_intent: Callable[[str], None] | None = None,
@@ -114,9 +118,16 @@ class RolloutInstanceReconciler:
             raise ValueError("startup_concurrency must be positive")
         if catch_up_concurrency <= 0:
             raise ValueError("catch_up_concurrency must be positive")
+        if health_check_concurrency <= 0:
+            raise ValueError("health_check_concurrency must be positive")
+        if health_check_failure_threshold <= 0:
+            raise ValueError("health_check_failure_threshold must be positive")
         self._startup_timeout_seconds = startup_timeout_seconds
         self._startup_concurrency = startup_concurrency
         self._catch_up_concurrency = catch_up_concurrency
+        self._health_check_concurrency = health_check_concurrency
+        self._health_check_failure_threshold = health_check_failure_threshold
+        self._health_check_failures: dict[str, int] = {}
         self._begin_catch_up = begin_catch_up or (lambda: None)
         self._end_catch_up = end_catch_up or (lambda: None)
         self._record_launch_intent = record_launch_intent or (lambda _role: None)
@@ -145,6 +156,67 @@ class RolloutInstanceReconciler:
             await self._launcher.launch_proxy(instance)
         finally:
             self._clear_launch_intent(proxy_role)
+
+    async def _fence_unhealthy_instances(
+        self, instances: list[RolloutInstance]
+    ) -> list[str]:
+        check_health = getattr(self._launcher, "check_health", None)
+        if not callable(check_health):
+            return []
+
+        ready_instances = [
+            instance
+            for instance in instances
+            if instance.state is RolloutInstanceState.READY
+            and instance.desired_state is InstanceDesiredState.RUNNING
+        ]
+        current_ids = {instance.instance_id for instance in ready_instances}
+        for instance_id in tuple(self._health_check_failures):
+            if instance_id not in current_ids:
+                self._health_check_failures.pop(instance_id, None)
+
+        semaphore = asyncio.Semaphore(self._health_check_concurrency)
+
+        async def check(instance: RolloutInstance) -> None:
+            async with semaphore:
+                await asyncio.to_thread(check_health, instance)
+
+        outcomes = await asyncio.gather(
+            *(check(instance) for instance in ready_instances),
+            return_exceptions=True,
+        )
+        fenced_ids = []
+        for instance, outcome in zip(ready_instances, outcomes, strict=True):
+            if isinstance(outcome, asyncio.CancelledError):
+                raise outcome
+            if not isinstance(outcome, Exception):
+                self._health_check_failures.pop(instance.instance_id, None)
+                continue
+
+            failures = self._health_check_failures.get(instance.instance_id, 0) + 1
+            self._health_check_failures[instance.instance_id] = failures
+            logger.warning(
+                "Elastic instance health check failed instance_id=%s role=%s "
+                "failures=%d threshold=%d error=%s: %s",
+                instance.instance_id,
+                instance.worker_role,
+                failures,
+                self._health_check_failure_threshold,
+                type(outcome).__name__,
+                outcome,
+            )
+            if failures < self._health_check_failure_threshold:
+                continue
+            fenced = self._pool.fence_failed(instance.instance_id)
+            self._health_check_failures.pop(instance.instance_id, None)
+            if fenced is not None:
+                fenced_ids.append(instance.instance_id)
+                logger.error(
+                    "Fenced unhealthy elastic instance instance_id=%s role=%s",
+                    instance.instance_id,
+                    instance.worker_role,
+                )
+        return fenced_ids
 
     def _remove_new_instance(
         self, instance: RolloutInstance, *, provisioned: bool
@@ -276,6 +348,7 @@ class RolloutInstanceReconciler:
         failed: list[str] = []
 
         instances = self._instances()
+        failed.extend(await self._fence_unhealthy_instances(instances))
         for instance in instances:
             if (
                 instance.desired_state is InstanceDesiredState.RUNNING
