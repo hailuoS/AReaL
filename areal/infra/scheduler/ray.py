@@ -406,6 +406,23 @@ class RayWorkerInfo:
     spec: SchedulingSpec | None = None
 
 
+@dataclass
+class RayWorkerReservation:
+    """A submitted Ray worker allocation that has not been activated yet."""
+
+    role: str
+    replicas: int
+    schedulings: list[SchedulingSpec]
+    spec: SchedulingSpec
+    bundles: list[dict[str, Any]]
+    plan: list[dict[str, Any]]
+    nodes_per_worker: int
+    placement_group: Any
+    ready: bool = False
+    activated: bool = False
+    cancelled: bool = False
+
+
 class RayMultiNodeRolloutCoordinator:
     def __init__(
         self,
@@ -624,6 +641,7 @@ class RayScheduler(Scheduler):
             str, list[ActorHandle]
         ] = {}  # role -> Ray launcher actors
         self._placement_groups: dict[str, Any] = {}
+        self._pending_worker_reservations: dict[str, RayWorkerReservation] = {}
         self._multi_node_rollout = RayMultiNodeRolloutCoordinator(
             exp_config, startup_timeout
         )
@@ -1292,9 +1310,7 @@ class RayScheduler(Scheduler):
                 del self._colocated_roles[role]
             raise
 
-    def _request_placement_group(
-        self, role: str, bundles: list[dict[str, Any]]
-    ) -> Any:
+    def _request_placement_group(self, role: str, bundles: list[dict[str, Any]]) -> Any:
         """Submit one placement-group demand without waiting for resources."""
         try:
             return placement_group(bundles=bundles, strategy="PACK")
@@ -1457,6 +1473,273 @@ class RayScheduler(Scheduler):
             )
         return bundles, plan, 1
 
+    def request_worker_reservation(
+        self,
+        *,
+        role: str,
+        replicas: int,
+        schedulings: list[SchedulingSpec],
+    ) -> RayWorkerReservation:
+        """Submit one separation-mode worker demand without waiting for resources."""
+        if role in self._workers or role in self._pending_worker_reservations:
+            raise WorkerCreationError(role, f"Role '{role}' already exists")
+        if replicas <= 0:
+            raise WorkerCreationError(
+                role, "Invalid configuration", "replicas must be greater than 0"
+            )
+        if len(schedulings) != replicas:
+            raise WorkerCreationError(
+                role,
+                "Invalid configuration",
+                "prepared scheduling specs must match replicas",
+            )
+
+        spec = schedulings[0]
+        bundles, plan, nodes_per_worker = self._build_node_plan(replicas, spec)
+        pg = self._request_placement_group(role, bundles)
+        reservation = RayWorkerReservation(
+            role=role,
+            replicas=replicas,
+            schedulings=schedulings,
+            spec=spec,
+            bundles=bundles,
+            plan=plan,
+            nodes_per_worker=nodes_per_worker,
+            placement_group=pg,
+        )
+        self._pending_worker_reservations[role] = reservation
+        return reservation
+
+    def wait_worker_reservation(
+        self,
+        reservation: RayWorkerReservation,
+        *,
+        timeout: float | None = None,
+    ) -> None:
+        """Wait for a submitted worker reservation to acquire resources."""
+        self._verify_pending_worker_reservation(reservation)
+        if reservation.ready:
+            return
+        try:
+            self._wait_placement_group_ready(
+                reservation.role,
+                reservation.placement_group,
+                reservation.bundles,
+                self.startup_timeout if timeout is None else timeout,
+            )
+        except BaseException:
+            self._pending_worker_reservations.pop(reservation.role, None)
+            reservation.cancelled = True
+            raise
+        reservation.ready = True
+
+    def cancel_worker_reservation(self, reservation: RayWorkerReservation) -> None:
+        """Cancel a pending placement-group demand idempotently."""
+        if reservation.activated:
+            raise RuntimeError(
+                f"worker reservation for role '{reservation.role}' is activated"
+            )
+        if reservation.cancelled:
+            return
+        current = self._pending_worker_reservations.get(reservation.role)
+        if current is not reservation:
+            raise RuntimeError(
+                f"worker reservation for role '{reservation.role}' is not pending"
+            )
+        self._pending_worker_reservations.pop(reservation.role, None)
+        remove_placement_group(reservation.placement_group)
+        reservation.cancelled = True
+
+    def _verify_pending_worker_reservation(
+        self, reservation: RayWorkerReservation
+    ) -> None:
+        if reservation.cancelled:
+            raise RuntimeError(
+                f"worker reservation for role '{reservation.role}' is cancelled"
+            )
+        if reservation.activated:
+            raise RuntimeError(
+                f"worker reservation for role '{reservation.role}' is activated"
+            )
+        if self._pending_worker_reservations.get(reservation.role) is not reservation:
+            raise RuntimeError(
+                f"worker reservation for role '{reservation.role}' is not pending"
+            )
+
+    def activate_worker_reservation(
+        self, reservation: RayWorkerReservation
+    ) -> list[str]:
+        """Start Ray launchers and workers inside a ready reservation."""
+        self._verify_pending_worker_reservation(reservation)
+        if not reservation.ready:
+            raise RuntimeError(
+                f"worker reservation for role '{reservation.role}' is not ready"
+            )
+
+        role = reservation.role
+        replicas = reservation.replicas
+        schedulings = reservation.schedulings
+        spec = reservation.spec
+        bundles = reservation.bundles
+        plan = reservation.plan
+        nodes_per_worker = reservation.nodes_per_worker
+        pg = reservation.placement_group
+        launchers = []
+
+        # Transfer placement-group ownership to the active role before creating
+        # actors so the common activation rollback path owns every resource.
+        self._pending_worker_reservations.pop(role)
+        self._placement_groups[role] = pg
+        try:
+            for item in plan:
+                bundle = bundles[item["bundle_index"]]
+                gpu_count = int(bundle.get(self.ray_device_resource, 0))
+                cpu_count = int(bundle.get("CPU", 0))
+                mem_gb = max(1, int(bundle.get("memory", 0) // 1024**3))
+                options = create_resource_spec(
+                    self.ray_device_resource, cpu_count, gpu_count, mem_gb * 1024**3
+                )
+                options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_bundle_index=item["bundle_index"],
+                    placement_group_capture_child_tasks=True,
+                )
+                launcher = RayWorkerProcessLauncher.options(**options).remote(
+                    role,
+                    self._log_path_of(role),
+                    self._merged_log_path(),
+                    self.ray_device_resource,
+                    self.device_control_env_var,
+                    spec.env_vars,
+                )
+                launchers.append((item, launcher))
+
+            node_infos = ray.get(
+                [launcher.get_node_info.remote() for _, launcher in launchers],
+                timeout=self.startup_timeout,
+            )
+            ordered = sorted(
+                zip(launchers, node_infos, strict=True),
+                key=lambda x: (
+                    x[1]["host"],
+                    min([int(v) for v in x[1]["visible_devices"]] or [0]),
+                    x[0][0]["bundle_index"],
+                ),
+            )
+            self._launchers[role] = [launcher for (_, launcher), _ in ordered]
+
+            workers = []
+            start_refs = []
+
+            def build_worker_spec(
+                worker_idx: int, gpu_devices: list[str], worker_spec: SchedulingSpec
+            ) -> dict[str, Any]:
+                return dict(
+                    role=role,
+                    worker_index=worker_idx,
+                    gpu_devices=gpu_devices,
+                    cmd=worker_spec.cmd,
+                    experiment_name=self.experiment_name,
+                    trial_name=self.trial_name,
+                    name_resolve_type=self.name_resolve_config.type,
+                    nfs_record_root=self.name_resolve_config.nfs_record_root,
+                    etcd3_addr=self.name_resolve_config.etcd3_addr,
+                    fileroot=self.fileroot,
+                )
+
+            def build_worker_info(
+                worker_idx: int,
+                worker_launchers: list[ActorHandle],
+                worker_spec: SchedulingSpec,
+            ) -> RayWorkerInfo:
+                worker_id = f"{role}/{worker_idx}"
+                worker = Worker(
+                    id=worker_id,
+                    ip="",
+                    worker_ports=[],
+                    engine_ports=[],
+                )
+                return RayWorkerInfo(
+                    worker=worker,
+                    role=role,
+                    launchers=worker_launchers,
+                    task_index=worker_idx,
+                    spec=worker_spec,
+                )
+
+            if nodes_per_worker > 1:
+                nodes_by_worker: dict[int, list[tuple[int, Any, list[str]]]] = {}
+                for (item, launcher), info in ordered:
+                    nodes_by_worker.setdefault(item["worker_idx"], []).append(
+                        (item["node_rank"], launcher, info["visible_devices"])
+                    )
+                for worker_idx in range(replicas):
+                    node_group = sorted(nodes_by_worker[worker_idx], key=lambda x: x[0])
+                    _, head_launcher, head_visible_devices = node_group[0]
+                    worker_spec = schedulings[worker_idx]
+                    start_refs.append(
+                        head_launcher.start_workers.remote(
+                            [
+                                build_worker_spec(
+                                    worker_idx,
+                                    head_visible_devices,
+                                    worker_spec,
+                                )
+                            ]
+                        )
+                    )
+                    workers.append(
+                        build_worker_info(
+                            worker_idx,
+                            [launcher for _, launcher, _ in node_group],
+                            worker_spec,
+                        )
+                    )
+            else:
+                next_worker_idx = 0
+                for (item, launcher), info in ordered:
+                    visible = info["visible_devices"]
+                    workers_on_node = item["workers"]
+                    batch = []
+                    for local_idx in range(workers_on_node):
+                        worker_idx = next_worker_idx
+                        next_worker_idx += 1
+                        start = local_idx * max(1, spec.gpu)
+                        end = start + max(1, spec.gpu)
+                        gpu_devices = visible[start:end] if spec.gpu > 0 else []
+                        worker_spec = schedulings[worker_idx]
+                        batch.append(
+                            build_worker_spec(worker_idx, gpu_devices, worker_spec)
+                        )
+                        workers.append(
+                            build_worker_info(worker_idx, [launcher], worker_spec)
+                        )
+                    if batch:
+                        start_refs.append(launcher.start_workers.remote(batch))
+
+            ray.get(start_refs, timeout=self.startup_timeout)
+            self._workers[role] = workers
+            worker_ids = [worker_info.worker.id for worker_info in workers]
+            reservation.activated = True
+            logger.info(f"Created {replicas} workers for role '{role}' with Ray")
+            return worker_ids
+        except Exception as e:
+            reservation.cancelled = True
+            if role in self._launchers:
+                self._stop_launchers(role, timeout=10)
+                del self._launchers[role]
+            if role in self._placement_groups:
+                remove_placement_group(self._placement_groups[role])
+                del self._placement_groups[role]
+            if isinstance(e, WorkerCreationError):
+                raise
+            logs = self._read_log_tail(role)
+            raise WorkerCreationError(
+                role,
+                "Ray worker creation failed",
+                f"{type(e).__name__}: {e}\nLogs:\n{logs}",
+            ) from e
+
     def create_workers(self, job: Job, *args, **kwargs) -> list[str]:
         """Create workers via Ray placement group creation.
 
@@ -1558,165 +1841,13 @@ class RayScheduler(Scheduler):
             f"cpus={cpus_per_task}, mem={mem_per_task}MB"
         )
 
-        launchers = []
-        try:
-            bundles, plan, nodes_per_worker = self._build_node_plan(replicas, spec)
-            pg = self._create_placement_group(role, bundles, self.startup_timeout)
-            self._placement_groups[role] = pg
-
-            for item in plan:
-                bundle = bundles[item["bundle_index"]]
-                gpu_count = int(bundle.get(self.ray_device_resource, 0))
-                cpu_count = int(bundle.get("CPU", 0))
-                mem_gb = max(1, int(bundle.get("memory", 0) // 1024**3))
-                options = create_resource_spec(
-                    self.ray_device_resource, cpu_count, gpu_count, mem_gb * 1024**3
-                )
-                options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
-                    placement_group=pg,
-                    placement_group_bundle_index=item["bundle_index"],
-                    placement_group_capture_child_tasks=True,
-                )
-                launcher = RayWorkerProcessLauncher.options(**options).remote(
-                    role,
-                    self._log_path_of(role),
-                    self._merged_log_path(),
-                    self.ray_device_resource,
-                    self.device_control_env_var,
-                    spec.env_vars,
-                )
-                launchers.append((item, launcher))
-
-            node_infos = ray.get(
-                [launcher.get_node_info.remote() for _, launcher in launchers],
-                timeout=self.startup_timeout,
-            )
-            ordered = sorted(
-                zip(launchers, node_infos, strict=True),
-                key=lambda x: (
-                    x[1]["host"],
-                    min([int(v) for v in x[1]["visible_devices"]] or [0]),
-                    x[0][0]["bundle_index"],
-                ),
-            )
-            self._launchers[role] = [launcher for (_, launcher), _ in ordered]
-
-            workers = []
-            start_refs = []
-
-            def build_worker_spec(
-                worker_idx: int, gpu_devices: list[str], worker_spec: SchedulingSpec
-            ) -> dict[str, Any]:
-                return dict(
-                    role=role,
-                    worker_index=worker_idx,
-                    gpu_devices=gpu_devices,
-                    cmd=worker_spec.cmd,
-                    experiment_name=self.experiment_name,
-                    trial_name=self.trial_name,
-                    name_resolve_type=self.name_resolve_config.type,
-                    nfs_record_root=self.name_resolve_config.nfs_record_root,
-                    etcd3_addr=self.name_resolve_config.etcd3_addr,
-                    fileroot=self.fileroot,
-                )
-
-            def build_worker_info(
-                worker_idx: int,
-                worker_launchers: list[ActorHandle],
-                worker_spec: SchedulingSpec,
-            ) -> RayWorkerInfo:
-                worker_id = f"{role}/{worker_idx}"
-                worker = Worker(
-                    id=worker_id,
-                    ip="",  # Will be discovered
-                    worker_ports=[],  # Will be discovered
-                    engine_ports=[],
-                )
-                return RayWorkerInfo(
-                    worker=worker,
-                    role=role,
-                    launchers=worker_launchers,
-                    task_index=worker_idx,
-                    spec=worker_spec,
-                )
-
-            if nodes_per_worker > 1:
-                nodes_by_worker: dict[int, list[tuple[int, Any, list[str]]]] = {}
-                for (item, launcher), info in ordered:
-                    nodes_by_worker.setdefault(item["worker_idx"], []).append(
-                        (item["node_rank"], launcher, info["visible_devices"])
-                    )
-                for worker_idx in range(replicas):
-                    node_group = sorted(nodes_by_worker[worker_idx], key=lambda x: x[0])
-                    _, head_launcher, head_visible_devices = node_group[0]
-                    worker_spec = schedulings[worker_idx]
-                    start_refs.append(
-                        head_launcher.start_workers.remote(
-                            [
-                                build_worker_spec(
-                                    worker_idx,
-                                    head_visible_devices,
-                                    worker_spec,
-                                )
-                            ]
-                        )
-                    )
-                    workers.append(
-                        build_worker_info(
-                            worker_idx,
-                            [launcher for _, launcher, _ in node_group],
-                            worker_spec,
-                        )
-                    )
-
-            else:
-                next_worker_idx = 0
-                for (item, launcher), info in ordered:
-                    visible = info["visible_devices"]
-                    workers_on_node = item["workers"]
-                    batch = []
-                    for local_idx in range(workers_on_node):
-                        worker_idx = next_worker_idx
-                        next_worker_idx += 1
-                        start = local_idx * max(1, spec.gpu)
-                        end = start + max(1, spec.gpu)
-                        gpu_devices = visible[start:end] if spec.gpu > 0 else []
-                        worker_spec = schedulings[worker_idx]
-                        batch.append(
-                            build_worker_spec(worker_idx, gpu_devices, worker_spec)
-                        )
-                        workers.append(
-                            build_worker_info(worker_idx, [launcher], worker_spec)
-                        )
-                    if batch:
-                        start_refs.append(launcher.start_workers.remote(batch))
-
-            ray.get(
-                start_refs,
-                timeout=self.startup_timeout,
-            )
-
-            self._workers[role] = workers
-            worker_ids = [worker_info.worker.id for worker_info in workers]
-
-            logger.info(f"Created {replicas} workers for role '{role}' with Ray")
-        except Exception as e:
-            if role in self._launchers:
-                self._stop_launchers(role, timeout=10)
-                del self._launchers[role]
-            if role in self._placement_groups:
-                remove_placement_group(self._placement_groups[role])
-                del self._placement_groups[role]
-            if isinstance(e, WorkerCreationError):
-                raise
-            logs = self._read_log_tail(role)
-            raise WorkerCreationError(
-                role,
-                "Ray worker creation failed",
-                f"{type(e).__name__}: {e}\nLogs:\n{logs}",
-            ) from e
-
-        return worker_ids
+        reservation = self.request_worker_reservation(
+            role=role,
+            replicas=replicas,
+            schedulings=schedulings,
+        )
+        self.wait_worker_reservation(reservation)
+        return self.activate_worker_reservation(reservation)
 
     def get_workers(self, role: str, timeout: float | None = None) -> list[Worker]:
         """Wait for workers to be ready and return their information.
@@ -1911,6 +2042,8 @@ class RayScheduler(Scheduler):
         """
         del reverse_order  # unused, see docstring
         if role is None:
+            for reservation in list(self._pending_worker_reservations.values()):
+                self.cancel_worker_reservation(reservation)
             # Delete colocated/forked roles first (they don't own Ray launchers)
             colocated_roles = list(self._colocated_roles.keys())
             for r in colocated_roles:
@@ -1918,6 +2051,12 @@ class RayScheduler(Scheduler):
             # Then delete actual worker roles
             for r in list(self._workers.keys()):
                 self.delete_workers(r)
+            return
+
+        pending = self._pending_worker_reservations.get(role)
+        if pending is not None:
+            self.cancel_worker_reservation(pending)
+            logger.info(f"Cancelled pending Ray worker reservation for role '{role}'")
             return
 
         # Handle colocated/forked role

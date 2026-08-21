@@ -42,6 +42,7 @@ def _scheduler(tmp_path, n_gpus_per_node: int = 8) -> RayScheduler:
     scheduler._workers = {}
     scheduler._launchers = {}
     scheduler._placement_groups = {}
+    scheduler._pending_worker_reservations = {}
     scheduler._multi_node_rollout = None
     scheduler._colocated_roles = {}
     return scheduler
@@ -141,7 +142,9 @@ def test_create_placement_group_submits_before_waiting(tmp_path, monkeypatch):
     monkeypatch.setattr(
         scheduler,
         "_request_placement_group",
-        Mock(side_effect=lambda role, requested: events.append(("request", role)) or pg),
+        Mock(
+            side_effect=lambda role, requested: events.append(("request", role)) or pg
+        ),
     )
     monkeypatch.setattr(
         scheduler,
@@ -162,7 +165,9 @@ def test_wait_placement_group_ready_keeps_successful_request(tmp_path, monkeypat
     pg.ready.return_value = ready_ref
     ray_get = Mock()
     remove_pg = Mock()
-    monkeypatch.setattr(ray_scheduler.ray, "wait", lambda *_args, **_kwargs: ([ready_ref], []))
+    monkeypatch.setattr(
+        ray_scheduler.ray, "wait", lambda *_args, **_kwargs: ([ready_ref], [])
+    )
     monkeypatch.setattr(ray_scheduler.ray, "get", ray_get)
     monkeypatch.setattr(ray_scheduler, "remove_placement_group", remove_pg)
 
@@ -175,6 +180,88 @@ def test_wait_placement_group_ready_keeps_successful_request(tmp_path, monkeypat
 
     ray_get.assert_called_once_with(ready_ref, timeout=0)
     remove_pg.assert_not_called()
+
+
+def test_worker_reservation_submission_does_not_wait(tmp_path, monkeypatch):
+    scheduler = _scheduler(tmp_path)
+    pg = object()
+    wait_ready = Mock()
+    monkeypatch.setattr(scheduler, "_request_placement_group", Mock(return_value=pg))
+    monkeypatch.setattr(scheduler, "_wait_placement_group_ready", wait_ready)
+    schedulings = [SchedulingSpec(cpu=1, gpu=1, mem=1)]
+
+    reservation = scheduler.request_worker_reservation(
+        role="rollout",
+        replicas=1,
+        schedulings=schedulings,
+    )
+
+    assert reservation.placement_group is pg
+    assert scheduler._pending_worker_reservations == {"rollout": reservation}
+    assert not reservation.ready
+    wait_ready.assert_not_called()
+
+
+def test_worker_reservation_wait_and_cancel_are_separate(tmp_path, monkeypatch):
+    scheduler = _scheduler(tmp_path)
+    pg = object()
+    wait_ready = Mock()
+    remove_pg = Mock()
+    monkeypatch.setattr(scheduler, "_request_placement_group", Mock(return_value=pg))
+    monkeypatch.setattr(scheduler, "_wait_placement_group_ready", wait_ready)
+    monkeypatch.setattr(ray_scheduler, "remove_placement_group", remove_pg)
+    reservation = scheduler.request_worker_reservation(
+        role="rollout",
+        replicas=1,
+        schedulings=[SchedulingSpec(cpu=1, gpu=1, mem=1)],
+    )
+
+    scheduler.wait_worker_reservation(reservation, timeout=123.0)
+    scheduler.cancel_worker_reservation(reservation)
+    scheduler.cancel_worker_reservation(reservation)
+
+    wait_ready.assert_called_once_with(
+        "rollout",
+        pg,
+        reservation.bundles,
+        123.0,
+    )
+    assert reservation.ready
+    assert reservation.cancelled
+    assert scheduler._pending_worker_reservations == {}
+    remove_pg.assert_called_once_with(pg)
+
+
+def test_legacy_create_workers_composes_reservation_lifecycle(tmp_path, monkeypatch):
+    scheduler = _scheduler(tmp_path)
+    events = []
+    reservation = object()
+    monkeypatch.setattr(
+        scheduler,
+        "request_worker_reservation",
+        Mock(side_effect=lambda **_kwargs: events.append("request") or reservation),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "wait_worker_reservation",
+        Mock(side_effect=lambda *_args: events.append("wait")),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "activate_worker_reservation",
+        Mock(side_effect=lambda *_args: events.append("activate") or ["rollout/0"]),
+    )
+
+    worker_ids = scheduler.create_workers(
+        Job(
+            role="rollout",
+            replicas=1,
+            tasks=[SchedulingSpec(cpu=1, gpu=1, mem=1)],
+        )
+    )
+
+    assert worker_ids == ["rollout/0"]
+    assert events == ["request", "wait", "activate"]
 
 
 def test_zero_replicas_fails(tmp_path):
