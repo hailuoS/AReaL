@@ -43,6 +43,10 @@ def _log_timing(
 class _InstanceLauncher(Protocol):
     def provision(self, *, instance: RolloutInstance) -> None: ...
 
+    async def provision_many(
+        self, instances: list[RolloutInstance]
+    ) -> list[Exception | None]: ...
+
     async def start(
         self,
         *,
@@ -154,6 +158,23 @@ class RolloutInstanceReconciler:
         elif instance.state is not RolloutInstanceState.STOPPED:
             instance.transition_to(RolloutInstanceState.STOPPED)
         self._pool.remove(instance.instance_id)
+
+    async def _provision_many(
+        self, instances: list[RolloutInstance]
+    ) -> list[Exception | None]:
+        provision_many = getattr(self._launcher, "provision_many", None)
+        if callable(provision_many):
+            return await provision_many(instances)
+
+        outcomes: list[Exception | None] = []
+        for instance in instances:
+            try:
+                self._launcher.provision(instance=instance)
+            except Exception as error:
+                outcomes.append(error)
+            else:
+                outcomes.append(None)
+        return outcomes
 
     async def _start_instance(self, instance: RolloutInstance) -> RolloutInstance:
         result = await self._launcher.start(
@@ -313,36 +334,49 @@ class RolloutInstanceReconciler:
 
         provisioned: list[RolloutInstance] = []
         provision_batch_started_at = time.monotonic()
-        for launch_index, instance in enumerate(pending_launches):
-            worker_role = instance.worker_role
-            launch_intent_recorded = False
-            try:
-                logger.info(
-                    "Elastic scale-up timing event=provision_started batch_id=%s "
-                    "instance_id=%s elapsed_seconds=0.000 worker_role=%s",
-                    batch_id,
-                    instance.instance_id,
-                    worker_role,
+        recorded_intents: list[str] = []
+        for instance in pending_launches:
+            logger.info(
+                "Elastic scale-up timing event=provision_started batch_id=%s "
+                "instance_id=%s elapsed_seconds=0.000 worker_role=%s",
+                batch_id,
+                instance.instance_id,
+                instance.worker_role,
+            )
+            self._record_launch_intent(instance.worker_role)
+            recorded_intents.append(instance.worker_role)
+
+        try:
+            provision_outcomes = await self._provision_many(pending_launches)
+            if len(provision_outcomes) != len(pending_launches):
+                raise RuntimeError(
+                    "Launcher returned an unexpected number of provision "
+                    f"outcomes: {len(provision_outcomes)} != "
+                    f"{len(pending_launches)}"
                 )
-                self._record_launch_intent(worker_role)
-                launch_intent_recorded = True
-                self._launcher.provision(instance=instance)
+        except Exception as error:
+            provision_outcomes = [error] * len(pending_launches)
+        finally:
+            for worker_role in recorded_intents:
+                self._clear_launch_intent(worker_role)
+
+        for instance, outcome in zip(pending_launches, provision_outcomes, strict=True):
+            if outcome is None:
                 provisioned.append(instance)
-            except Exception as error:
-                failed.append(instance.instance_id)
-                self._remove_new_instance(instance, provisioned=False)
-                logger.warning(
-                    "Failed to provision elastic instance %s: %s: %s",
-                    instance.instance_id,
-                    type(error).__name__,
-                    error,
-                )
-                for unstarted in pending_launches[launch_index + 1 :]:
-                    self._remove_new_instance(unstarted, provisioned=False)
-                break
-            finally:
-                if launch_intent_recorded:
-                    self._clear_launch_intent(worker_role)
+                continue
+
+            failed.append(instance.instance_id)
+            role_was_provisioned = instance.worker_id is not None
+            self._remove_new_instance(
+                instance,
+                provisioned=role_was_provisioned,
+            )
+            logger.warning(
+                "Failed to provision elastic instance %s: %s: %s",
+                instance.instance_id,
+                type(outcome).__name__,
+                outcome,
+            )
         if pending_launches:
             _log_timing(
                 event="provision_batch_completed",

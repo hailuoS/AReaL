@@ -15,6 +15,7 @@ from areal.infra.controller.elastic import (
     RolloutInstanceState,
     SingleNodeInstanceError,
 )
+from areal.infra.scheduler.capacity import WorkerProvisionOutcome
 
 
 class _FakeInferenceEngine:
@@ -66,6 +67,36 @@ class _FakeScheduler:
         self.deleted_roles.append(role)
 
 
+class _FakeCapacityProvider:
+    def __init__(self) -> None:
+        self.jobs = []
+        self.failed_role = None
+
+    async def provision_many(self, jobs):
+        self.jobs = list(jobs)
+        return [
+            WorkerProvisionOutcome(
+                role=job.role,
+                worker_ids=() if job.role == self.failed_role else (f"{job.role}/0",),
+                error=(
+                    RuntimeError("capacity unavailable")
+                    if job.role == self.failed_role
+                    else None
+                ),
+            )
+            for job in jobs
+        ]
+
+
+class _BatchFakeScheduler(_FakeScheduler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.capacity_provider = _FakeCapacityProvider()
+
+    def create_worker_capacity_provider(self):
+        return self.capacity_provider
+
+
 def _launcher(
     n_gpus_per_node: int = 8,
 ) -> tuple[RolloutInstanceLauncher, _FakeScheduler]:
@@ -90,6 +121,70 @@ def _pending_instance() -> RolloutInstance:
         worker_id=None,
         engine_name="rollout/ri-a",
     )
+
+
+def _batch_launcher():
+    scheduler = _BatchFakeScheduler()
+    config = _FakeConfig(scheduling_spec=(SchedulingSpec(cpu=2, gpu=1, mem=3),))
+    rollout_alloc = SimpleNamespace(
+        parallel=SimpleNamespace(tp_size=2, pp_size=2),
+    )
+    launcher = RolloutInstanceLauncher(
+        scheduler=scheduler,
+        inf_engine=_FakeInferenceEngine,
+        config=config,
+        rollout_alloc=rollout_alloc,
+    )
+    return launcher, scheduler
+
+
+@pytest.mark.asyncio
+async def test_provision_many_uses_capacity_provider_batch():
+    launcher, scheduler = _batch_launcher()
+    instances = [
+        RolloutInstance(
+            instance_id=f"ri-{index}",
+            worker_role=f"rollout-{index}",
+            worker_id=None,
+            engine_name=f"rollout/ri-{index}",
+        )
+        for index in range(3)
+    ]
+
+    outcomes = await launcher.provision_many(instances)
+
+    assert outcomes == [None, None, None]
+    assert [job.role for job in scheduler.capacity_provider.jobs] == [
+        instance.worker_role for instance in instances
+    ]
+    assert scheduler.created_job is None
+    assert all(
+        instance.state is RolloutInstanceState.STARTING for instance in instances
+    )
+
+
+@pytest.mark.asyncio
+async def test_provision_many_keeps_successful_roles_on_partial_failure():
+    launcher, scheduler = _batch_launcher()
+    instances = [
+        RolloutInstance(
+            instance_id=f"ri-{index}",
+            worker_role=f"rollout-{index}",
+            worker_id=None,
+            engine_name=f"rollout/ri-{index}",
+        )
+        for index in range(3)
+    ]
+    scheduler.capacity_provider.failed_role = instances[1].worker_role
+
+    outcomes = await launcher.provision_many(instances)
+
+    assert outcomes[0] is None
+    assert isinstance(outcomes[1], RuntimeError)
+    assert outcomes[2] is None
+    assert instances[0].state is RolloutInstanceState.STARTING
+    assert instances[1].state is RolloutInstanceState.FAILED
+    assert instances[2].state is RolloutInstanceState.STARTING
 
 
 @pytest.mark.asyncio

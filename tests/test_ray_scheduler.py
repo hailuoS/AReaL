@@ -2,6 +2,7 @@
 
 import gc
 import sys
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -19,7 +20,11 @@ from areal.infra.scheduler.exceptions import (
     WorkerCreationError,
     WorkerNotFoundError,
 )
-from areal.infra.scheduler.ray import RayScheduler, RayWorkerInfo
+from areal.infra.scheduler.ray import (
+    RayScheduler,
+    RayWorkerCapacityProvider,
+    RayWorkerInfo,
+)
 
 
 def _scheduler(tmp_path, n_gpus_per_node: int = 8) -> RayScheduler:
@@ -262,6 +267,76 @@ def test_legacy_create_workers_composes_reservation_lifecycle(tmp_path, monkeypa
 
     assert worker_ids == ["rollout/0"]
     assert events == ["request", "wait", "activate"]
+
+
+@pytest.mark.asyncio
+async def test_capacity_provider_submits_all_demands_before_waiting():
+    events = []
+    scheduler = Mock()
+
+    def request(job):
+        events.append(("request", job.role))
+        return SimpleNamespace(role=job.role)
+
+    def wait(reservation):
+        assert [event[0] for event in events[:3]] == ["request"] * 3
+        events.append(("wait", reservation.role))
+
+    def activate(reservation):
+        events.append(("activate", reservation.role))
+        return [f"{reservation.role}/0"]
+
+    scheduler.request_worker_job.side_effect = request
+    scheduler.wait_worker_reservation.side_effect = wait
+    scheduler.activate_worker_reservation.side_effect = activate
+    provider = RayWorkerCapacityProvider(scheduler)
+    jobs = [
+        Job(role=f"rollout-{index}", replicas=1, tasks=[SchedulingSpec(gpu=1)])
+        for index in range(3)
+    ]
+
+    outcomes = await provider.provision_many(jobs)
+
+    assert [outcome.role for outcome in outcomes] == [job.role for job in jobs]
+    assert [outcome.worker_ids for outcome in outcomes] == [
+        (f"{job.role}/0",) for job in jobs
+    ]
+    first_non_request = next(
+        index for index, event in enumerate(events) if event[0] != "request"
+    )
+    assert first_non_request == len(jobs)
+
+
+@pytest.mark.asyncio
+async def test_capacity_provider_preserves_partial_success():
+    scheduler = Mock()
+    scheduler.request_worker_job.side_effect = lambda job: SimpleNamespace(
+        role=job.role
+    )
+
+    def wait(reservation):
+        if reservation.role == "rollout-1":
+            raise RuntimeError("capacity unavailable")
+
+    scheduler.wait_worker_reservation.side_effect = wait
+    scheduler.activate_worker_reservation.side_effect = lambda reservation: [
+        f"{reservation.role}/0"
+    ]
+    provider = RayWorkerCapacityProvider(scheduler)
+    jobs = [
+        Job(role=f"rollout-{index}", replicas=1, tasks=[SchedulingSpec(gpu=1)])
+        for index in range(3)
+    ]
+
+    outcomes = await provider.provision_many(jobs)
+
+    assert outcomes[0].succeeded
+    assert isinstance(outcomes[1].error, RuntimeError)
+    assert outcomes[2].succeeded
+    assert [
+        call.args[0].role
+        for call in scheduler.activate_worker_reservation.call_args_list
+    ] == ["rollout-0", "rollout-2"]
 
 
 def test_zero_replicas_fails(tmp_path):

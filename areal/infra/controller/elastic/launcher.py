@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -18,6 +19,7 @@ from areal.api import (
 )
 from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import InferenceEngineConfig, SchedulingSpec
+from areal.infra.scheduler.capacity import WorkerCapacityProvider
 from areal.utils import logging
 from areal.utils.network import format_hostport
 
@@ -70,6 +72,12 @@ class RolloutInstanceLauncher:
         self._inf_engine = inf_engine
         self._config = config
         self._rollout_alloc = rollout_alloc
+        capacity_provider_factory = getattr(
+            scheduler, "create_worker_capacity_provider", None
+        )
+        self._capacity_provider: WorkerCapacityProvider | None = (
+            capacity_provider_factory() if callable(capacity_provider_factory) else None
+        )
 
     def _instance_scheduling_spec(self) -> SchedulingSpec:
         instance_size = self._instance_size()
@@ -98,6 +106,34 @@ class RolloutInstanceLauncher:
         """Return the stable Scheduler role for an instance-local V1 proxy."""
         return f"proxy-{instance.worker_role}"
 
+    def _job_for(self, instance: RolloutInstance) -> Job:
+        self._validate_single_node_capacity()
+        if instance.state is not RolloutInstanceState.PENDING:
+            raise ValueError("instance must be PENDING before provisioning")
+        return Job(
+            role=instance.worker_role,
+            replicas=1,
+            tasks=[self._instance_scheduling_spec()],
+            scheduling_strategy=self._config.scheduling_strategy,
+        )
+
+    @staticmethod
+    def _bind_provisioned_worker(
+        instance: RolloutInstance, worker_ids: Sequence[str]
+    ) -> None:
+        if len(worker_ids) != 1:
+            raise RuntimeError(
+                "Expected one provisioned Worker ID for "
+                f"{instance.worker_role}, got {len(worker_ids)}"
+            )
+        instance.worker_id = worker_ids[0]
+        instance.transition_to(RolloutInstanceState.STARTING)
+
+    @staticmethod
+    def _mark_provision_failed(instance: RolloutInstance) -> None:
+        if instance.state is not RolloutInstanceState.FAILED:
+            instance.transition_to(RolloutInstanceState.FAILED)
+
     def provision(self, *, instance: RolloutInstance) -> None:
         """Create one Scheduler role without initializing its inference engine.
 
@@ -105,27 +141,12 @@ class RolloutInstanceLauncher:
         synchronous methods, so callers must serialize this phase.
         """
         started_at = time.monotonic()
-        self._validate_single_node_capacity()
-        if instance.state is not RolloutInstanceState.PENDING:
-            raise ValueError("instance must be PENDING before provisioning")
-
-        job = Job(
-            role=instance.worker_role,
-            replicas=1,
-            tasks=[self._instance_scheduling_spec()],
-            scheduling_strategy=self._config.scheduling_strategy,
-        )
+        job = self._job_for(instance)
         workers_created = False
         try:
             worker_ids = self._scheduler.create_workers(job=job)
             workers_created = True
-            if len(worker_ids) != 1:
-                raise RuntimeError(
-                    "Expected one provisioned Worker ID for "
-                    f"{instance.worker_role}, got {len(worker_ids)}"
-                )
-            instance.worker_id = worker_ids[0]
-            instance.transition_to(RolloutInstanceState.STARTING)
+            self._bind_provisioned_worker(instance, worker_ids)
             _log_timing(instance, event="provision_completed", started_at=started_at)
         except BaseException as error:
             _log_timing(
@@ -134,11 +155,102 @@ class RolloutInstanceLauncher:
                 started_at=started_at,
                 error_type=type(error).__name__,
             )
-            if instance.state is not RolloutInstanceState.FAILED:
-                instance.transition_to(RolloutInstanceState.FAILED)
+            self._mark_provision_failed(instance)
             if workers_created:
                 self._scheduler.delete_workers(role=instance.worker_role)
             raise
+
+    async def provision_many(
+        self, instances: Sequence[RolloutInstance]
+    ) -> list[Exception | None]:
+        """Provision a batch, submitting all Ray demands before waiting.
+
+        Schedulers without a batch-capacity adapter retain the legacy serialized
+        create_workers behavior.
+        """
+        if self._capacity_provider is None:
+            results: list[Exception | None] = []
+            for instance in instances:
+                try:
+                    self.provision(instance=instance)
+                except Exception as error:
+                    results.append(error)
+                else:
+                    results.append(None)
+            return results
+
+        results: list[Exception | None] = [None] * len(instances)
+        jobs: list[Job] = []
+        job_instances: list[tuple[int, RolloutInstance, float]] = []
+        for index, instance in enumerate(instances):
+            started_at = time.monotonic()
+            try:
+                job = self._job_for(instance)
+            except Exception as error:
+                results[index] = error
+                continue
+            jobs.append(job)
+            job_instances.append((index, instance, started_at))
+
+        if not jobs:
+            return results
+
+        try:
+            outcomes = await self._capacity_provider.provision_many(jobs)
+            if len(outcomes) != len(jobs):
+                for outcome in outcomes:
+                    if outcome.succeeded:
+                        self._scheduler.delete_workers(role=outcome.role)
+                raise RuntimeError(
+                    "Capacity provider returned an unexpected number of outcomes: "
+                    f"{len(outcomes)} != {len(jobs)}"
+                )
+        except Exception as error:
+            for index, instance, started_at in job_instances:
+                results[index] = error
+                self._mark_provision_failed(instance)
+                _log_timing(
+                    instance,
+                    event="provision_failed",
+                    started_at=started_at,
+                    error_type=type(error).__name__,
+                )
+            return results
+
+        for (index, instance, started_at), outcome in zip(
+            job_instances, outcomes, strict=True
+        ):
+            error = outcome.error
+            if outcome.role != instance.worker_role:
+                if outcome.succeeded:
+                    self._scheduler.delete_workers(role=outcome.role)
+                error = RuntimeError(
+                    "Capacity provider returned role "
+                    f"'{outcome.role}' for '{instance.worker_role}'"
+                )
+            if error is None:
+                try:
+                    self._bind_provisioned_worker(instance, outcome.worker_ids)
+                except Exception as bind_error:
+                    self._scheduler.delete_workers(role=instance.worker_role)
+                    error = bind_error
+
+            if error is not None:
+                results[index] = error
+                self._mark_provision_failed(instance)
+                _log_timing(
+                    instance,
+                    event="provision_failed",
+                    started_at=started_at,
+                    error_type=type(error).__name__,
+                )
+            else:
+                _log_timing(
+                    instance,
+                    event="provision_completed",
+                    started_at=started_at,
+                )
+        return results
 
     async def start(
         self,

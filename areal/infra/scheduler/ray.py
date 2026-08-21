@@ -29,6 +29,10 @@ from areal.api.cli_args import (
     SchedulingStrategyType,
 )
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
+from areal.infra.scheduler.capacity import (
+    WorkerCapacityProvider,
+    WorkerProvisionOutcome,
+)
 from areal.infra.scheduler.exceptions import (
     EngineCallError,
     EngineCreationError,
@@ -421,6 +425,78 @@ class RayWorkerReservation:
     ready: bool = False
     activated: bool = False
     cancelled: bool = False
+
+
+class RayWorkerCapacityProvider(WorkerCapacityProvider):
+    """Batch Ray placement-group demand before activating any worker role."""
+
+    def __init__(self, scheduler: "RayScheduler") -> None:
+        self._scheduler = scheduler
+
+    async def provision_many(self, jobs: list[Job]) -> list[WorkerProvisionOutcome]:
+        reservations: list[tuple[int, RayWorkerReservation]] = []
+        outcomes: list[WorkerProvisionOutcome | None] = [None] * len(jobs)
+
+        # Submit every valid placement group first. This lets Ray autoscaler see
+        # the whole capacity gap instead of discovering roles one at a time.
+        for index, job in enumerate(jobs):
+            try:
+                reservation = self._scheduler.request_worker_job(job)
+            except Exception as error:
+                outcomes[index] = WorkerProvisionOutcome(
+                    role=job.role,
+                    error=error,
+                )
+            else:
+                reservations.append((index, reservation))
+
+        wait_results = await asyncio.gather(
+            *(
+                asyncio.to_thread(
+                    self._scheduler.wait_worker_reservation,
+                    reservation,
+                )
+                for _, reservation in reservations
+            ),
+            return_exceptions=True,
+        )
+
+        # Activation mutates RayScheduler's role registries, so keep it
+        # serialized after all placement-group waits have completed.
+        for (index, reservation), wait_result in zip(
+            reservations, wait_results, strict=True
+        ):
+            if isinstance(wait_result, Exception):
+                outcomes[index] = WorkerProvisionOutcome(
+                    role=reservation.role,
+                    error=wait_result,
+                )
+                continue
+            try:
+                worker_ids = await asyncio.to_thread(
+                    self._scheduler.activate_worker_reservation,
+                    reservation,
+                )
+            except Exception as error:
+                outcomes[index] = WorkerProvisionOutcome(
+                    role=reservation.role,
+                    error=error,
+                )
+            else:
+                outcomes[index] = WorkerProvisionOutcome(
+                    role=reservation.role,
+                    worker_ids=tuple(worker_ids),
+                )
+
+        return [
+            outcome
+            if outcome is not None
+            else WorkerProvisionOutcome(
+                role=job.role,
+                error=RuntimeError(f"No provisioning outcome for role '{job.role}'"),
+            )
+            for job, outcome in zip(jobs, outcomes, strict=True)
+        ]
 
 
 class RayMultiNodeRolloutCoordinator:
@@ -1509,6 +1585,35 @@ class RayScheduler(Scheduler):
         )
         self._pending_worker_reservations[role] = reservation
         return reservation
+
+    def create_worker_capacity_provider(self) -> WorkerCapacityProvider:
+        """Return the optional batch-capacity adapter used by elastic launchers."""
+        return RayWorkerCapacityProvider(self)
+
+    def request_worker_job(self, job: Job) -> RayWorkerReservation:
+        """Validate and submit one separation-mode Job without waiting for it."""
+        role = job.role
+        replicas = job.replicas
+        if ":" in role:
+            raise ValueError("Invalid worker name.")
+        if replicas <= 0:
+            raise WorkerCreationError(
+                role, "Invalid configuration", "replicas must be greater than 0"
+            )
+
+        strategy_type = SchedulingStrategyType(job.scheduling_strategy.type)
+        if strategy_type != SchedulingStrategyType.separation:
+            raise WorkerCreationError(
+                role,
+                "Invalid strategy",
+                "Batch capacity requests only support separation jobs",
+            )
+        schedulings = self._prepare_worker_specs(role, replicas, job.tasks)
+        return self.request_worker_reservation(
+            role=role,
+            replicas=replicas,
+            schedulings=schedulings,
+        )
 
     def wait_worker_reservation(
         self,

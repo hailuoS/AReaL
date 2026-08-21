@@ -84,6 +84,26 @@ class _FailingProxyLauncher(_FakeLauncher):
         raise RuntimeError("proxy launch failed")
 
 
+class _BatchProvisionLauncher(_FakeLauncher):
+    def __init__(self):
+        super().__init__()
+        self.provision_batches = []
+
+    async def provision_many(self, instances):
+        self.provision_batches.append(
+            [(instance.instance_id, instance.state) for instance in instances]
+        )
+        outcomes = []
+        for index, instance in enumerate(instances):
+            if index == 1:
+                instance.transition_to(RolloutInstanceState.FAILED)
+                outcomes.append(RuntimeError("capacity unavailable"))
+            else:
+                self.provision(instance=instance)
+                outcomes.append(None)
+        return outcomes
+
+
 class _ParallelLauncher(_FakeLauncher):
     def __init__(self, expected_starts):
         super().__init__()
@@ -201,6 +221,36 @@ async def test_reconciler_registers_pending_instance_before_launch_completes():
     instances = [pool.get(instance_id) for instance_id in pool.instance_ids()]
     assert all(instance.state is RolloutInstanceState.READY for instance in instances)
     assert all(instance.worker_id is not None for instance in instances)
+
+
+@pytest.mark.asyncio
+async def test_reconciler_preserves_partial_batch_provision_success():
+    pool = RolloutInstancePool(min_instances=1, initial_instances=3, max_instances=3)
+    launcher = _BatchProvisionLauncher()
+    reconciler = RolloutInstanceReconciler(
+        pool=pool,
+        launcher=launcher,
+        role_prefix="rollout-elastic",
+        server_args={},
+        latest_checkpoint=lambda: None,
+        current_version=lambda: 0,
+    )
+
+    result = await reconciler.reconcile_once()
+
+    assert len(launcher.provision_batches) == 1
+    assert [state for _, state in launcher.provision_batches[0]] == [
+        RolloutInstanceState.PENDING,
+        RolloutInstanceState.PENDING,
+        RolloutInstanceState.PENDING,
+    ]
+    assert len(result.created_instance_ids) == 2
+    assert len(result.failed_instance_ids) == 1
+    assert len(pool.instance_ids()) == 2
+    assert all(
+        pool.get(instance_id).state is RolloutInstanceState.READY
+        for instance_id in pool.instance_ids()
+    )
 
 
 @pytest.mark.asyncio
