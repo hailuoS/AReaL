@@ -97,11 +97,14 @@ wait_fraction < 0.05，且有效 step 时间、生产、消费均非零:
 ```
 
 结果会限制在配置的 min/max 范围内。按需驱动的 `prepare_batch` 即使在容量过剩时 也常使 `consumed / entered` 接近 1，因此
-AReaL 不再使用该比例计算缩容目标。 该建议只生成报告，不会自动修改 desired state。
+AReaL 不再使用该比例计算缩容目标。建议默认仍只生成报告。设置 `auto_apply_scaling_recommendations=true`
+后，RolloutController 会校验每个完整报告窗口， 并通过与 HTTP API 相同的入口更新 desired state。随后 reconciler 创建的
+Ray placement group 会驱动集群级 Ray autoscaler；策略循环不会直接调用 Kubernetes 或 KubeRay 扩缩容 接口。
 
-示例 autoscaler 会立即消费冷却期或容量未收敛时观察到的报告，不会在条件解除后 重放。一次扩缩容收敛后，它只接受采样窗口完全开始于收敛版本之后、且报告容量与
-当前稳定容量一致的新报告。连续扩容默认不额外冷却（`--scale-up-cooldown=0`）； 连续缩容和扩缩方向反转默认冷却 30 秒。缩容还要求连续两个有效低等待窗口
-（`--scale-down-windows`），并且每次收敛周期最多减少 1 个实例。旧参数 `--cooldown` 仍可统一覆盖所有方向的冷却时间。
+内部 autoscaler 与示例 autoscaler 复用同一套有状态策略。它们会立即消费冷却期或容量
+未收敛时观察到的报告，不会在条件解除后重放。一次扩缩容收敛后，策略只接受采样窗口 完全开始于收敛版本之后、且报告容量与当前稳定容量一致的新报告。连续扩容默认不额外
+冷却；连续缩容和扩缩方向反转默认冷却 30 秒。缩容还要求连续两个有效低等待窗口，并且 每次收敛周期最多减少 1 个实例。内部参数通过 elastic 下的
+`autoscaler_*` 字段配置；示例 提供等价的命令行选项。
 
 ## Disk checkpoint 保留和恢复
 

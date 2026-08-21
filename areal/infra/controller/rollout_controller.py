@@ -14,7 +14,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, Literal
 
 from flask import Flask, jsonify, request
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -43,6 +43,7 @@ from areal.infra.controller.elastic import (
     DiskCheckpointCatalog,
     DiskCheckpointCatalogError,
     DiskCheckpointManifest,
+    ElasticAutoscalerPolicy,
     ElasticRecoveryState,
     ElasticRecoveryStore,
     ElasticScalingReporter,
@@ -127,6 +128,12 @@ class RolloutController:
         self._elastic_scaling_report: dict[str, Any] | None = None
         self._elastic_scaling_report_lock = threading.Lock()
         self._elastic_scaling_reporter: ElasticScalingReporter | None = None
+        self._elastic_autoscaler_policy: ElasticAutoscalerPolicy | None = None
+        self._elastic_autoscaler_lock = threading.Lock()
+        self._elastic_autoscaler_pending_direction: (
+            Literal["scale_up", "scale_down"] | None
+        ) = None
+        self._elastic_last_autoscaler_decision: dict[str, Any] | None = None
         self._elastic_recovery_store: ElasticRecoveryStore | None = None
         self._elastic_desired_lock = threading.RLock()
         self._elastic_reconcile_lock = threading.Lock()
@@ -151,6 +158,19 @@ class RolloutController:
                 min_instances=config.elastic.min_instances,
                 max_instances=config.elastic.max_instances,
             )
+            if config.elastic.auto_apply_scaling_recommendations:
+                self._elastic_autoscaler_policy = ElasticAutoscalerPolicy(
+                    scale_up_cooldown_seconds=(
+                        config.elastic.autoscaler_scale_up_cooldown_seconds
+                    ),
+                    scale_down_cooldown_seconds=(
+                        config.elastic.autoscaler_scale_down_cooldown_seconds
+                    ),
+                    direction_change_cooldown_seconds=(
+                        config.elastic.autoscaler_direction_change_cooldown_seconds
+                    ),
+                    scale_down_windows=(config.elastic.autoscaler_scale_down_windows),
+                )
 
         self._task_id_generator = TaskIdGenerator()
 
@@ -651,7 +671,146 @@ class RolloutController:
                 previous_desired_count,
                 desired_count,
             )
+        if (
+            desired_count != previous_desired_count
+            and source != "internal_autoscaler"
+            and self._elastic_autoscaler_policy is not None
+        ):
+            with self._elastic_autoscaler_lock:
+                self._elastic_autoscaler_pending_direction = None
         return previous_desired_count, desired_count
+
+    def _elastic_autoscaler_status(self) -> tuple[dict[str, Any], bool, str]:
+        assert self._instance_pool is not None
+        instances = self._instance_pool.instances_snapshot()
+        desired = self._instance_pool.desired_count
+        serving_version = self.get_version()
+        with self._elastic_update_condition:
+            pending_update_version = self._elastic_pending_update_version
+        status = {
+            "desired_instances": desired,
+            "ready_instances": len(self._instance_pool.ready_snapshot()),
+            "serving_version": serving_version,
+            "pending_update_version": pending_update_version,
+        }
+
+        if self._elastic_last_reconcile_error:
+            return status, False, "last reconcile attempt failed"
+        if pending_update_version is not None:
+            return status, False, f"pending weight update={pending_update_version}"
+        if len(instances) != desired or status["ready_instances"] != desired:
+            return (
+                status,
+                False,
+                f"desired={desired} ready={status['ready_instances']} "
+                f"total={len(instances)}",
+            )
+        if any(instance.state.value != "ready" for instance in instances):
+            return status, False, "not all instances are READY"
+        if self._elastic_proxy_enabled and any(
+            not instance.proxy_ready for instance in instances
+        ):
+            return status, False, "not all instance proxies are ready"
+        mismatched = [
+            instance.instance_id
+            for instance in instances
+            if instance.loaded_version != serving_version
+        ]
+        if mismatched:
+            return (
+                status,
+                False,
+                f"serving_version={serving_version} mismatched={mismatched}",
+            )
+        return status, True, "stable"
+
+    def _evaluate_elastic_autoscaler(self, report: dict[str, Any]) -> None:
+        policy = self._elastic_autoscaler_policy
+        if policy is None:
+            return
+        with self._elastic_autoscaler_lock:
+            status, stable, detail = self._elastic_autoscaler_status()
+            try:
+                decision = policy.evaluate(
+                    report,
+                    status,
+                    capacity_stable=stable,
+                    stability_detail=detail,
+                    now=time.monotonic(),
+                )
+                self._elastic_last_autoscaler_decision = {
+                    "report_version": report.get("report_version"),
+                    "action": decision.action,
+                    "direction": decision.direction,
+                    "message": decision.message,
+                    "recommended_instances": report.get("recommended_instances"),
+                }
+                if not decision.should_apply:
+                    logger.info(
+                        "Internal elastic autoscaler action=%s report_version=%s: %s",
+                        decision.action,
+                        report.get("report_version"),
+                        decision.message,
+                    )
+                    return
+
+                recommended = report.get("recommended_instances")
+                if isinstance(recommended, bool) or not isinstance(recommended, int):
+                    raise ValueError(
+                        "scaling recommendation requires integer recommended_instances"
+                    )
+                previous, accepted = self._set_elastic_desired_instances(
+                    recommended,
+                    source="internal_autoscaler",
+                )
+                if accepted != previous:
+                    self._elastic_autoscaler_pending_direction = decision.direction
+                logger.info(
+                    "Internal elastic autoscaler applied report_version=%s "
+                    "previous_desired_instances=%d desired_instances=%d "
+                    "direction=%s",
+                    report.get("report_version"),
+                    previous,
+                    accepted,
+                    decision.direction,
+                )
+            except Exception as error:
+                self._elastic_last_autoscaler_decision = {
+                    "report_version": report.get("report_version"),
+                    "action": "error",
+                    "message": f"{type(error).__name__}: {error}",
+                    "recommended_instances": report.get("recommended_instances"),
+                }
+                logger.warning(
+                    "Internal elastic autoscaler rejected report_version=%s",
+                    report.get("report_version"),
+                    exc_info=True,
+                )
+
+    def _record_elastic_autoscaler_convergence(self) -> None:
+        policy = self._elastic_autoscaler_policy
+        if policy is None:
+            return
+        with self._elastic_autoscaler_lock:
+            direction = self._elastic_autoscaler_pending_direction
+            if direction is None:
+                return
+            status, stable, _ = self._elastic_autoscaler_status()
+            if not stable:
+                return
+            policy.record_convergence(
+                status,
+                now=time.monotonic(),
+                action_direction=direction,
+            )
+            self._elastic_autoscaler_pending_direction = None
+            self._elastic_last_autoscaler_decision = {
+                "action": "converged",
+                "direction": direction,
+                "message": "desired rollout capacity is stable",
+                "desired_instances": status["desired_instances"],
+                "serving_version": status["serving_version"],
+            }
 
     def record_elastic_scaling_window(
         self,
@@ -676,6 +835,7 @@ class RolloutController:
         if report is None:
             return None
         self._publish_elastic_scaling_report(report, persist=True)
+        self._evaluate_elastic_autoscaler(report)
         return report
 
     def _elastic_scaling_report_path(self, report_version: int) -> Path | None:
@@ -727,6 +887,7 @@ class RolloutController:
             try:
                 run_async_task(self._reconcile_elastic_once)
                 self._elastic_last_reconcile_error = None
+                self._record_elastic_autoscaler_convergence()
             except Exception:
                 self._elastic_last_reconcile_error = traceback.format_exc()
                 logger.error("Elastic reconciliation failed", exc_info=True)
@@ -1229,6 +1390,12 @@ class RolloutController:
                     if self._elastic_scaling_report is not None
                     else None
                 )
+            with self._elastic_autoscaler_lock:
+                last_autoscaler_decision = (
+                    dict(self._elastic_last_autoscaler_decision)
+                    if self._elastic_last_autoscaler_decision is not None
+                    else None
+                )
             instances = []
             for instance in self._instance_pool.instances_snapshot():
                 instances.append(
@@ -1283,6 +1450,10 @@ class RolloutController:
                     "last_reconcile_error": self._elastic_last_reconcile_error,
                     "report_freq_steps": self.config.elastic.report_freq_steps,
                     "latest_report_version": latest_report_version,
+                    "auto_apply_scaling_recommendations": (
+                        self.config.elastic.auto_apply_scaling_recommendations
+                    ),
+                    "last_autoscaler_decision": last_autoscaler_decision,
                     "instances": instances,
                 }
             )

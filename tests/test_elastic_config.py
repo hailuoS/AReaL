@@ -38,6 +38,10 @@ def test_elastic_rollout_config_is_disabled_by_default():
         ({"checkpoint_retention": 1}, "at least 2"),
         ({"recovery_schema_version": 2}, "schema_version"),
         ({"report_freq_steps": -1}, "non-negative"),
+        ({"autoscaler_scale_down_windows": 0}, "positive"),
+        ({"autoscaler_scale_up_cooldown_seconds": -1}, "non-negative"),
+        ({"autoscaler_scale_down_cooldown_seconds": -1}, "non-negative"),
+        ({"autoscaler_direction_change_cooldown_seconds": -1}, "non-negative"),
     ],
 )
 def test_elastic_rollout_config_rejects_invalid_contracts(kwargs, message):
@@ -54,6 +58,11 @@ def test_elastic_rollout_config_accepts_scale_out_contract():
         role_prefix="rollout-elastic",
         checkpoint_retention=3,
         report_freq_steps=20,
+        auto_apply_scaling_recommendations=True,
+        autoscaler_scale_down_windows=3,
+        autoscaler_scale_up_cooldown_seconds=1,
+        autoscaler_scale_down_cooldown_seconds=45,
+        autoscaler_direction_change_cooldown_seconds=60,
         resource_provision_timeout_seconds=600,
         startup_timeout_seconds=120,
         startup_concurrency=2,
@@ -65,6 +74,11 @@ def test_elastic_rollout_config_accepts_scale_out_contract():
     assert config.enabled
     assert config.max_instances == 4
     assert config.report_freq_steps == 20
+    assert config.auto_apply_scaling_recommendations
+    assert config.autoscaler_scale_down_windows == 3
+    assert config.autoscaler_scale_up_cooldown_seconds == 1
+    assert config.autoscaler_scale_down_cooldown_seconds == 45
+    assert config.autoscaler_direction_change_cooldown_seconds == 60
     assert config.resource_provision_timeout_seconds == 600
     assert config.startup_timeout_seconds == 120
     assert config.startup_concurrency == 2

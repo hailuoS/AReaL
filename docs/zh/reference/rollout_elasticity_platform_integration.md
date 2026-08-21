@@ -31,38 +31,42 @@ flowchart LR
     subgraph AReaL[AReaL 框架]
         Trainer[训练过程]
         Metrics[供需指标与扩缩容建议]
+        Policy[框架实例 Autoscaler]
         Controller[弹性控制与实例状态]
         Routing[请求路由与安全排空]
         Version[模型版本与 Checkpoint]
     end
 
     subgraph Platform[云平台 / Kubernetes]
-        Autoscaler[平台弹性控制器]
-        Scheduler[Ray / 平台调度层]
+        Autoscaler[Ray / KubeRay Autoscaler]
+        Scheduler[Ray 调度层]
         Workload[Worker Pod / 推理工作负载]
         Resource[NPU/GPU 节点与存储]
     end
 
     Trainer --> Metrics
-    Metrics --> Autoscaler
-    Autoscaler -->|设置目标实例数| Controller
-    Controller -->|申请/释放实例资源| Scheduler
+    Metrics --> Policy
+    Policy -->|设置目标实例数| Controller
+    Controller -->|创建/删除 Placement Group| Scheduler
+    Scheduler -->|Pending Resource Demand| Autoscaler
+    Autoscaler -->|扩缩 Worker Pod / 节点| Workload
     Scheduler --> Workload
     Workload --> Resource
     Controller --> Version
     Controller --> Routing
     Version --> Workload
     Workload -->|资源与运行状态| Controller
-    Controller -->|收敛状态| Autoscaler
+    Controller -->|收敛状态| Policy
 ```
 
 架构中存在两个相互配合的控制闭环：
 
-1. **AReaL 实例闭环**：判断需要多少 Rollout 实例，并管理启动、版本追赶、路由和排空。
-1. **平台资源闭环**：为实例提供 Worker Pod、NPU/GPU 节点、网络和共享存储。
+1. **AReaL 实例闭环**：根据训练指标判断需要多少 Rollout 实例，并管理启动、版本追赶、路由和排空。
+1. **Ray/KubeRay 资源闭环**：根据 pending placement group 的资源需求扩缩 Worker Pod 和 NPU/GPU 节点。
 
-当前运行方式下，AReaL 通过 Ray 申请资源。Ray 集群有空闲资源时可以直接启动实例； 资源不足时，需要平台扩充 Ray Worker Pod，必要时继续扩充底层
-NPU/GPU 节点。
+当前运行方式下，AReaL 不调用 Kubernetes 扩容 API。框架批量创建 Ray placement group：集群有空闲资源时直接调度；资源不足时，Ray
+autoscaler 从 pending resource demand 中计算缺口，KubeRay 扩充 Worker Pod，必要时由底层节点 autoscaler
+继续增加 NPU/GPU 节点。
 
 ## 4. 框架内部已经实现的能力
 
@@ -85,25 +89,26 @@ Ingress 或平台 API Gateway。
 
 ### 5.1 HTTP 控制与状态接口
 
-| 接口                                  | 方向         | 平台用途                              |
-| ------------------------------------- | ------------ | ------------------------------------- |
-| `GET /elastic/scaling-recommendation` | AReaL → 平台 | 读取训练侧推荐实例数和指标依据        |
-| `PUT /elastic/desired-instances`      | 平台 → AReaL | 设置目标 Rollout 实例数               |
-| `GET /elastic/desired-instances`      | AReaL → 平台 | 查询当前目标实例数                    |
-| `GET /elastic/instances`              | AReaL → 平台 | 查询 READY 数量、模型版本、容量和错误 |
+| 接口                                  | 方向         | 用途                                       |
+| ------------------------------------- | ------------ | ------------------------------------------ |
+| `GET /elastic/scaling-recommendation` | AReaL → 平台 | 观测训练侧推荐实例数和指标依据             |
+| `PUT /elastic/desired-instances`      | 平台 → AReaL | 人工覆盖、调试或关闭内部策略时设置目标数量 |
+| `GET /elastic/desired-instances`      | AReaL → 平台 | 查询当前目标实例数                         |
+| `GET /elastic/instances`              | AReaL → 平台 | 查询 READY 数量、模型版本、容量和错误      |
 
-`PUT` 是异步目标状态接口：响应成功表示目标已被接受，不表示资源已创建或容量已生效。平台需要继续查询状态，直到容量和模型版本收敛。
+启用 `auto_apply_scaling_recommendations` 后，正常运行不依赖平台调用 `PUT`；该接口仍保留 作为兼容和运维入口。`PUT`
+是异步目标状态接口：响应成功表示目标已被接受，不表示资源已 创建或容量已生效。调用方需要继续查询状态，直到容量和模型版本收敛。
 
 ### 5.2 资源调度接口
 
 AReaL 当前通过 Scheduler 抽象申请和释放资源。在现有 Ray 部署中，它负责：
 
-- 向同一个 Ray 集群申请新 Worker 所需的 CPU、内存和 NPU/GPU；
+- 一次性提交当前全部实例缺口对应的 Ray placement group，使 Ray autoscaler 能看到完整资源需求；
 - 等待 Worker 注册并获得网络地址；
 - 在 Worker 中启动推理引擎、vLLM 服务和可选框架 Proxy；
 - 缩容完成后删除对应 Worker并释放 Ray 资源。
 
-平台可以继续使用 Ray 作为资源接入层，也可以后续实现平台 Scheduler Adapter。AReaL 当前不直接创建 Kubernetes Pod 或节点。
+平台继续使用 Ray/KubeRay 作为资源接入层。AReaL 当前不直接创建 Kubernetes Pod 或 节点，也不重复实现节点级 autoscaler。
 
 ### 5.3 共享数据与观测输出
 
@@ -117,20 +122,22 @@ AReaL 还会向平台环境读写或输出：
 
 ### 6.1 平台负责
 
-- 提供 Ray Worker Pod 或等价的推理工作负载；
+- 在作业启动前创建启用 autoscaling 的 RayCluster，并配置 WorkerGroup 最小、最大副本数；
+- 配置 GPU/NPU 自定义资源名、Worker Pod 规格和 placement group 可满足的节点形态；
+- 让 Ray autoscaler 根据 pending resource demand 扩缩 Ray Worker Pod；
 - 管理 NPU/GPU 配额、节点供给、设备分配和资源回收；
 - 保证 Controller、Worker 和推理服务之间的网络连通；
 - 提供所有相关实例可访问的 checkpoint 共享存储；
 - 提供镜像、驱动、CANN/CUDA 和推理运行环境；
-- 将资源排队、Pod 调度、节点扩容和失败状态反馈给控制面；
+- 提供 Ray autoscaler、Pod 调度、节点扩容失败和资源上限的日志与监控；
 - 提供生产环境所需的鉴权、TLS、审计、告警、高可用和失败重试；
 - 清理 Controller 异常退出后可能残留的孤儿资源。
 
 ### 6.2 双方共同定义
 
-- 一个 Rollout 实例对应的平台工作负载形态和资源规格；
+- 一个 Rollout 实例对应的 Ray bundle、Worker Pod 和节点资源规格；
 - 实例、Ray Worker、Pod 和节点之间的统一标识；
-- 资源申请、排队、就绪、失败和删除的状态协议；
+- placement group 申请、排队、就绪、失败和删除的状态协议；
 - 扩容超时、重试、退避和熔断策略；
 - 模型版本就绪与平台 readiness 状态如何映射；
 - Controller 重启或平台资源残留时，以哪一侧状态为准。
@@ -141,30 +148,30 @@ AReaL 还会向平台环境读写或输出：
 sequenceDiagram
     autonumber
     participant T as 训练过程
-    participant A as 平台 Autoscaler
+    participant A as AReaL 实例 Autoscaler
     participant C as AReaL 弹性控制器
-    participant P as Ray / 云平台
+    participant R as Ray Autoscaler / KubeRay
     participant I as 新推理实例
 
     T->>A: 上报训练等待与 Rollout 供需
     A->>C: 设置更大的目标实例数
-    C-->>A: 目标已接受
-    C->>P: 申请新的 Rollout 实例资源
+    C->>R: 批量创建缺口对应的 Placement Group
     alt Ray 集群有空闲资源
-        P->>I: 直接启动 Worker 和推理服务
+        R->>I: 直接分配 Worker 资源
     else Ray 集群资源不足
-        P->>P: 扩 Ray Worker Pod / NPU 节点
-        P->>I: 资源就绪后启动推理服务
+        R->>R: 扩 Ray Worker Pod / NPU 节点
+        R->>I: 节点就绪后分配 Worker 资源
     end
     C->>I: 加载当前指定模型版本
     I-->>C: 服务和模型版本就绪
     C->>C: 实例进入 READY 并加入请求路由
-    C-->>A: 返回实例数、版本和容量收敛状态
+    C-->>A: 记录实例数、版本和容量已收敛
 ```
 
 扩容过程需要注意：
 
-- 设置目标实例数是异步操作，接口成功不代表新容量已经生效；
+- desired state 变更是异步操作，不代表新容量已经生效；
+- 同一轮全部 placement group 先提交，再等待资源，避免 Ray autoscaler 逐个发现节点缺口；
 - Pod 或 Worker 启动只代表资源和进程可用，不能直接视为模型就绪；
 - 新实例加载权重期间不接收 Rollout 请求；
 - 同一批新实例使用一致的目标模型版本；
@@ -175,25 +182,26 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     autonumber
-    participant A as 平台 Autoscaler
+    participant A as AReaL 实例 Autoscaler
     participant C as AReaL 弹性控制器
     participant R as 请求路由
     participant I as 待缩容实例
-    participant P as Ray / 云平台
+    participant P as Ray Autoscaler / KubeRay
 
     A->>C: 设置更小的目标实例数
     C->>R: 停止向目标实例分配新请求
     C->>I: 进入 DRAINING
     Note over I: 已接收任务继续执行，不做迁移
     I-->>C: 在途任务与结果全部释放
-    C->>P: 删除该实例的 Worker/Pod
-    P-->>C: 设备资源已释放
+    C->>P: 删除 Worker 并释放 Placement Group
+    P->>P: 空闲超时后缩 Worker Pod / 节点
     C-->>A: 缩容完成
 ```
 
 `DRAINING` 是缩容中的安全排空阶段：实例仍然运行并占用设备，但不再接收新任务； 已有任务和结果使用结束后，AReaL 才通知平台释放资源。
 
-因此平台不应在收到缩容建议后直接删除 Pod，否则可能中断正在执行的 Rollout 请求。
+因此 Ray/KubeRay 只根据 placement group 释放后的空闲资源缩 Pod/节点，不应根据框架的 缩容建议直接删除仍承载实例的
+Pod，否则可能中断正在执行的 Rollout 请求。
 
 ## 9. 模型版本一致性
 
@@ -219,15 +227,19 @@ flowchart LR
 
 ## 10. 框架与平台联动方式
 
-平台 Autoscaler 与 AReaL 的基本联动方式是：
+推荐的基本联动方式是：
 
 ```text
-读取建议和当前状态
-  → 执行冷却、配额、审批和安全策略
-  → 设置目标实例数
-  → 必要时扩充 Ray Worker Pod 或底层节点
-  → 持续查询状态直到容量和模型版本收敛
+AReaL 读取训练指标并执行实例级冷却和安全策略
+  → AReaL 更新目标实例数
+  → AReaL 批量创建或安全释放 Ray Placement Group
+  → Ray Autoscaler 根据资源需求扩缩 Worker Pod
+  → 底层节点 Autoscaler 按需扩缩 NPU/GPU 节点
+  → AReaL 管理服务启动、版本追赶、路由和排空直到收敛
 ```
+
+HTTP 控制方式继续保留，可用于第一阶段穿刺、人工审批环境和故障处置，但不是正常自动 扩缩容链路的必需组件。这样可以复用 Ray 已有的资源
+autoscaler，同时避免平台重复实现 AReaL 的指标解释、模型版本门控和实例生命周期状态机。
 
 生产集成时，建议以以下条件判断扩容完成：
 
@@ -237,8 +249,8 @@ flowchart LR
 - 当前没有正在进行的权重版本切换；
 - 没有未处理的扩缩容错误。
 
-生产环境需要由平台为 AReaL HTTP 接口补充服务发现、鉴权、TLS、审计、重试和单写者保护。后续如果需要 Kubernetes 原生管理方式，可以再封装成 CRD 和
-Operator，不建议第一阶段直接从 CRD 开始。
+生产环境如果对外暴露 AReaL HTTP 运维接口，需要由平台补充服务发现、鉴权、TLS、审计 和人工覆盖权限控制。后续如果需要 Kubernetes
+原生管理方式，可以再封装成 CRD 和 Operator，不建议第一阶段直接从 CRD 开始。
 
 ### 10.1 平台资源联动
 
@@ -263,11 +275,12 @@ flowchart LR
     Launch --> Ready
 ```
 
-只扩 Ray Worker Pod 不会自动增加 AReaL 的目标实例数；只增加目标实例数而没有平台 资源时，新实例会等待资源。平台 Autoscaler
-需要协调这两个动作。
+只扩 Ray Worker Pod 不会自动增加 AReaL 的目标实例数；只增加目标实例数而没有平台 资源时，placement group 会保持 pending，并成为
+Ray autoscaler 的扩容依据。两个闭环 通过 Ray resource demand 解耦，不需要平台同时调用 AReaL HTTP 接口并操作 Worker
+Pod。
 
 不建议让 Kubernetes HPA 直接修改 Rollout Pod 副本数。HPA 只理解 Pod 数量，无法 处理 AReaL 的模型版本追赶、READY 路由和
-DRAINING 排空语义。第一阶段更适合由平台 Autoscaler 调用 AReaL 接口，并通过 Ray 或平台调度层提供资源。
+DRAINING 排空语义。第一阶段应由 AReaL 管理实例，由 Ray/KubeRay autoscaler 管理 Pod 和节点资源。
 
 ## 11. 当前性能现状
 
@@ -298,18 +311,18 @@ DRAINING 排空语义。第一阶段更适合由平台 Autoscaler 调用 AReaL �
 建议第一阶段保持 AReaL 现有实例和版本控制逻辑，只接入平台资源层：
 
 ```text
-平台 Autoscaler
-    ↓ 读取建议、设置目标、等待收敛
-AReaL 弹性控制器
-    ↓ 申请/释放 Rollout 实例
-Ray on Kubernetes 或平台 Scheduler Adapter
+AReaL 指标与实例 Autoscaler
+    ↓ 设置目标、管理生命周期、创建/释放 Placement Group
+Ray Autoscaler on KubeRay
+    ↓ 根据 Resource Demand 扩缩 Worker Pod
+Kubernetes 节点 Autoscaler
     ↓
-Ray Worker Pod 与 NPU/GPU 节点
+NPU/GPU 节点
 ```
 
 第一阶段目标：
 
-1. 打通目标实例数与平台资源扩缩的闭环；
+1. 打通 AReaL 目标实例数、Ray resource demand 与 KubeRay 资源扩缩的闭环；
 1. 保证新增 Worker 能加入同一个 Ray 集群并正确上报设备资源；
 1. 打通共享 checkpoint、网络和实例删除；
 1. 用统一 ID 串联扩容请求、实例、Ray Worker、Pod 和节点日志；
@@ -330,7 +343,7 @@ Ray Worker Pod 与 NPU/GPU 节点
 
 1. 平台当前如何扩充 Ray Worker Pod，它们如何注册进现有 Ray 集群？
 1. Ray 资源不足时，能否自动触发 Worker Pod和底层 NPU/GPU 节点扩容？
-1. 由谁运行生产 Autoscaler，并拥有目标实例数的唯一写权限？
+1. 平台是否接受由 AReaL 内部策略作为目标实例数的正常单写者，HTTP 仅用于人工覆盖？
 1. 平台如何向 AReaL 返回资源排队、Pod 调度、节点扩容和失败状态？
 1. checkpoint 使用哪种共享存储，访问路径和清理规则如何保证一致？
 1. Controller、Ray Worker、推理服务和框架 Proxy 的网络如何打通？

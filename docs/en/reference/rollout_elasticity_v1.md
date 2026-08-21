@@ -124,17 +124,21 @@ otherwise:
 The result is clamped to configured min/max instances. AReaL does not use the
 `consumed / entered` ratio as the scale-down target because demand-driven
 `prepare_batch` commonly keeps those counters close even when rollout capacity is
-over-provisioned. The recommendation is report-only and never changes desired state
-automatically.
+over-provisioned. Recommendations remain report-only by default. Set
+`auto_apply_scaling_recommendations=true` to let RolloutController validate each
+completed report window and update desired state through the same mutation path as the
+HTTP API. Ray placement groups created by reconciliation then drive the cluster-level
+Ray autoscaler; the policy loop does not call Kubernetes or KubeRay scaling APIs.
 
-The example autoscaler consumes reports observed during cooldown or unstable capacity
-instead of replaying them later. After convergence it accepts only a report whose
-complete window starts after the convergence version and whose reported capacity matches
-the current stable capacity. Consecutive scale-up has no extra cooldown by default
-(`--scale-up-cooldown=0`); consecutive scale-down and direction reversals default to 30
-seconds. Scale-down additionally requires two consecutive valid low-wait windows
-(`--scale-down-windows`) and removes at most one instance per convergence cycle. The
-legacy `--cooldown` option can still override every direction uniformly.
+The internal and example autoscalers share the same stateful policy. They consume
+reports observed during cooldown or unstable capacity instead of replaying them later.
+After convergence, the policy accepts only a report whose complete window starts after
+the convergence version and whose reported capacity matches the current stable capacity.
+Consecutive scale-up has no extra cooldown by default; consecutive scale-down and
+direction reversals default to 30 seconds. Scale-down additionally requires two
+consecutive valid low-wait windows and removes at most one instance per convergence
+cycle. The internal values are configurable through the `autoscaler_*` elastic fields;
+the example exposes equivalent command-line options.
 
 ## Disk checkpoint retention and recovery
 

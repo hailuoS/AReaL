@@ -2401,6 +2401,42 @@ class ElasticRolloutConfig:
             )
         },
     )
+    auto_apply_scaling_recommendations: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Let RolloutController apply completed scaling recommendations "
+                "to desired_instances. Ray autoscaler remains responsible only "
+                "for cluster worker capacity."
+            )
+        },
+    )
+    autoscaler_scale_down_windows: int = field(
+        default=2,
+        metadata={
+            "help": (
+                "Number of consecutive low-load report windows required before "
+                "the internal autoscaler removes one rollout instance."
+            )
+        },
+    )
+    autoscaler_scale_up_cooldown_seconds: float = field(
+        default=0.0,
+        metadata={"help": "Cooldown after an internal autoscaler scale-up action."},
+    )
+    autoscaler_scale_down_cooldown_seconds: float = field(
+        default=30.0,
+        metadata={"help": "Cooldown after an internal autoscaler scale-down action."},
+    )
+    autoscaler_direction_change_cooldown_seconds: float = field(
+        default=30.0,
+        metadata={
+            "help": (
+                "Cooldown before the internal autoscaler reverses its previous "
+                "scaling direction."
+            )
+        },
+    )
 
     def __post_init__(self):
         if self.min_instances < 1:
@@ -2456,6 +2492,15 @@ class ElasticRolloutConfig:
             raise ValueError("elastic.recovery_schema_version must be 1")
         if self.report_freq_steps < 0:
             raise ValueError("elastic.report_freq_steps must be non-negative")
+        if self.autoscaler_scale_down_windows <= 0:
+            raise ValueError("elastic.autoscaler_scale_down_windows must be positive")
+        autoscaler_cooldowns = (
+            self.autoscaler_scale_up_cooldown_seconds,
+            self.autoscaler_scale_down_cooldown_seconds,
+            self.autoscaler_direction_change_cooldown_seconds,
+        )
+        if any(seconds < 0 for seconds in autoscaler_cooldowns):
+            raise ValueError("elastic autoscaler cooldown seconds must be non-negative")
 
 
 @dataclass

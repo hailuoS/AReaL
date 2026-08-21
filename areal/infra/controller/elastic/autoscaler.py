@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Stateful policy for an external rollout autoscaler control loop."""
+"""Stateful policy shared by internal and external rollout autoscalers."""
 
 from __future__ import annotations
 
@@ -79,9 +79,9 @@ class ScaleDownConfirmation:
 class ElasticAutoscalerPolicy:
     """Reject observations that cannot safely drive the current topology.
 
-    The policy deliberately has no HTTP or sleep behavior. The caller owns polling and
-    actuation, while this object owns restart watermarks, cooldown, convergence state,
-    and conservative scale-down confirmation.
+    The policy deliberately has no HTTP, sleep, or Scheduler behavior. The caller owns
+    observation and actuation, while this object owns restart watermarks, cooldown,
+    convergence state, and conservative scale-down confirmation.
     """
 
     def __init__(

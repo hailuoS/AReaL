@@ -281,6 +281,100 @@ def test_controller_persists_completed_report_in_experiment_directory(tmp_path):
     assert json.loads(path.read_text(encoding="utf-8")) == report
 
 
+def test_controller_internal_autoscaler_applies_and_records_convergence():
+    config = InferenceEngineConfig(
+        backend="vllm:d1",
+        consumer_batch_size=1,
+        scheduling_spec=(SchedulingSpec(cpu=1, gpu=1, mem=1),),
+        elastic=ElasticRolloutConfig(
+            enabled=True,
+            max_instances=3,
+            report_freq_steps=1,
+            auto_apply_scaling_recommendations=True,
+        ),
+    )
+    controller = RolloutController(inf_engine=object, config=config, scheduler=object())
+    first = controller._instance_pool.create(
+        instance_id="ri-first",
+        worker_role="rollout-elastic-first",
+        worker_id="rollout-elastic-first/0",
+        engine_name="rollout/ri-first",
+    )
+    first.loaded_version = 0
+    first.transition_to(RolloutInstanceState.STARTING)
+    first.transition_to(RolloutInstanceState.READY)
+
+    controller.record_elastic_scaling_window(
+        report_version=1,
+        entered=10,
+        consumed=10,
+        wait_seconds=2.0,
+        step_seconds=10.0,
+    )
+    assert controller._instance_pool.desired_count == 1
+    assert controller._elastic_last_autoscaler_decision["action"] == "discard"
+
+    controller.record_elastic_scaling_window(
+        report_version=2,
+        entered=10,
+        consumed=10,
+        wait_seconds=2.0,
+        step_seconds=10.0,
+    )
+    assert controller._instance_pool.desired_count == 2
+    assert controller._elastic_autoscaler_pending_direction == "scale_up"
+    assert controller._elastic_last_autoscaler_decision["action"] == "apply"
+
+    second = controller._instance_pool.create(
+        instance_id="ri-second",
+        worker_role="rollout-elastic-second",
+        worker_id="rollout-elastic-second/0",
+        engine_name="rollout/ri-second",
+    )
+    second.loaded_version = 0
+    second.transition_to(RolloutInstanceState.STARTING)
+    second.transition_to(RolloutInstanceState.READY)
+    controller._record_elastic_autoscaler_convergence()
+
+    assert controller._elastic_autoscaler_pending_direction is None
+    assert controller._elastic_last_autoscaler_decision["action"] == "converged"
+
+
+def test_controller_keeps_recommendations_report_only_by_default():
+    config = InferenceEngineConfig(
+        backend="vllm:d1",
+        consumer_batch_size=1,
+        scheduling_spec=(SchedulingSpec(cpu=1, gpu=1, mem=1),),
+        elastic=ElasticRolloutConfig(
+            enabled=True,
+            max_instances=3,
+            report_freq_steps=1,
+        ),
+    )
+    controller = RolloutController(inf_engine=object, config=config, scheduler=object())
+    instance = controller._instance_pool.create(
+        instance_id="ri-first",
+        worker_role="rollout-elastic-first",
+        worker_id="rollout-elastic-first/0",
+        engine_name="rollout/ri-first",
+    )
+    instance.loaded_version = 0
+    instance.transition_to(RolloutInstanceState.STARTING)
+    instance.transition_to(RolloutInstanceState.READY)
+
+    for report_version in (1, 2):
+        controller.record_elastic_scaling_window(
+            report_version=report_version,
+            entered=10,
+            consumed=10,
+            wait_seconds=2.0,
+            step_seconds=10.0,
+        )
+
+    assert controller._instance_pool.desired_count == 1
+    assert controller._elastic_last_autoscaler_decision is None
+
+
 def test_active_rollout_gpu_count_includes_only_ready_elastic_instances():
     config = InferenceEngineConfig(
         backend="vllm:t2",

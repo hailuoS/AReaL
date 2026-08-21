@@ -2,6 +2,7 @@
 
 """Lifecycle primitives for RolloutController V1 elasticity."""
 
+from .autoscaler import AutoscalerDecision, ElasticAutoscalerPolicy
 from .disk_catalog import DiskCheckpointCatalog, DiskCheckpointManifest
 from .errors import (
     DiskCheckpointCatalogError,
@@ -38,6 +39,8 @@ __all__ = [
     "DiskCheckpointCatalogError",
     "DiskCheckpointManifest",
     "ElasticRolloutError",
+    "AutoscalerDecision",
+    "ElasticAutoscalerPolicy",
     "InstanceDesiredState",
     "InstanceNotFoundError",
     "InstanceNotReadyError",
