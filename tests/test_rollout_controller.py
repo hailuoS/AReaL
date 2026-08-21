@@ -25,6 +25,7 @@ from areal.infra.controller import rollout_controller as rollout_controller_modu
 from areal.infra.controller.elastic import (
     DiskCheckpointCatalogError,
     ElasticRecoveryStore,
+    InvalidDesiredCountError,
     RolloutInstanceState,
     RolloutRPCTarget,
 )
@@ -1533,6 +1534,68 @@ class TestElasticDiskCheckpointCatalog:
             DiskCheckpointCatalogError, match="require a checkpoint version"
         ):
             asyncio.run(controller.update_weights_from_disk(meta))
+
+
+class TestElasticDesiredState:
+    def _controller(self):
+        config = create_test_config(
+            elastic=ElasticRolloutConfig(enabled=True, max_instances=3)
+        )
+        return RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=config,
+            scheduler=MockScheduler(),
+        )
+
+    def test_shared_mutation_updates_desired_and_persists_recovery(self):
+        controller = self._controller()
+        controller._save_elastic_recovery_state = Mock()
+
+        accepted = controller._set_elastic_desired_instances(2, source="test")
+
+        assert accepted == (1, 2)
+        assert controller._instance_pool.desired_count == 2
+        assert controller._elastic_desired_change[0] == 2
+        controller._save_elastic_recovery_state.assert_called_once_with()
+
+    @pytest.mark.parametrize("desired_count", [True, 1.5, "2"])
+    def test_shared_mutation_rejects_non_integer_desired(self, desired_count):
+        controller = self._controller()
+        controller._save_elastic_recovery_state = Mock()
+
+        with pytest.raises(
+            InvalidDesiredCountError, match="desired_instances must be an integer"
+        ):
+            controller._set_elastic_desired_instances(
+                desired_count,
+                source="test",
+            )
+
+        assert controller._instance_pool.desired_count == 1
+        controller._save_elastic_recovery_state.assert_not_called()
+
+    def test_scale_down_clears_pending_scale_up_timing(self):
+        controller = self._controller()
+        controller._save_elastic_recovery_state = Mock()
+        controller._set_elastic_desired_instances(3, source="test")
+
+        controller._set_elastic_desired_instances(2, source="test")
+
+        assert controller._instance_pool.desired_count == 2
+        assert controller._elastic_desired_change is None
+
+    def test_recovery_mutation_can_skip_persistence(self):
+        controller = self._controller()
+        controller._save_elastic_recovery_state = Mock()
+
+        accepted = controller._set_elastic_desired_instances(
+            2,
+            source="recovery",
+            persist=False,
+        )
+
+        assert accepted == (1, 2)
+        controller._save_elastic_recovery_state.assert_not_called()
 
 
 def test_elastic_proxy_routing_uses_selected_instance_proxy():

@@ -128,6 +128,7 @@ class RolloutController:
         self._elastic_scaling_report_lock = threading.Lock()
         self._elastic_scaling_reporter: ElasticScalingReporter | None = None
         self._elastic_recovery_store: ElasticRecoveryStore | None = None
+        self._elastic_desired_lock = threading.RLock()
         self._elastic_reconcile_lock = threading.Lock()
         self._elastic_update_condition = threading.Condition()
         self._elastic_pending_update_version: int | None = None
@@ -287,7 +288,11 @@ class RolloutController:
             )
             recovered = self._elastic_recovery_store.load()
             if recovered is not None:
-                self._instance_pool.set_desired_count(recovered.desired_instances)
+                self._set_elastic_desired_instances(
+                    recovered.desired_instances,
+                    source="recovery",
+                    persist=False,
+                )
                 self._version = recovered.serving_version
                 if recovered.checkpoint_path is not None:
                     checkpoint_path = Path(recovered.checkpoint_path)
@@ -593,6 +598,57 @@ class RolloutController:
                     worker_roles=tuple(sorted(instance_roles | pending_worker_roles)),
                 )
             )
+
+    def _set_elastic_desired_instances(
+        self,
+        desired_count: int,
+        *,
+        source: str,
+        requested_at: float | None = None,
+        persist: bool = True,
+    ) -> tuple[int, int]:
+        """Atomically accept one desired-capacity update.
+
+        HTTP callers and the in-process autoscaler share this mutation boundary so
+        validation, recovery persistence, and scale-up timing remain identical.
+        Resource creation and deletion stay asynchronous in the reconciler.
+
+        Returns ``(previous_count, accepted_count)``.
+        """
+        if self._instance_pool is None:
+            raise RuntimeError("elastic rollout is disabled")
+        if isinstance(desired_count, bool) or not isinstance(desired_count, int):
+            raise InvalidDesiredCountError("desired_instances must be an integer")
+        if not source:
+            raise ValueError("desired-state update source must not be empty")
+
+        accepted_at = time.monotonic()
+        request_started_at = accepted_at if requested_at is None else requested_at
+        with self._elastic_desired_lock:
+            previous_desired_count = self._instance_pool.desired_count
+            self._instance_pool.set_desired_count(desired_count)
+            is_scale_up = desired_count > previous_desired_count
+            if desired_count != previous_desired_count:
+                with self._elastic_update_condition:
+                    self._elastic_desired_change = (
+                        (desired_count, accepted_at) if is_scale_up else None
+                    )
+
+            recovery_started_at = time.monotonic()
+            if persist:
+                self._save_elastic_recovery_state()
+        if is_scale_up:
+            logger.info(
+                "Elastic scale-up timing event=desired_instances_accepted "
+                "instance_id=- elapsed_seconds=%.3f recovery_save_seconds=%.3f "
+                "source=%s previous_desired_instances=%d desired_instances=%d",
+                time.monotonic() - request_started_at,
+                time.monotonic() - recovery_started_at,
+                source,
+                previous_desired_count,
+                desired_count,
+            )
+        return previous_desired_count, desired_count
 
     def record_elastic_scaling_window(
         self,
@@ -1142,30 +1198,14 @@ class RolloutController:
             desired_count = payload.get("desired_instances")
             if isinstance(desired_count, bool) or not isinstance(desired_count, int):
                 return jsonify({"error": "desired_instances must be an integer"}), 400
-            previous_desired_count = self._instance_pool.desired_count
             try:
-                self._instance_pool.set_desired_count(desired_count)
+                self._set_elastic_desired_instances(
+                    desired_count,
+                    source="http",
+                    requested_at=request_started_at,
+                )
             except InvalidDesiredCountError as exc:
                 return jsonify({"error": str(exc)}), 400
-            is_scale_up = desired_count > previous_desired_count
-            if is_scale_up:
-                with self._elastic_update_condition:
-                    self._elastic_desired_change = (
-                        desired_count,
-                        time.monotonic(),
-                    )
-            recovery_started_at = time.monotonic()
-            self._save_elastic_recovery_state()
-            if is_scale_up:
-                logger.info(
-                    "Elastic scale-up timing event=desired_instances_accepted "
-                    "instance_id=- elapsed_seconds=%.3f recovery_save_seconds=%.3f "
-                    "previous_desired_instances=%d desired_instances=%d",
-                    time.monotonic() - request_started_at,
-                    time.monotonic() - recovery_started_at,
-                    previous_desired_count,
-                    desired_count,
-                )
             return jsonify(
                 {
                     "desired_instances": self._instance_pool.desired_count,
