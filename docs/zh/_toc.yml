@@ -47,5 +47,8 @@ parts:
     - file: reference/bridge_backend
     - file: reference/tree_training
     - file: reference/rollout_workflow
+    - file: reference/rollout_elasticity_v1
+    - file: reference/rollout_elasticity_platform_integration
+    - file: reference/rollout_elasticity_kuberay_validation
     - file: reference/agent_workflow
     - file: reference/ai_assisted_dev
