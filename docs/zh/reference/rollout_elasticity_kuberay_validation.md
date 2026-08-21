@@ -75,6 +75,14 @@ ID。故障测试结束后必须恢复 `maxReplicas` 并 `uncordon` 节点。
 
 ## 5. 本地和镜像内回归
 
+对于两台 8 卡 Ascend 910B、CANN 8.5.x 的独立裸机验证环境，仓库提供了固定为 Ray 2.53.0、KubeRay 1.5.2 的部署模板和逐步指导：
+
+- [`examples/kuberay/README.md`](../../../examples/kuberay/README.md)
+- [`examples/kuberay/raycluster-2x910b.yaml`](../../../examples/kuberay/raycluster-2x910b.yaml)
+
+先完成模板中的无模型 Ray/KubeRay smoke，再运行本节回归和后续 AReaL HTTP 闭环。这样可以先区分 Kubernetes/Device Plugin
+问题与 AReaL 推理服务问题。
+
 在依赖完整的 AReaL 环境中运行：
 
 ```bash
@@ -219,12 +227,12 @@ kubectl exec -n "$NS" "$HEAD_POD" -c ray-head -- ray list actors --detail
 如果 `ray list` 不可用，确认 head 镜像安装了 Ray Dashboard/State CLI 依赖。`ray status` 中的 pending
 demand 是确认 AReaL 已成功把资源需求提交给 Ray autoscaler 的关键证据。
 
-## 7. 基础验证：1→2→1 和正常 1→N→1
+## 7. 基础验证：Controller 1→N→1 和真实训练
 
 ### 7.1 最小 Controller spike
 
-仓库的 `examples/math/rollout_elastic_controller_spike.py` 固定验证 1→2→1，只用于 HTTP、Proxy 和
-recovery 基础穿刺，不能覆盖任意 N、资源不足或真实训练指标自动决策。
+仓库的 `examples/math/rollout_elastic_controller_spike.py` 默认验证 1→2→1，也可通过
+`--scale-up-to N` 验证 1→N→1。它用于 HTTP、Proxy 和 recovery 基础穿刺，不覆盖真实训练指标自动决策。
 
 先执行最小路径：
 
@@ -260,12 +268,27 @@ AREAL_SPMD_MODE=false python \
   cluster.fileroot="$SHARED_FILEROOT"
 ```
 
+当一个 Ray Worker Pod 提供 8 卡，而一个 Rollout 实例只使用 2 卡时，至少扩到 5 才会触发第二个 Worker Pod：
+
+```bash
+AREAL_SPMD_MODE=false python \
+  examples/math/rollout_elastic_controller_spike.py \
+  --scale-up-to 5 --verify-recommendation --verify-recovery -- \
+  --config examples/math/gsm8k_grpo_npu.yaml \
+  scheduler.type=ray \
+  cluster.ray_device_resource=NPU \
+  cluster.n_gpus_per_node=8 \
+  rollout.backend=vllm:d1p1t2 \
+  actor.weight_update_mode=disk \
+  cluster.fileroot=/shared/areal
+```
+
 GPU 环境将示例配置和 `cluster.ray_device_resource` 改成对应的 GPU 配置。`--verify-recovery` 要求
 `cluster.fileroot` 对重启前后的 Controller 和所有 Worker 使用相同绝对路径。
 
 通过标准：
 
-- 日志出现 `Elastic Controller HTTP 1->2->1 spike passed`；
+- 日志出现 `Elastic Controller HTTP 1->N->1 spike passed`，其中 N 是传入的目标值；
 - Proxy 场景中所有 READY 实例 `proxy_ready=true`；
 - recovery 场景恢复 `desired_instances=1`；
 - 扩容时 Ray/KubeRay 出现新 PG 和 Worker，缩容释放 PG 后 Worker 在 idle timeout 后回收；
@@ -727,7 +750,7 @@ desired decreased
 | -------------------------------- | ---- | -------- | -------- | --------- |
 | 单元测试                         |      |          |          |           |
 | KubeRay 资源键和 autoscaler 前置 |      |          |          |           |
-| Controller spike 1→2→1           |      |          |          |           |
+| Controller spike 1→N→1           |      |          |          |           |
 | 真实训练 1→3→1                   |      |          |          |           |
 | 初始 1、新增 4、仅 3 个新增空位  |      |          |          |           |
 | 内部指标自动扩容                 |      |          |          |           |

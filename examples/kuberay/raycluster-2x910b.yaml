@@ -1,0 +1,121 @@
+# This is a validation template, not a production manifest.
+# Replace the image placeholder before applying it.
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: areal-elastic-npu
+  namespace: areal-elastic-validation
+spec:
+  rayVersion: "2.53.0"
+  enableInTreeAutoscaling: true
+  autoscalerOptions:
+    version: v2
+    upscalingMode: Default
+    idleTimeoutSeconds: 120
+    imagePullPolicy: IfNotPresent
+    env:
+      - name: RAY_LOGGER_LEVEL
+        value: info
+  headGroupSpec:
+    serviceType: ClusterIP
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+      num-cpus: "0"
+      object-store-memory: "2147483648"
+    template:
+      metadata:
+        labels:
+          app.kubernetes.io/part-of: areal-elastic-validation
+      spec:
+        restartPolicy: Never
+        nodeSelector:
+          areal.io/ray-head: "true"
+        tolerations:
+          - key: node-role.kubernetes.io/control-plane
+            operator: Exists
+            effect: NoSchedule
+          - key: node-role.kubernetes.io/master
+            operator: Exists
+            effect: NoSchedule
+        containers:
+          - name: ray-head
+            image: REPLACE_ME_AREAL_NPU_IMAGE_WITH_RAY_2_53
+            imagePullPolicy: IfNotPresent
+            env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+            ports:
+              - name: gcs
+                containerPort: 6379
+              - name: dashboard
+                containerPort: 8265
+              - name: client
+                containerPort: 10001
+            resources:
+              requests:
+                cpu: "4"
+                memory: 16Gi
+              limits:
+                cpu: "8"
+                memory: 32Gi
+            volumeMounts:
+              - name: areal-shared
+                mountPath: /shared/areal
+        volumes:
+          - name: areal-shared
+            persistentVolumeClaim:
+              claimName: areal-elastic-shared
+  workerGroupSpecs:
+    - groupName: npu-8
+      replicas: 1
+      minReplicas: 1
+      maxReplicas: 2
+      rayStartParams:
+        num-cpus: "64"
+        object-store-memory: "68719476736"
+        resources: '"{\"NPU\": 8}"'
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/part-of: areal-elastic-validation
+            areal.io/accelerator-shape: ascend910b-8
+        spec:
+          restartPolicy: Never
+          nodeSelector:
+            areal.io/npu-worker: "true"
+          tolerations:
+            - key: node-role.kubernetes.io/control-plane
+              operator: Exists
+              effect: NoSchedule
+            - key: node-role.kubernetes.io/master
+              operator: Exists
+              effect: NoSchedule
+          containers:
+            - name: ray-worker
+              image: REPLACE_ME_AREAL_NPU_IMAGE_WITH_RAY_2_53
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+              resources:
+                requests:
+                  cpu: "64"
+                  memory: 384Gi
+                  huawei.com/Ascend910: 8
+                limits:
+                  cpu: "64"
+                  memory: 384Gi
+                  huawei.com/Ascend910: 8
+              volumeMounts:
+                - name: areal-shared
+                  mountPath: /shared/areal
+                - name: shared-memory
+                  mountPath: /dev/shm
+          volumes:
+            - name: areal-shared
+              persistentVolumeClaim:
+                claimName: areal-elastic-shared
+            - name: shared-memory
+              emptyDir:
+                medium: Memory
+                sizeLimit: 96Gi

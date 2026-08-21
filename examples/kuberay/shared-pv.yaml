@@ -1,0 +1,21 @@
+# Replace the NFS placeholders before applying this manifest.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: areal-elastic-shared-pv
+spec:
+  capacity:
+    storage: 2Ti
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  claimRef:
+    namespace: areal-elastic-validation
+    name: areal-elastic-shared
+  mountOptions:
+    - hard
+    - nfsvers=4.1
+  nfs:
+    server: REPLACE_ME_NFS_SERVER
+    path: /REPLACE_ME_NFS_EXPORT
