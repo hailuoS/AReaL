@@ -1292,11 +1292,27 @@ class RayScheduler(Scheduler):
                 del self._colocated_roles[role]
             raise
 
-    def _create_placement_group(
-        self, role: str, bundles: list[dict[str, Any]], timeout: float
+    def _request_placement_group(
+        self, role: str, bundles: list[dict[str, Any]]
     ) -> Any:
-        """Generate Ray placement group for worker job with bundle-per-node layout."""
-        pg = placement_group(bundles=bundles, strategy="PACK")
+        """Submit one placement-group demand without waiting for resources."""
+        try:
+            return placement_group(bundles=bundles, strategy="PACK")
+        except Exception as e:
+            raise WorkerCreationError(
+                role,
+                "Ray placement group creation failed",
+                f"{type(e).__name__}: {e}",
+            ) from e
+
+    def _wait_placement_group_ready(
+        self,
+        role: str,
+        pg: Any,
+        bundles: list[dict[str, Any]],
+        timeout: float,
+    ) -> None:
+        """Wait until a submitted placement group has reserved its resources."""
         try:
             ready_ref = pg.ready()
             tik = time.time()
@@ -1348,6 +1364,13 @@ class RayScheduler(Scheduler):
                 "Ray placement group creation failed",
                 f"{type(e).__name__}: {e}",
             ) from e
+
+    def _create_placement_group(
+        self, role: str, bundles: list[dict[str, Any]], timeout: float
+    ) -> Any:
+        """Submit and synchronously wait for one placement group."""
+        pg = self._request_placement_group(role, bundles)
+        self._wait_placement_group_ready(role, pg, bundles, timeout)
         return pg
 
     def _build_node_plan(

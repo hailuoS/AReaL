@@ -2,6 +2,7 @@
 
 import gc
 import sys
+from unittest.mock import Mock
 
 import pytest
 import ray
@@ -130,6 +131,50 @@ def test_mismatched_spec_count_fails(tmp_path):
 
     with pytest.raises(ValueError, match="must be 1 or match"):
         scheduler.create_workers(job)
+
+
+def test_create_placement_group_submits_before_waiting(tmp_path, monkeypatch):
+    scheduler = _scheduler(tmp_path)
+    bundles = [{"CPU": 1, "GPU": 1}]
+    pg = object()
+    events = []
+    monkeypatch.setattr(
+        scheduler,
+        "_request_placement_group",
+        Mock(side_effect=lambda role, requested: events.append(("request", role)) or pg),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_wait_placement_group_ready",
+        Mock(side_effect=lambda role, *_args: events.append(("wait", role))),
+    )
+
+    result = scheduler._create_placement_group("rollout", bundles, timeout=30.0)
+
+    assert result is pg
+    assert events == [("request", "rollout"), ("wait", "rollout")]
+
+
+def test_wait_placement_group_ready_keeps_successful_request(tmp_path, monkeypatch):
+    scheduler = _scheduler(tmp_path)
+    ready_ref = object()
+    pg = Mock()
+    pg.ready.return_value = ready_ref
+    ray_get = Mock()
+    remove_pg = Mock()
+    monkeypatch.setattr(ray_scheduler.ray, "wait", lambda *_args, **_kwargs: ([ready_ref], []))
+    monkeypatch.setattr(ray_scheduler.ray, "get", ray_get)
+    monkeypatch.setattr(ray_scheduler, "remove_placement_group", remove_pg)
+
+    scheduler._wait_placement_group_ready(
+        "rollout",
+        pg,
+        [{"CPU": 1, "GPU": 1}],
+        timeout=30.0,
+    )
+
+    ray_get.assert_called_once_with(ready_ref, timeout=0)
+    remove_pg.assert_not_called()
 
 
 def test_zero_replicas_fails(tmp_path):
