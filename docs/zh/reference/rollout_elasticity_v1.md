@@ -50,6 +50,9 @@ worker Pod 和节点的启动时间。资源就绪后，`startup_concurrency` �
 后，实例会立即被摘出路由，并由 desired state 创建替代 实例。旧 placement group 会在 Controller 可见的
 workflow、result、direct RPC 和权重更新 lease 全部排空后删除。
 
+如果 Ray head 仅有 CPU，需要显式设置 `cluster.ray_device_resource=GPU` 或 `NPU`，确保 placement group
+bundle 使用 KubeRay Worker 所上报的加速卡资源键。
+
 ## HTTP 控制和状态
 
 V1 callback server 提供：

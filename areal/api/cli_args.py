@@ -3087,6 +3087,15 @@ class ClusterSpecConfig:
         default=8,
         metadata={"help": "Number of GPUs per node (physical)."},
     )
+    ray_device_resource: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Explicit Ray accelerator resource key, such as GPU or NPU. "
+                "Required when the Ray head has no local accelerator to detect."
+            )
+        },
+    )
 
 
 @dataclass

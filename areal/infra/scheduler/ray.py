@@ -710,6 +710,7 @@ class RayScheduler(Scheduler):
         name_resolve_type: str = "nfs",
         nfs_record_root: str = "/tmp/areal/name_resolve",
         etcd3_addr: str = "localhost:2379",
+        ray_device_resource: str | None = None,
         exp_config: BaseExperimentConfig | None = None,
     ):
         initialize_ray()
@@ -732,10 +733,15 @@ class RayScheduler(Scheduler):
         if self.experiment_name is None or self.trial_name is None:
             raise ValueError("experiment_name and trial_name must be provided")
 
-        self.ray_device_resource = ray_resource_type()
+        configured_device_resource = ray_device_resource
+        if exp_config is not None:
+            configured_device_resource = exp_config.cluster.ray_device_resource
+        self.ray_device_resource = configured_device_resource or ray_resource_type()
         if self.ray_device_resource not in DEVICE_CONTROL_ENV_VARS:
             raise RuntimeError(
-                f"RayScheduler does not support {self.ray_device_resource}-only clusters"
+                f"RayScheduler does not support {self.ray_device_resource}-only "
+                "clusters. Configure cluster.ray_device_resource to GPU or NPU "
+                "when the Ray head node has no accelerator."
             )
         self.device_control_env_var = DEVICE_CONTROL_ENV_VARS[self.ray_device_resource]
 
@@ -785,7 +791,8 @@ class RayScheduler(Scheduler):
         logger.info(
             f"Initialized RayScheduler: exp={self.experiment_name}, "
             f"trial={self.trial_name}, fileroot={self.fileroot}, "
-            f"n_gpus_per_node={self.n_gpus_per_node}"
+            f"n_gpus_per_node={self.n_gpus_per_node}, "
+            f"ray_device_resource={self.ray_device_resource}"
         )
 
     @property

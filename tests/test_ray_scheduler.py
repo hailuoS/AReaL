@@ -108,6 +108,25 @@ def test_ray_scheduler_rejects_cpu_only_cluster(monkeypatch):
         RayScheduler(experiment_name="test-exp", trial_name="test-trial")
 
 
+def test_ray_scheduler_allows_explicit_device_resource_on_cpu_head(monkeypatch):
+    monkeypatch.setattr(ray_scheduler.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(ray_scheduler, "ray_resource_type", lambda: "CPU")
+    monkeypatch.setattr(ray_scheduler, "validate_shared_path", lambda *_args: None)
+    monkeypatch.setattr(ray_scheduler.name_resolve, "reconfigure", lambda *_args: None)
+    monkeypatch.setattr(
+        ray_scheduler.name_resolve, "clear_subtree", lambda *_args: None
+    )
+
+    scheduler = RayScheduler(
+        experiment_name="test-exp",
+        trial_name="test-trial",
+        ray_device_resource="GPU",
+    )
+
+    assert scheduler.ray_device_resource == "GPU"
+    assert scheduler.device_control_env_var == "CUDA_VISIBLE_DEVICES"
+
+
 def test_prepare_worker_specs_expands_single_spec(tmp_path):
     """Test that a single scheduling spec expands to all replicas."""
     scheduler = _scheduler(tmp_path)

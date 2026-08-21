@@ -134,6 +134,9 @@ AReaL 还会向平台环境读写或输出：
 - 提供生产环境所需的鉴权、TLS、审计、告警、高可用和失败重试；
 - 清理 Controller 异常退出后可能残留的孤儿资源。
 
+如果 Ray head Pod 不挂载加速卡，需要在作业配置中显式设置 `cluster.ray_device_resource=GPU` 或 `NPU`。AReaL 不能从
+CPU-only head 的本机 Torch 环境可靠推断 WorkerGroup 使用的资源键。
+
 ### 6.2 双方共同定义
 
 - 一个 Rollout 实例对应的 Ray bundle、Worker Pod 和节点资源规格；

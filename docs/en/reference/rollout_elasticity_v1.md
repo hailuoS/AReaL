@@ -68,6 +68,9 @@ fenced out of routing immediately and a replacement is created from desired stat
 old placement group is deleted after Controller-visible workflow, result, direct-RPC,
 and weight-update leases have drained.
 
+On a CPU-only Ray head, set `cluster.ray_device_resource=GPU` or `NPU` explicitly so
+placement-group bundles use the accelerator resource advertised by KubeRay workers.
+
 ## HTTP control and status
 
 The V1 callback server exposes:
