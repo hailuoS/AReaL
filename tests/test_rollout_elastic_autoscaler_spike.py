@@ -120,6 +120,8 @@ def test_live_autoscaler_discards_cooldown_report_without_replaying(monkeypatch)
             _stable_status(1, 10),
             _stable_status(2, 20),
             _stable_status(2, 20),
+            # The duplicate report still reads current status before policy dedupe.
+            _stable_status(2, 20),
         ]
     )
     applied_versions = []
