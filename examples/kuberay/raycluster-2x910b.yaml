@@ -44,6 +44,8 @@ spec:
             env:
               - name: PYTHONUNBUFFERED
                 value: "1"
+              - name: HF_HOME
+                value: /shared/areal/huggingface
             ports:
               - name: gcs
                 containerPort: 6379
@@ -67,6 +69,8 @@ spec:
               claimName: areal-elastic-shared
   workerGroupSpecs:
     - groupName: npu-8
+      # One Worker Pod reserves the whole 8-card host. Ray then packs training
+      # and multiple 2-NPU rollout instances inside this logical NPU:8 node.
       replicas: 1
       minReplicas: 1
       maxReplicas: 2
@@ -97,6 +101,8 @@ spec:
               env:
                 - name: PYTHONUNBUFFERED
                   value: "1"
+                - name: HF_HOME
+                  value: /shared/areal/huggingface
               resources:
                 requests:
                   cpu: "64"

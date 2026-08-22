@@ -1,0 +1,40 @@
+# Replace the image placeholder before applying this manifest.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: npu-device-smoke
+  namespace: areal-elastic-validation
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    areal.io/npu-smoke: "true"
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+    - key: node-role.kubernetes.io/master
+      operator: Exists
+      effect: NoSchedule
+  containers:
+    - name: smoke
+      image: REPLACE_ME_AREAL_NPU_IMAGE_WITH_RAY_2_53
+      imagePullPolicy: IfNotPresent
+      command:
+        - bash
+        - -lc
+      args:
+        - |
+          set -euo pipefail
+          echo "ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-<unset>}"
+          echo "ASCEND_VISIBLE_DEVICES=${ASCEND_VISIBLE_DEVICES:-<unset>}"
+          npu-smi info
+          python -c 'import torch, torch_npu; print(torch.npu.is_available()); print(torch.npu.device_count())'
+      resources:
+        requests:
+          cpu: "1"
+          memory: 2Gi
+          huawei.com/Ascend910: 1
+        limits:
+          cpu: "1"
+          memory: 2Gi
+          huawei.com/Ascend910: 1
