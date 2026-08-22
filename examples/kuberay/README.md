@@ -77,23 +77,6 @@ Pod。它不会创建或 删除裸机；本手册验证的是 Ray Worker Pod 层
   -> 自动策略、资源不足和故障
 ```
 
-### 0.4 建集群前先跑代码回归
-
-在能安装仓库开发依赖的机器执行：
-
-```bash
-uv run pytest -q \
-  tests/test_elastic_config.py \
-  tests/test_ray_scheduler.py \
-  tests/test_rollout_controller.py \
-  tests/test_rollout_elastic_autoscaler_spike.py \
-  tests/infra/controller/elastic/
-```
-
-这些测试用 mock/fake 覆盖 desired mutation、批量资源申请、部分失败清理、状态机、内部自动决策和恢复文件；它们不启动真实
-Kubernetes、KubeRay、NPU 或 vLLM。这里通过只能说明框架逻辑回归正常，不能替代第 7～17 节的端到端验收。`uv run` 可能按仓库
-lockfile 使用 Ray 2.55.1；这不会改变后续集群镜像必须固定 Ray 2.53.0 的要求。
-
 ## 1. 固定版本
 
 | 组件                               | 版本或要求                                    |
@@ -110,7 +93,8 @@ lockfile 使用 Ray 2.55.1；这不会改变后续集群镜像必须固定 Ray 2
 MindCluster 7.3 支持 Kubernetes 1.17～1.34，并建议使用最新 bugfix；Kubernetes 1.30 已经 EOL，因此新建集群不再推荐
 1.30。若内网已有固定的 Kubernetes 1.30 集群，可以继续做兼容性验证，但要在报告中记录其 EOL 风险，不要将其作为新的生产基线。
 
-仓库的 `uv.npu.lock` 当前解析到 Ray 2.55.1，而你的环境使用 Ray 2.53。制作验证镜像时必须在最后显式固定：
+仓库的 `uv.npu.lock` 当前解析到 Ray 2.55.1，而你的环境使用 Ray 2.53。下面命令只在已有 Python/pip
+的镜像构建环境执行，不是在两台空白 裸机上安装 Python。制作验证镜像时必须在最后显式固定：
 
 ```bash
 python -m pip install 'ray[default]==2.53.0'
@@ -182,22 +166,14 @@ Calico VXLAN: UDP 4789（如果最终配置使用 VXLAN）
 | Helm 3.x 二进制                                                    | 安装 KubeRay                                               |
 | KubeRay Operator 1.5.2 chart 和 operator 镜像                      | 管理 RayCluster                                            |
 | MindCluster 7.3.0 Ascend Docker Runtime、Device Plugin YAML 和镜像 | NPU 容器化                                                 |
+| 当前 AReaL 分支源码或源码压缩包                                    | 在 node-1 执行仓库脚本和复制部署模板                       |
 | AReaL NPU 镜像，固定 Ray 2.53.0                                    | head、worker、driver                                       |
 | Qwen2.5-1.5B-Instruct 或实际验证模型                               | 真实推理和训练                                             |
 | `openai/gsm8k` 的 Hugging Face cache                               | 放在共享盘 `/shared/areal/huggingface`，避免训练时访问公网 |
 
-在 control-plane 上可以先列出 Kubernetes 控制面镜像：
-
-```bash
-kubeadm config images list --kubernetes-version v1.34.10
-```
-
-离线导入 containerd 时必须使用 Kubernetes 的 `k8s.io` namespace：
-
-```bash
-sudo ctr -n k8s.io images import <IMAGE_TAR>
-sudo ctr -n k8s.io images list
-```
+本节只登记制品，不在空白裸机上执行 `kubeadm`、`ctr`、`kubectl` 或 `helm`。完成 containerd 安装后在第 4.4 节导入容器镜像；完成
+kubeadm 安装后在第 5.4 节生成并核对 Kubernetes 控制面镜像清单。中转机如需提前生成清单，也必须先安装与目标集群完全一致的
+`kubeadm v1.34.10`。
 
 在与验证镜像依赖一致、能够访问 Hugging Face 的准备环境中预热 GSM8K cache，然后把整个目录同步到内网共享盘：
 
@@ -221,12 +197,34 @@ python -c 'from datasets import load_dataset; load_dataset("openai/gsm8k", "main
 
 ### 3.1 检查 NPU 和共享盘
 
+如果共享盘使用 NFS，先确认两台机器都有 NFS 客户端。缺少 `mount.nfs` 时按 OS 安装一种：
+
+```bash
+command -v mount.nfs
+
+# Debian/Ubuntu
+sudo apt-get install -y nfs-common
+
+# RHEL/openEuler
+sudo dnf install -y nfs-utils
+```
+
+上面两个安装命令只执行与当前 OS 对应的一个。若共享目录尚未挂载，先在两台机器创建相同挂载点并挂载；已经由系统或存储客户端挂载时跳过 `mount`：
+
+```bash
+sudo mkdir -p /shared/areal
+sudo mount -t nfs -o nfsvers=4.1 \
+  <NFS_SERVER>:<NFS_EXPORT_PATH> /shared/areal
+```
+
+非 NFS 共享文件系统按照对应存储产品挂载，但最终路径仍统一为 `/shared/areal`。然后检查设备和共享路径：
+
 ```bash
 npu-smi info
 ls -l /dev/davinci* /dev/davinci_manager /dev/devmm_svm
-mount | grep '<SHARED_MOUNT_PATH>'
-touch <SHARED_MOUNT_PATH>/areal-write-test-$(hostname)
-ls -l <SHARED_MOUNT_PATH>/areal-write-test-*
+findmnt /shared/areal
+touch /shared/areal/areal-write-test-$(hostname)
+ls -l /shared/areal/areal-write-test-*
 ```
 
 两台机器都应看到 8 张健康 910B，并能看到对方写入的测试文件。测试文件可以在确认后手工删除。
@@ -291,46 +289,63 @@ date --iso-8601=seconds
 
 ### 4.1 安装 containerd
 
-如果机器已有 containerd，先不要重装：
+两台机器先检查是否已经安装：
 
 ```bash
-containerd --version
-sudo systemctl status containerd --no-pager
-sudo test -f /etc/containerd/config.toml
+if command -v containerd >/dev/null 2>&1; then
+  containerd --version
+  sudo systemctl status containerd --no-pager
+else
+  echo "containerd is not installed"
+fi
 ```
 
-没有 containerd 时，从经过内网验证的 deb/rpm 软件源安装 1.6.x。不同 OS 的包名不同，例如：
+没有 containerd 时，从经过内网验证的 deb/rpm 软件源安装 1.6.x。下面两组只执行与当前 OS 对应的一组：
 
 ```bash
-# Debian/Ubuntu 示例
+# Debian/Ubuntu
 sudo apt-get update
 sudo apt-get install -y containerd
 
-# RHEL/openEuler 示例；根据内网仓库实际包名二选一
+# RHEL/openEuler；根据内网仓库实际包名二选一
 sudo dnf install -y containerd
 # 或 sudo dnf install -y containerd.io
 ```
 
-### 4.2 检查 CRI 和 cgroup
-
-不要直接执行 `containerd config default > /etc/containerd/config.toml`，它会覆盖已有 Ascend
-runtime。先备份并检查：
+安装完成后再执行：
 
 ```bash
-sudo cp -a /etc/containerd/config.toml \
-  /etc/containerd/config.toml.before-areal-validation
+containerd --version
+sudo systemctl enable containerd
+```
+
+### 4.2 创建或保留 containerd 配置
+
+先判断配置文件是否存在。已有文件只备份，不覆盖；仅在文件不存在时生成默认配置：
+
+```bash
+if sudo test -f /etc/containerd/config.toml; then
+  sudo cp -a /etc/containerd/config.toml \
+    /etc/containerd/config.toml.before-areal-validation
+  echo "existing containerd config backed up"
+else
+  sudo mkdir -p /etc/containerd
+  containerd config default | sudo tee /etc/containerd/config.toml >/dev/null
+  echo "default containerd config created"
+fi
+
 sudo grep -nE 'disabled_plugins|SystemdCgroup|ascend|runtime' \
   /etc/containerd/config.toml
 ```
 
-需要满足：
+由管理员编辑 `/etc/containerd/config.toml`，需要满足：
 
 - `disabled_plugins` 不包含 `cri`；
 - containerd 1.x 的 runc 配置中 `SystemdCgroup = true`；
-- 已有 Ascend runtime 配置完整保留；
+- 如果原配置已有 Ascend runtime，完整保留；
 - CRI socket 是 `/run/containerd/containerd.sock`。
 
-修改后：
+修改后启动并检查 CRI。这里通过后才能使用后面的 `ctr` 命令：
 
 ```bash
 sudo systemctl restart containerd
@@ -338,16 +353,43 @@ sudo systemctl is-active containerd
 sudo ctr plugins list | grep -E 'io.containerd.grpc.v1.cri|io.containerd.cri.v1'
 ```
 
-### 4.3 验证 Ascend runtime
+### 4.3 安装或检查 Ascend Docker Runtime
 
-Ascend Device Plugin 必须在 Ascend Docker Runtime 之后安装。先确认安装路径：
+Ascend Device Plugin 必须在 Ascend Docker Runtime 之后安装。先检查：
 
 ```bash
 command -v ascend-docker-runtime || true
-ls -l /usr/local/Ascend/Ascend-Docker-Runtime/ascend-docker-runtime
+sudo test -x /usr/local/Ascend/Ascend-Docker-Runtime/ascend-docker-runtime && \
+  echo "Ascend Docker Runtime found"
 ```
 
-使用已有 NPU 镜像做单卡容器测试；镜像必须已导入 containerd：
+未找到时，使用第 2.3 节准备的、与 MindCluster 7.3/CANN 8.5.2 匹配的安装包，按照包内说明安装。安装程序可能修改
+`/etc/containerd/config.toml`；安装前使用第 4.2 节的备份，安装后重新检查 CRI 和 `SystemdCgroup = true`，然后执行：
+
+```bash
+sudo systemctl restart containerd
+sudo systemctl is-active containerd
+sudo test -x /usr/local/Ascend/Ascend-Docker-Runtime/ascend-docker-runtime
+```
+
+如果实际安装路径不同，后续命令统一替换成实际路径。
+
+### 4.4 导入离线容器镜像
+
+此时 containerd 和 Ascend runtime 已经安装，才开始在两台机器导入第 2.3 节准备的镜像。Kubernetes 使用的镜像必须导入 `k8s.io`
+namespace：
+
+```bash
+sudo ctr -n k8s.io images import <IMAGE_TAR>
+sudo ctr -n k8s.io images list
+```
+
+这里先导入 Calico、KubeRay Operator、Ascend Device Plugin、AReaL NPU 和网络 smoke 镜像。Kubernetes
+控制面镜像等 kubeadm 安装完成并生成精确清单后，在第 5.4 节导入。也可以使用内网镜像仓库，但 YAML 和 kubeadm 中的完整镜像名必须与仓库一致。
+
+### 4.5 验证 Ascend runtime
+
+确认 AReaL NPU 镜像已经存在，再做单卡容器测试：
 
 ```bash
 sudo ctr -n k8s.io images list | grep '<AREAL_NPU_IMAGE>'
@@ -360,9 +402,9 @@ sudo ctr -n k8s.io run --rm \
   npu-smi info
 ```
 
-如果实际 Ascend runtime 路径不同，使用安装包文档中的路径。不要在未确认现有 runtime 配置时重新安装。
+这个命令直接验证 containerd、Ascend runtime、驱动挂载和镜像是否能协同工作；失败时不要继续安装 Kubernetes。
 
-### 4.4 本节通过标准
+### 4.6 本节通过标准
 
 - containerd 服务 active；
 - CRI plugin 为 `ok`，且未被禁用；
@@ -371,7 +413,8 @@ sudo ctr -n k8s.io run --rm \
 
 ## 5. 安装 Kubernetes 1.34.10
 
-以下安装方式选择与你的 OS 对应的一种，两台机器使用完全相同版本。
+以下安装方式选择与你的 OS 对应的一种，两台机器使用完全相同版本。命令中的公网软件源只是联网示例；内网环境先把 URL 换成已同步的软件源，或者直接安装第 2.3 节准备的
+deb/rpm 包，不能在无公网环境照抄公网 URL。
 
 ### 5.1 Debian/Ubuntu 路径
 
@@ -430,17 +473,44 @@ kubectl version --client
 
 三者都应为 `v1.34.10`。
 
-## 6. 使用 kubeadm 建立两节点集群
+### 5.4 生成清单并准备 Kubernetes 镜像
 
-### 6.1 初始化 node-1
+到这一步 `kubeadm` 和 `ctr` 才都已经安装。两台机器执行清单命令：
 
-仅在 `node-1` 执行，替换管理 IP：
+```bash
+kubeadm config images list --kubernetes-version v1.34.10
+```
+
+输出的完整镜像名和 tag 是本次集群的精确清单。按环境二选一：
+
+联网且两台机器能直接访问 `registry.k8s.io` 时，在两台机器拉取：
 
 ```bash
 sudo kubeadm config images pull \
   --kubernetes-version v1.34.10 \
   --cri-socket unix:///run/containerd/containerd.sock
+```
 
+完全离线时，不执行上面的 `pull`。在中转机准备清单中的每个镜像 tar，然后在两台机器逐个导入，并保持原始完整镜像名和 tag：
+
+```bash
+sudo ctr -n k8s.io images import <KUBERNETES_IMAGE_TAR>
+sudo ctr -n k8s.io images list
+```
+
+如果企业镜像仓库改变了 repository 前缀，需要在后续 kubeadm 配置文件中统一设置对应的 `imageRepository`。为保持下面命令可直接执行，本文的
+内网路径统一采用 tar 导入并保留 `kubeadm config images list` 输出的原始名称。
+
+本节通过标准：两台机器均已安装同版本 kubeadm/kubelet/kubectl，并且清单中的镜像在各自 containerd `k8s.io` namespace
+可见。未满足时不要执行 `kubeadm init`。
+
+## 6. 使用 kubeadm 建立两节点集群
+
+### 6.1 初始化 node-1
+
+确认第 5.4 节镜像门禁已经通过。仅在 `node-1` 执行，替换管理 IP：
+
+```bash
 sudo kubeadm init \
   --kubernetes-version v1.34.10 \
   --apiserver-advertise-address <CONTROL_PLANE_IP> \
@@ -463,15 +533,33 @@ kubectl get nodes -o wide
 
 ### 6.2 安装 Calico CNI
 
-仅在 `node-1` 执行。联网环境可以直接应用固定版本 manifest；离线环境先将 manifest 和镜像同步到内网：
+仅在 `node-1` 执行。先按环境二选一确定 manifest 路径。
+
+联网环境：
 
 ```bash
 curl -LO https://raw.githubusercontent.com/projectcalico/calico/v3.32.1/manifests/calico.yaml
-grep -n '192.168.0.0/16' calico.yaml
-kubectl apply -f calico.yaml
+CALICO_MANIFEST=$PWD/calico.yaml
+```
+
+离线环境使用第 2.3 节准备的本地文件，不执行 `curl`；同时确认第 4.4 节已经在两台机器导入 manifest 引用的全部镜像：
+
+```bash
+CALICO_MANIFEST=/opt/areal-offline/calico-v3.32.1.yaml
+test -f "$CALICO_MANIFEST"
+```
+
+然后检查 CIDR 并部署：
+
+```bash
+grep -n '192.168.0.0/16' "$CALICO_MANIFEST"
+kubectl apply -f "$CALICO_MANIFEST"
 
 kubectl get pods -n kube-system -o wide -w
 ```
+
+`-w` 会持续观察而不会自行退出。看到 Calico 和 CoreDNS Pod 都进入 Running 后按一次 `Ctrl-C`，再继续第 6.3 节；这只停止观察命令，
+不会停止 Pod。
 
 如果 manifest 的 IP pool 与 kubeadm 的 Pod CIDR 不一致，必须在首次 apply 前修正。不要在已经分配 Pod IP 后随意更换
 CIDR。
@@ -512,7 +600,8 @@ kubectl run areal-network-smoke \
   --image=<INTERNAL_BUSYBOX_IMAGE> \
   --restart=Never --command -- sh -c \
   'nslookup kubernetes.default.svc && sleep 5'
-kubectl wait --for=condition=Ready pod/areal-network-smoke --timeout=120s
+kubectl wait --for=jsonpath='{.status.phase}'=Succeeded \
+  pod/areal-network-smoke --timeout=120s
 kubectl logs areal-network-smoke
 kubectl delete pod areal-network-smoke
 ```
@@ -576,7 +665,19 @@ huawei.com/Ascend910: 8
 
 ### 7.3 在两个节点分别做单卡 Pod smoke
 
-先把验证镜像填入 [`npu-device-smoke.yaml`](npu-device-smoke.yaml) 的副本，然后对两个节点分别执行：
+从这里开始，仓库相对路径命令都在 node-1 的 AReaL 仓库根目录执行。先确认源码和模板存在：
+
+```bash
+cd <AREAL_REPOSITORY_ROOT>
+test -f examples/kuberay/npu-device-smoke.yaml
+if command -v git >/dev/null 2>&1; then
+  git rev-parse --short HEAD
+else
+  echo "record the source commit from the offline archive manifest"
+fi
+```
+
+然后把验证镜像填入 [`npu-device-smoke.yaml`](npu-device-smoke.yaml) 的副本，对两个节点分别执行：
 
 ```bash
 mkdir -p /tmp/areal-kuberay-validation
@@ -615,9 +716,18 @@ kubectl label node node-2 areal.io/npu-smoke-
 
 ## 8. 安装 Helm 和 KubeRay Operator
 
+本节所有命令只在已经配置好 `kubectl` 的 `node-1` 执行。Helm 只负责向当前 Kubernetes 集群提交资源，不需要在 `node-2` 安装，
+同一个 KubeRay release 也只能安装一次。
+
 ### 8.1 安装 Helm 3
 
-从内网软件源或预下载的 Helm 3 二进制安装，然后检查：
+从内网软件源安装，或者安装第 2.3 节准备的 Helm 3 二进制：
+
+```bash
+sudo install -m 0755 <HELM_BINARY> /usr/local/bin/helm
+```
+
+已经通过软件包安装 Helm 时不执行 `install`，直接检查：
 
 ```bash
 helm version
@@ -637,8 +747,20 @@ helm install kuberay-operator ./kuberay-operator-1.5.2.tgz \
   --create-namespace
 ```
 
-离线环境把 chart 和 operator 镜像同步到内网，必要时使用 `--set image.repository=... --set image.tag=...`
-指定内网镜像。
+离线环境不执行 `helm repo`，直接使用第 2.3 节准备的 chart。若 operator 镜像保留 chart 默认完整名称且已在第 4.4 节导入，在
+`node-1` 执行：
+
+```bash
+test -f /opt/areal-offline/kuberay-operator-1.5.2.tgz
+helm install kuberay-operator \
+  /opt/areal-offline/kuberay-operator-1.5.2.tgz \
+  --namespace kuberay-system \
+  --create-namespace
+```
+
+如果镜像被推送到内网仓库并改变了名称，在这条命令额外使用 chart 对应的
+`--set image.repository=<INTERNAL_REPOSITORY> --set image.tag=<TAG>`；先用
+`helm show values` 核实字段，不能猜测字段名。
 
 验证：
 
@@ -696,6 +818,8 @@ CPU、16 GiB。节点规格不足时，同时修改 Worker Pod requests/limits �
 
 ### 9.3 dry-run 和部署
 
+第 7 节已经创建 namespace。这里仍先幂等 apply 一次，确保后面的 server dry-run 能在真实 namespace 中执行：
+
 ```bash
 kubectl apply --dry-run=client \
   -f /tmp/areal-kuberay-validation/namespace.yaml
@@ -703,10 +827,15 @@ kubectl apply --dry-run=client \
   -f /tmp/areal-kuberay-validation/shared-pv.yaml
 kubectl apply --dry-run=client \
   -f /tmp/areal-kuberay-validation/shared-pvc.yaml
+kubectl apply -f /tmp/areal-kuberay-validation/namespace.yaml
+
+kubectl apply --dry-run=server \
+  -f /tmp/areal-kuberay-validation/shared-pv.yaml
+kubectl apply --dry-run=server \
+  -f /tmp/areal-kuberay-validation/shared-pvc.yaml
 kubectl apply --dry-run=server \
   -f /tmp/areal-kuberay-validation/raycluster-2x910b.yaml
 
-kubectl apply -f /tmp/areal-kuberay-validation/namespace.yaml
 kubectl apply -f /tmp/areal-kuberay-validation/shared-pv.yaml
 kubectl apply -f /tmp/areal-kuberay-validation/shared-pvc.yaml
 kubectl apply -f /tmp/areal-kuberay-validation/raycluster-2x910b.yaml
@@ -723,6 +852,8 @@ RAYCLUSTER=areal-elastic-npu
 kubectl get raycluster -n "$NS" "$RAYCLUSTER" -o wide
 kubectl get pods -n "$NS" -o wide -w
 ```
+
+看到一个 head Pod 和一个 worker Pod 已创建后按一次 `Ctrl-C` 结束观察，再执行下面的 wait 和检查命令。
 
 初始应有：
 
@@ -750,6 +881,7 @@ kubectl exec -n "$NS" "$WORKER" -c ray-worker -- \
   env | grep -E 'ASCEND_RT_VISIBLE_DEVICES|ASCEND_VISIBLE_DEVICES'
 kubectl exec -n "$NS" "$HEAD" -c ray-head -- \
   sh -c 'test "$HF_HOME" = /shared/areal/huggingface && echo "$HF_HOME"'
+kubectl exec -n "$NS" "$HEAD" -c ray-head -- sh -c 'command -v curl'
 kubectl exec -n "$NS" "$HEAD" -c ray-head -- ray status -v
 ```
 
@@ -759,6 +891,7 @@ kubectl exec -n "$NS" "$HEAD" -c ray-head -- ray status -v
 - head、worker 的 Ray 均为 2.53.0；
 - Ray `cluster_resources()` 中有 `NPU: 8`，head 自身不上报 NPU；
 - Worker 容器内能看到 8 张 NPU；
+- head 镜像包含后续调用 Controller HTTP API 所需的 `curl`；
 - PVC Bound，head 和 worker 都能读写 `/shared/areal`；
 - autoscaler 容器没有持续报错。
 
@@ -1278,3 +1411,21 @@ export HCCL_CONNECT_TIMEOUT=120
 
 全部 case 通过后，可以认为已经在两台固定裸机上验证了 AReaL 到 Ray Autoscaler、KubeRay Worker Pod 和 rollout
 生命周期的端到端链路。该结论不包含物理机自动创建、control-plane/Ray head HA、在途请求迁移或 head/GCS 灾备。
+
+## 附录 A：独立开发环境的代码回归
+
+本附录不属于两台空白裸机的安装顺序。只在已经安装完整 AReaL 开发依赖的环境执行，直接使用当前 Python 环境，不要求 `uv`：
+
+```bash
+python -m pytest -q \
+  tests/test_elastic_config.py \
+  tests/test_ray_scheduler.py \
+  tests/test_rollout_elastic_autoscaler_spike.py \
+  tests/infra/controller/elastic/
+```
+
+这些测试用 mock/fake 覆盖配置、批量资源申请、部分失败清理、状态机、内部自动决策和恢复文件；它们不启动真实 Kubernetes、KubeRay、NPU 或
+vLLM。不要把整个 `tests/test_rollout_controller.py` 加入这个无模型门禁：该文件在 pytest 收集阶段会导入模型测试工具，本地
+`/storage/openpsi/models` 缺少模型时会尝试从 Hugging Face 下载，包括大模型。Controller 和真实推理已经由第 12 节覆盖。
+
+这里通过只能说明框架逻辑回归正常，不能替代第 3～17 节的端到端验收。测试环境使用的 Ray 版本不改变集群镜像必须固定 Ray 2.53.0 的要求。
