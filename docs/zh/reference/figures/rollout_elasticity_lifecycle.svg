@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="560" viewBox="0 0 1280 560" role="img" aria-labelledby="title desc">
+  <title id="title">Rollout 实例生命周期与路由门槛</title>
+  <desc id="desc">扩容从 Pending 到 Starting、Catching Up、Ready。缩容从 Ready 到 Draining，等待 task、result、direct、update 四类租约清零后进入 Stopping 和 Stopped。Draining 可在开始销毁前撤销。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9" fill="#52637b"/></marker>
+    <style>
+      text {font-family:'Microsoft YaHei','Noto Sans CJK SC',sans-serif;fill:#18324f}
+      .title {font-size:27px;font-weight:700} .name {font-size:22px;font-weight:700}
+      .body {font-size:18px} .small {font-size:16px;fill:#52637b}
+      .line {fill:none;stroke:#52637b;stroke-width:2;marker-end:url(#arrow)}
+    </style>
+  </defs>
+  <rect width="1280" height="560" fill="#f8fafc"/>
+  <text x="35" y="48" class="title">实例生命周期：只有 READY 接收新请求</text>
+  <text x="35" y="82" class="body">正常主路径；启动或健康失败进入失败处理，并由 desired state 驱动补齐</text>
+  <rect x="35" y="120" width="860" height="152" rx="14" fill="#edf2f8"/>
+  <text x="55" y="148" class="small">不可路由 · 不计入 READY 有效容量</text>
+  <rect x="55" y="170" width="215" height="80" rx="10" fill="white" stroke="#bccada"/>
+  <text x="75" y="203" class="name">PENDING</text><text x="75" y="231" class="body">等待完整实例资源</text>
+  <rect x="345" y="170" width="215" height="80" rx="10" fill="white" stroke="#bccada"/>
+  <text x="365" y="203" class="name">STARTING</text><text x="365" y="231" class="body">初始化引擎与服务</text>
+  <rect x="635" y="170" width="240" height="80" rx="10" fill="white" stroke="#bccada"/>
+  <text x="655" y="203" class="name">CATCHING_UP</text><text x="655" y="231" class="body">追赶已提交权重版本</text>
+  <rect x="1010" y="170" width="225" height="80" rx="10" fill="#dff2e8" stroke="#72af8e"/>
+  <text x="1030" y="203" class="name">READY</text><text x="1030" y="231" class="body">可路由，计入容量</text>
+  <path d="M270 210 H345" class="line"/><path d="M560 210 H635" class="line"/>
+  <path d="M875 210 H1010" class="line"/>
+  <text x="905" y="179" class="small">版本匹配</text><text x="905" y="198" class="small">Proxy 就绪*</text>
+  <path d="M1122 250 V347" class="line"/>
+  <text x="1140" y="303" class="small">缩容</text>
+  <rect x="900" y="350" width="335" height="100" rx="10" fill="#fff0d9" stroke="#d7b477"/>
+  <text x="920" y="383" class="name">DRAINING</text>
+  <text x="920" y="412" class="body">停止分配新任务，保留在途操作</text>
+  <text x="920" y="437" class="small">超时仅报错；仍占用设备资源</text>
+  <rect x="475" y="350" width="255" height="100" rx="10" fill="#edf2f8" stroke="#bccada"/>
+  <text x="495" y="383" class="name">STOPPING</text><text x="495" y="413" class="body">先删 Proxy，再删 rollout</text>
+  <text x="495" y="437" class="small">释放实例对应资源</text>
+  <rect x="55" y="350" width="240" height="100" rx="10" fill="#edf2f8" stroke="#bccada"/>
+  <text x="75" y="383" class="name">STOPPED</text><text x="75" y="413" class="body">从 InstancePool 移除</text>
+  <path d="M900 399 H730" class="line"/>
+  <text x="746" y="354" class="small">task / result</text><text x="746" y="375" class="small">direct / update = 0</text>
+  <path d="M475 399 H295" class="line"/>
+  <text x="325" y="385" class="small">销毁完成</text>
+  <path d="M1215 350 V280 H1247 V155 H1122 V170" class="line" stroke-dasharray="6 4"/>
+  <text x="980" y="130" class="small">尚未销毁时可撤销 drain</text>
+  <text x="35" y="505" class="body">关键区别：workflow 完成 ≠ 远程结果已被消费；result lease 清零前不能删除实例。</text>
+  <text x="35" y="537" class="small">* Proxy 门槛只适用于启用实例 Proxy 的 offline AgentWorkflow。图中省略失败及中途取消分支。</text>
+</svg>

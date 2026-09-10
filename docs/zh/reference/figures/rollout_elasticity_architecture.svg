@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="960" viewBox="0 0 1280 960" role="img" aria-labelledby="title desc">
+  <title id="title">AReaL Rollout 弹性扩缩容总体架构</title>
+  <desc id="desc">训练指标与可选内部策略或 HTTP 设置目标实例数。Controller 通过 Pool 管理请求和租约，通过版本门控协调权重更新，通过 Reconciler 和 Launcher 创建或删除完整实例。Ray 资源需求连接 KubeRay 和平台节点扩缩容。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9" fill="#52637b"/></marker>
+    <style>
+      text { font-family: 'Microsoft YaHei','Noto Sans CJK SC',sans-serif; fill:#18324f; }
+      .title {font-size:28px;font-weight:700} .heading {font-size:20px;font-weight:700}
+      .body {font-size:17px} .small {font-size:15px;fill:#52637b}
+      .box {stroke:#b7c9dd;stroke-width:1.5;rx:12;fill:white}
+      .line {fill:none;stroke:#52637b;stroke-width:2;marker-end:url(#arrow)}
+      .dash {stroke-dasharray:7 5}
+    </style>
+  </defs>
+  <rect width="1280" height="960" fill="#f8fafc"/>
+  <text x="40" y="48" class="title">Rollout 弹性扩缩容：实例闭环 × 资源闭环</text>
+  <text x="40" y="77" class="body">AReaL 决定实例何时可服务；Ray / KubeRay 与平台提供和回收资源</text>
+
+  <rect x="40" y="105" width="310" height="100" class="box"/>
+  <text x="60" y="138" class="heading">Trainer / Actor</text>
+  <text x="60" y="167" class="body">prepare_batch → 训练 → disk 更新</text>
+  <text x="60" y="190" class="small">采集等待时间、进入量与消费量</text>
+  <rect x="470" y="105" width="340" height="100" class="box"/>
+  <text x="490" y="138" class="heading">Reporter + 可选内置 Policy</text>
+  <text x="490" y="167" class="body">Controller 内部：报告 → 策略检查</text>
+  <text x="490" y="190" class="small">默认只报告；auto_apply 开启后自动执行</text>
+  <rect x="930" y="105" width="310" height="100" class="box"/>
+  <text x="950" y="138" class="heading">人工 / 外部 Autoscaler</text>
+  <text x="950" y="167" class="body">GET 建议与状态 → PUT desired</text>
+  <text x="950" y="190" class="small">人工也可直接 PUT；明确唯一控制方</text>
+  <path d="M350 155 H470" class="line"/>
+  <text x="370" y="144" class="small">指标</text>
+  <path d="M810 155 H930" class="line dash"/>
+  <text x="825" y="144" class="small">读取建议</text>
+
+  <rect x="25" y="237" width="1230" height="285" rx="18" fill="#eaf2fc" stroke="#bed4ed"/>
+  <text x="45" y="266" class="heading">AReaL 实例控制平面 · RolloutController V1</text>
+  <rect x="470" y="285" width="340" height="82" class="box"/>
+  <text x="490" y="315" class="heading">目标状态 / HTTP / 后台协调</text>
+  <text x="490" y="345" class="body">desired、版本、状态与错误</text>
+  <path d="M640 205 V285" class="line"/>
+  <text x="653" y="225" class="small">内部自动更新 desired（开启时）</text>
+  <path d="M1080 205 V325 H810" class="line"/>
+  <text x="1090" y="225" class="small">外部 HTTP 设置</text>
+
+  <rect x="60" y="418" width="320" height="83" class="box"/>
+  <text x="80" y="448" class="heading">InstancePool + Dispatcher</text>
+  <text x="80" y="477" class="body">READY 路由 · 负载选择 · 四类租约</text>
+  <rect x="470" y="418" width="340" height="83" class="box"/>
+  <text x="490" y="448" class="heading">版本门控 / Catalog / Recovery</text>
+  <text x="490" y="477" class="body">disk 追赶互斥 · 保留与恢复元数据</text>
+  <rect x="900" y="418" width="310" height="83" class="box"/>
+  <text x="920" y="448" class="heading">InstanceReconciler</text>
+  <text x="920" y="477" class="body">补齐缺口 · 排空 · 健康摘除</text>
+  <path d="M545 367 V390 H220 V418" class="line"/>
+  <path d="M640 367 V418" class="line"/>
+  <path d="M735 367 V390 H1055 V418" class="line"/>
+  <path d="M900 490 H810" class="line dash"/>
+
+  <rect x="60" y="580" width="700" height="125" rx="14" fill="#e5f5ee" stroke="#a3cdb8"/>
+  <text x="80" y="610" class="heading">Rollout 数据平面：实例 1 … N</text>
+  <text x="80" y="640" class="body">每实例：稳定 ID + 独立 role + 完整单节点 TP × PP Server</text>
+  <text x="80" y="668" class="body">AgentWorkflow：实例专属 V1 Proxy → 本实例 Server</text>
+  <text x="80" y="692" class="small">生成结果 / RTensor → 训练消费；结果释放前保留实例</text>
+  <rect x="900" y="580" width="310" height="125" class="box"/>
+  <text x="920" y="613" class="heading">InstanceLauncher</text>
+  <text x="920" y="644" class="body">申请 Worker · engine / server</text>
+  <text x="920" y="672" class="body">Proxy · disk load · role 删除</text>
+  <path d="M220 501 V580" class="line"/>
+  <text x="234" y="550" class="small">请求绑定与结果追踪</text>
+  <path d="M640 501 V580" class="line"/>
+  <text x="650" y="550" class="small">共享 checkpoint</text>
+  <path d="M1055 501 V580" class="line"/>
+  <path d="M900 630 H760" class="line"/>
+  <text x="776" y="618" class="small">生命周期</text>
+
+  <rect x="25" y="775" width="1230" height="140" rx="18" fill="#fff4e4" stroke="#e1c79f"/>
+  <text x="45" y="804" class="heading">资源闭环 · Ray 调度 + KubeRay / 平台已有能力</text>
+  <rect x="60" y="821" width="310" height="76" class="box"/>
+  <text x="80" y="850" class="heading">RayScheduler / PG</text>
+  <text x="80" y="879" class="body">整批申请 · 单实例完整 bundle</text>
+  <rect x="465" y="821" width="315" height="76" class="box"/>
+  <text x="485" y="850" class="heading">Ray Autoscaler / KubeRay</text>
+  <text x="485" y="879" class="body">根据资源需求扩缩 Worker Pod</text>
+  <rect x="880" y="821" width="330" height="76" class="box"/>
+  <text x="900" y="850" class="heading">Kubernetes / 节点 Autoscaler</text>
+  <text x="900" y="879" class="body">Pod 调度 · 必要时提供设备节点</text>
+  <path d="M1055 705 V744 H215 V821" class="line"/>
+  <text x="478" y="734" class="small">创建 / 删除 role，申请 / 释放 PG</text>
+  <path d="M370 860 H465" class="line dash"/>
+  <path d="M780 860 H880" class="line"/>
+  <text x="40" y="944" class="small">实线：调用或数据路径　虚线：需求 / 状态依赖　｜　资源就绪后仍需服务初始化与权重追赶，才能进入 READY</text>
+</svg>
